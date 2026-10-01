@@ -2394,6 +2394,99 @@ fn priors_printing(answer: &std::path::Path) -> String {
     )
 }
 
+/// Story 191-6b10. Hooks registered in a user profile with one event missing:
+/// the fix must write that profile. The default (local) scope added a second
+/// copy of every event, and doctor then asked for the same command again.
+#[test]
+fn smoke_doctor_fixes_missing_hooks_in_the_profile_that_holds_them() {
+    let repo = Repo::new();
+    let profile = tempfile::tempdir().expect("profile dir");
+    let dir = profile.path().to_str().unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", dir), ("HOME", dir)];
+    assert_ok(
+        &run_env(
+            &[
+                "setup",
+                "hooks",
+                "claude",
+                "--scope",
+                "user",
+                "--profile-dir",
+                dir,
+            ],
+            &repo.root,
+            &env,
+        ),
+        "register user hooks",
+    );
+    let settings_path = profile.path().join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("PostToolUseFailure");
+    std::fs::write(&settings_path, settings.to_string()).unwrap();
+
+    let out = run_env(&["doctor"], &repo.root, &env);
+    let text = stdout(&out);
+    assert!(text.contains("PostToolUseFailure"), "got: {text}");
+    assert!(
+        text.contains(&format!("--scope user --profile-dir '{dir}'")),
+        "the fix must target the profile that holds the hooks: {text}"
+    );
+}
+
+/// Story 191-6b10. The same events in the user profile and in the local scope
+/// fire twice. Re-running setup cannot fix that; removing one scope does.
+#[test]
+fn smoke_doctor_removes_the_duplicate_scope_instead_of_rerunning_setup() {
+    let repo = Repo::new();
+    let profile = tempfile::tempdir().expect("profile dir");
+    let dir = profile.path().to_str().unwrap();
+    let env = [("CLAUDE_CONFIG_DIR", dir), ("HOME", dir)];
+    for args in [
+        vec![
+            "setup",
+            "hooks",
+            "claude",
+            "--scope",
+            "user",
+            "--profile-dir",
+            dir,
+        ],
+        vec!["setup", "hooks", "claude", "--scope", "local"],
+    ] {
+        assert_ok(&run_env(&args, &repo.root, &env), "register hooks");
+    }
+
+    let out = run_env(&["doctor"], &repo.root, &env);
+    let text = stdout(&out);
+    assert!(
+        text.contains("`mdkb setup remove hooks claude --scope local`"),
+        "got: {text}"
+    );
+    assert!(
+        !text.contains("fix: `mdkb setup hooks claude`"),
+        "re-running setup is the loop this story removes: {text}"
+    );
+
+    assert_ok(
+        &run_env(
+            &["setup", "remove", "hooks", "claude", "--scope", "local"],
+            &repo.root,
+            &env,
+        ),
+        "remove the local scope",
+    );
+    let out = run_env(&["doctor"], &repo.root, &env);
+    assert!(
+        !stdout(&out).contains("hooks.drift"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
 /// A `[priors]` block whose distiller writes `message` to stderr and exits 1.
 fn priors_failing(message: &str) -> String {
     let (program, args) = if cfg!(windows) {

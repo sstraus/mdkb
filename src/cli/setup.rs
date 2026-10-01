@@ -828,23 +828,80 @@ pub fn detect_hook_drift(settings: &[&serde_json::Value]) -> HookDrift {
     drift
 }
 
+/// A settings file as JSON. Missing or unparseable files read as `{}` so drift
+/// detection never fails a caller — it degrades to "no mdkb hooks seen".
+fn read_settings_lenient(path: Result<PathBuf>) -> serde_json::Value {
+    path.ok()
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// Detect hook drift for a repo by reading both the user-scope
 /// (`~/.claude/settings.json`) and local-scope (`<cwd>/.claude/settings.local.json`)
-/// settings. Missing or unparseable files contribute nothing (treated as `{}`)
-/// so drift detection never fails a caller — it degrades to "no mdkb hooks seen".
+/// settings.
 pub fn detect_hook_drift_for_repo(cwd: &Path, profile_dir: Option<&Path>) -> HookDrift {
-    let read = |path: Result<PathBuf>| -> serde_json::Value {
-        path.ok()
-            .filter(|p| p.exists())
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .filter(|raw| !raw.trim().is_empty())
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| serde_json::json!({}))
-    };
-    let user = read(claude_settings_path(cwd, "user", profile_dir));
-    let local = read(claude_settings_path(cwd, "local", None));
+    let user = read_settings_lenient(claude_settings_path(cwd, "user", profile_dir));
+    let local = read_settings_lenient(claude_settings_path(cwd, "local", None));
     detect_hook_drift(&[&user, &local])
+}
+
+/// The commands that repair a [`HookDrift`], chosen from where the mdkb hooks
+/// already live. `mdkb setup hooks claude` alone writes the local scope, so
+/// suggesting it for a user-profile install adds a second copy of every event
+/// and the next diagnosis asks for the same command again (story 191-6b10).
+#[derive(Debug, PartialEq, Eq)]
+pub struct HookFixes {
+    pub missing: String,
+    pub duplicated: String,
+}
+
+/// Choose the repair commands for `cwd`. Setup targets the scope that already
+/// carries mdkb hooks (user first); when both do, the duplicates are removed
+/// from the local scope and the next run reports whatever is then missing.
+pub fn hook_fix_commands(cwd: &Path, profile_dir: Option<&Path>) -> HookFixes {
+    let has_mdkb_hooks = |settings: &serde_json::Value| {
+        HOOK_EVENTS
+            .iter()
+            .any(|(event, cli_event, _)| count_mdkb_entries(settings, event, cli_event) > 0)
+    };
+    let user = has_mdkb_hooks(&read_settings_lenient(claude_settings_path(
+        cwd,
+        "user",
+        profile_dir,
+    )));
+    let local = has_mdkb_hooks(&read_settings_lenient(claude_settings_path(
+        cwd, "local", None,
+    )));
+    let setup_user = || {
+        let dir = profile_dir
+            .map(Path::to_path_buf)
+            .or_else(|| claude_profile_dir().ok());
+        match dir {
+            Some(dir) => format!(
+                "mdkb setup hooks claude --scope user --profile-dir {}",
+                shell_quote(&dir.to_string_lossy())
+            ),
+            None => "mdkb setup hooks claude --scope user".to_string(),
+        }
+    };
+    let setup = if user {
+        setup_user()
+    } else {
+        "mdkb setup hooks claude".to_string()
+    };
+    let duplicated = if user && local {
+        "mdkb setup remove hooks claude --scope local".to_string()
+    } else {
+        setup.clone()
+    };
+    HookFixes {
+        missing: setup,
+        duplicated,
+    }
 }
 
 /// Hook-registration half of `mdkb setup check`: the settings files that are
@@ -939,6 +996,16 @@ fn upsert_hook_entries(
         // rather than duplicates. See `is_mdkb_hook_entry` for the two cases
         // (tagged + legacy untagged). rtk's `hook claude` and other hooks don't
         // match, so they survive.
+        // A matcher on the entry being replaced is the user's narrowing of the
+        // hook (story 191-6b10); the replacement keeps it instead of widening
+        // the hook to every tool.
+        let kept_matcher = arr
+            .iter()
+            .filter(|item| is_mdkb_hook_entry(item, cli_event))
+            .find_map(|item| item.get("matcher").cloned());
+        if let Some(m) = kept_matcher {
+            mdkb_entry["matcher"] = m;
+        }
         arr.retain(|item| !is_mdkb_hook_entry(item, cli_event));
         arr.push(mdkb_entry);
         registered.push((*event_name).to_string());
@@ -1626,8 +1693,13 @@ mod tests {
         assert!(rtk_preserved, "unrelated rtk hook must be preserved");
     }
 
+    /// Story 191-6b10. Setup widened `PostToolUse Edit|Write|...` and
+    /// `PreToolUse Grep|Bash` to every tool when it merged into a settings file
+    /// that already carried them. Replaces the 162-feeb test that required the
+    /// widening: a matcher on an mdkb entry is kept, and an entry without one
+    /// still registers for every tool.
     #[test]
-    fn setup_replaces_scoped_tool_hooks_with_all_tool_registrations() {
+    fn setup_keeps_the_matcher_of_an_existing_mdkb_entry() {
         let mut settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -1635,7 +1707,7 @@ mod tests {
                     {"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}
                 ],
                 "PostToolUse": [
-                    {"_managedBy":"mdkb","matcher":"Edit|Write","hooks":[{"type":"command","command":"mdkb hook post-tool-use"}]}
+                    {"matcher":"Edit|Write","hooks":[{"type":"command","command":"/old/mdkb hook post-tool-use"}]}
                 ]
             }
         });
@@ -1646,24 +1718,31 @@ mod tests {
             false,
             None,
         );
-        for event in ["PreToolUse", "PostToolUse"] {
-            let entries = settings["hooks"][event].as_array().unwrap();
-            let managed: Vec<_> = entries
+        let managed = |event: &str| -> Vec<serde_json::Value> {
+            settings["hooks"][event]
+                .as_array()
+                .unwrap()
                 .iter()
                 .filter(|entry| entry["_managedBy"] == "mdkb")
-                .collect();
-            assert_eq!(managed.len(), 1, "one mdkb registration for {event}");
-            assert!(
-                managed[0].get("matcher").is_none(),
-                "{event} must reach Edit, Agent and MCP tools too: {managed:?}"
-            );
-        }
+                .cloned()
+                .collect()
+        };
+        let pre = managed("PreToolUse");
+        assert_eq!(pre.len(), 1, "one mdkb registration for PreToolUse");
+        assert_eq!(pre[0]["matcher"], "Grep|Bash", "tagged matcher kept");
+        let post = managed("PostToolUse");
+        assert_eq!(post.len(), 1, "one mdkb registration for PostToolUse");
+        assert_eq!(post[0]["matcher"], "Edit|Write", "legacy matcher kept");
+        assert!(
+            managed("Stop")[0].get("matcher").is_none(),
+            "an event with no matcher to keep registers for every tool"
+        );
         assert!(
             settings["hooks"]["PreToolUse"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["matcher"] == "Bash"),
+                .any(|entry| entry["matcher"] == "Bash" && entry.get("_managedBy").is_none()),
             "setup keeps another tool's hook"
         );
     }

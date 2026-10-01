@@ -14,11 +14,14 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
     let (config, config_error) = crate::config::Config::load_or_report(&config_path);
     let priors = crate::config::effective_priors(&config_path);
     let drift = crate::cli::setup::detect_hook_drift_for_repo(root, None);
+    let hook_fixes = crate::cli::setup::hook_fix_commands(root, None);
     let week_ago = chrono::Utc::now().timestamp() - 7 * 86_400;
 
     let mut facts = Facts {
         hooks_missing: drift.missing,
         hooks_duplicated: drift.duplicated,
+        hooks_missing_fix: Some(hook_fixes.missing),
+        hooks_duplicated_fix: Some(hook_fixes.duplicated),
         config_error,
         require_sigil: config.hooks.user_prompt_submit_require_sigil,
         shadow_enabled: config.hooks.user_prompt_submit_shadow,
