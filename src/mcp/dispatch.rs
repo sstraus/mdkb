@@ -4379,8 +4379,8 @@ async fn record_recall(
 /// the absolute floor drops some.
 const DOC_RECALL_POOL_FACTOR: usize = 4;
 
-/// The documents recall may inject: those with absolute evidence of relevance,
-/// in rank order, as `(path, title)`.
+/// The documents recall may inject: those with absolute evidence of relevance
+/// whose file still exists, in rank order, as `(path, title)`, at most `limit`.
 ///
 /// A hit is admitted when the cosine of its closest chunk reaches `min_cosine`,
 /// or when the prompt quotes its title or path
@@ -4388,10 +4388,15 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// store without embeddings, or an identifier-shaped query, from losing the
 /// leg. Being in the BM25 result set is not evidence: recall OR-expands the
 /// prompt, so one common word puts a document there.
+///
+/// `present` runs on admitted hits only, lazily and until `limit` are found, so
+/// it costs one stat per candidate that could be injected, not one per hit.
 fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
     prompt: &str,
     min_cosine: f32,
+    mut present: impl FnMut(&crate::domain::SearchResult) -> bool,
+    limit: usize,
 ) -> Vec<(String, Option<String>)> {
     hits.into_iter()
         .filter(|(hit, cosine)| {
@@ -4401,8 +4406,33 @@ fn admit_doc_hits(
                     &format!("{} {}", hit.path, hit.title.as_deref().unwrap_or_default()),
                 )
         })
+        .filter(|(hit, _)| present(hit))
         .map(|(hit, _)| (hit.path, hit.title.filter(|t| !t.is_empty())))
+        .take(limit)
         .collect()
+}
+
+/// A closure for [`admit_doc_hits`]: whether the file behind an indexed document
+/// is still on disk. Between a deletion and the next `update` the index still
+/// lists it, and recall must not point at it. Read-only: `update` prunes the
+/// row. A collection's directory is resolved once per collection; a stat that
+/// fails for any reason but absence keeps the document, as `update` does.
+fn indexed_file_present<'a>(
+    conn: &'a rusqlite::Connection,
+    root: &'a std::path::Path,
+) -> impl FnMut(&crate::domain::SearchResult) -> bool + 'a {
+    let mut dirs: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    move |hit| {
+        let dir = dirs.entry(hit.collection.clone()).or_insert_with(|| {
+            crate::store::collections::get_collection(conn, &hit.collection)
+                .ok()
+                .flatten()
+                .map(|c| root.join(c.path))
+        });
+        dir.as_ref()
+            .is_none_or(|dir| !matches!(dir.join(&hit.path).try_exists(), Ok(false)))
+    }
 }
 
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
@@ -5587,13 +5617,17 @@ async fn hook_user_prompt_submit_impl_timed(
                         None,
                         false,
                     )
+                    .map(|hits| {
+                        admit_doc_hits(
+                            hits,
+                            &prompt,
+                            docs_min_cosine,
+                            indexed_file_present(&ctx.conn, &root),
+                            docs_limit,
+                        )
+                    })
                 }) {
-                    Some(Ok(hits)) => {
-                        doc_hits = admit_doc_hits(hits, &prompt, docs_min_cosine)
-                            .into_iter()
-                            .take(docs_limit)
-                            .collect();
-                    }
+                    Some(Ok(hits)) => doc_hits = hits,
                     Some(Err(error)) => {
                         // Degrade silently (hooks must not block) but stay observable.
                         tracing::debug!("recall doc search failed: {error}");
@@ -8740,7 +8774,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
-        seed_document(&handle, "docs/deleted.md", "Quarantine autoheal deleted", content).await;
+        seed_document(
+            &handle,
+            "docs/deleted.md",
+            "Quarantine autoheal deleted",
+            content,
+        )
+        .await;
         seed_document(&handle, "docs/kept.md", "Quarantine autoheal kept", content).await;
         std::fs::remove_file(tmp.path().join("docs/docs/deleted.md")).unwrap();
 
@@ -9271,6 +9311,8 @@ mod tests {
                 vec![scored_hit("archive/x.md", "Unrelated title", Some(c))],
                 "perche la dettatura resta bloccata",
                 floor,
+                |_| true,
+                usize::MAX,
             )
             .is_empty()
         };
@@ -9288,8 +9330,16 @@ mod tests {
                 scored_hit("docs/quarantine.md", "Quarantine autoheal handling", None),
             ]
         };
-        assert!(admit_doc_hits(hits(), "how does the sandbox work today", 0.55).is_empty());
-        let by_identifier = admit_doc_hits(hits(), "where is quarantine.md described", 0.55);
+        assert!(
+            admit_doc_hits(hits(), "how does the sandbox work today", 0.55, |_| true, 9).is_empty()
+        );
+        let by_identifier = admit_doc_hits(
+            hits(),
+            "where is quarantine.md described",
+            0.55,
+            |_| true,
+            9,
+        );
         assert_eq!(by_identifier.len(), 1);
         assert_eq!(by_identifier[0].0, "docs/quarantine.md");
     }
