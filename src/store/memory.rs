@@ -6635,4 +6635,27 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert!(results[0].distance.is_some_and(|d| d < 1e-3), "{:?}", results[0].distance);
     }
+
+    /// Catches: a window that comes back short not ending the duplicate search
+    /// (`neighbours.len() < fetch_limit` turned `==`/`>`), which widens until
+    /// the result limit overflows into an error instead of answering "none".
+    #[test]
+    fn a_lone_archived_neighbour_ends_the_duplicate_search_without_a_duplicate() {
+        use crate::store::vectors;
+        let conn = setup_db_with_vectors();
+        let mut entry = typed_entry("old", "Old note", "retired", EntryType::Decision);
+        entry.status = EntryStatus::Archived;
+        add_entry(&conn, &entry).unwrap();
+        let rowid = get_rowid(&conn, "old").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+
+        let found = find_duplicate(
+            &conn,
+            "new",
+            "Another title entirely",
+            Some(&test_embedding(0.30)),
+        )
+        .unwrap();
+        assert!(found.is_none(), "{found:?}");
+    }
 }
