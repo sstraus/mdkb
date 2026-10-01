@@ -487,35 +487,35 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // understand.
     refuse_future_schema(conn)?;
 
-    // Create schema
-    conn.execute_batch(SCHEMA_SQL)?;
-    conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
-    conn.execute_batch(RELATION_CANDIDATES_SQL)?;
-    conn.execute_batch(RECALL_LEDGER_SQL)?;
-    conn.execute_batch(INDEX_HEAD_SQL)?;
-
-    // Set BM25 weights
-    conn.execute_batch(BM25_WEIGHTS_SQL)?;
-
-    // Check for migrations
-    let current = get_schema_version(conn)?;
-    match current {
+    // A store older than this binary creates its missing tables INSIDE the
+    // migration's transaction. Created before it, a migration that rolled back
+    // left the old version number on a store that had already gained tables,
+    // triggers and indexes — half old, half new.
+    match get_schema_version(conn)? {
+        Some(v) if v < SCHEMA_VERSION => migrate_with_tables(conn, v)?,
         None => {
+            create_tables(conn)?;
             // Fresh database
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)",
                 [SCHEMA_VERSION],
             )?;
         }
-        Some(v) if v < SCHEMA_VERSION => {
-            // Run migrations
-            migrate_schema(conn, v)?;
-        }
-        _ => {
-            // Up to date
-        }
+        Some(_) => create_tables(conn)?,
     }
 
+    Ok(())
+}
+
+/// Create every table, index and trigger the current schema has, and set the
+/// BM25 weights. Idempotent.
+fn create_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
+    conn.execute_batch(RELATION_CANDIDATES_SQL)?;
+    conn.execute_batch(RECALL_LEDGER_SQL)?;
+    conn.execute_batch(INDEX_HEAD_SQL)?;
+    conn.execute_batch(BM25_WEIGHTS_SQL)?;
     Ok(())
 }
 
@@ -539,8 +539,20 @@ pub fn refuse_future_schema(conn: &Connection) -> Result<()> {
 /// Wrapped in a transaction for atomicity — partial migration on crash
 /// is rolled back automatically by SQLite.
 fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
+    in_transaction(conn, || migrate_schema_inner(conn, from_version))
+}
+
+/// [`migrate_schema`] preceded by [`create_tables`], in the same transaction.
+fn migrate_with_tables(conn: &Connection, from_version: i32) -> Result<()> {
+    in_transaction(conn, || {
+        create_tables(conn)?;
+        migrate_schema_inner(conn, from_version)
+    })
+}
+
+fn in_transaction(conn: &Connection, body: impl FnOnce() -> Result<()>) -> Result<()> {
     conn.execute("BEGIN IMMEDIATE", [])?;
-    let result = migrate_schema_inner(conn, from_version);
+    let result = body();
     match &result {
         Ok(()) => {
             conn.execute("COMMIT", [])?;

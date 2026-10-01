@@ -49,6 +49,11 @@ pub struct RefreshFailure {
     pub reason: String,
     /// The verified copy, when the failure came after it was taken.
     pub backup: Option<PathBuf>,
+    /// The schema the store is at NOW, read after the failure. A failure after
+    /// the migration committed (a later initialization step) leaves a migrated
+    /// store, and saying "unchanged" about it would be false. `None` when the
+    /// store could not be read.
+    pub schema_after: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -75,11 +80,16 @@ pub fn refresh_store(
     root: &Path,
     stamp: &str,
 ) -> std::result::Result<RefreshStatus, RefreshFailure> {
+    let db_path = index_path(root).map_err(|e| RefreshFailure {
+        reason: e.to_string(),
+        backup: None,
+        schema_after: None,
+    })?;
     let failed = |e: Error| RefreshFailure {
         reason: e.to_string(),
         backup: None,
+        schema_after: read_version(&db_path).ok(),
     };
-    let db_path = index_path(root).map_err(failed)?;
 
     // Unlocked first, so a store that is already current costs no lock.
     if let Some(status) = settled(read_version(&db_path).map_err(failed)?) {
@@ -101,6 +111,7 @@ pub fn refresh_store(
     let with_backup = |e: Error| RefreshFailure {
         reason: e.to_string(),
         backup: Some(backup.clone()),
+        schema_after: read_version(&db_path).ok(),
     };
     let ctx = Context::open_writer_admitted(root).map_err(with_backup)?;
     let now = schema::get_schema_version(&ctx.conn).map_err(with_backup)?;

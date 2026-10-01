@@ -19,12 +19,21 @@ fn stores_in_scope() -> Vec<PathBuf> {
 
 pub fn handle_refresh(only: RefreshFilter) -> Result<()> {
     let RefreshFilter::Outdated = only;
+    // The repo map lists default stores. Under a namespace every store path
+    // resolves to `.mdkb/namespaces/<name>/`, so each default store would be
+    // reported as missing: fail once, with the reason, instead of N times.
+    if let Some(namespace) = crate::store::namespace::active()? {
+        return Err(Error::other(format!(
+            "refusing to refresh under MDKB_NAMESPACE={namespace}: the repo map lists default \
+             stores, and a namespace redirects every store path. Unset MDKB_NAMESPACE."
+        )));
+    }
     let reports = refresh_outdated(&stores_in_scope());
     let (text, failed) = render_refresh(&reports);
     print!("{text}");
     if failed > 0 {
         return Err(Error::other(format!(
-            "{failed} store(s) were not migrated; each is unchanged at its old schema"
+            "{failed} store(s) failed; the FAILED lines above say what state each is in"
         )));
     }
     Ok(())
@@ -66,7 +75,14 @@ fn render_refresh(reports: &[RefreshReport]) -> (String, usize) {
                     .as_ref()
                     .map(|b| format!(" (backup kept at {})", b.display()))
                     .unwrap_or_default();
-                let _ = writeln!(out, "FAILED    {root}: {}{backup}", f.reason);
+                let state = match f.schema_after {
+                    Some(v) if v >= crate::store::schema::SCHEMA_VERSION => {
+                        format!(" — the store IS at schema v{v}: the migration committed")
+                    }
+                    Some(v) => format!(" — the store is at schema v{v}, as before"),
+                    None => " — the store's schema could not be read afterwards".to_string(),
+                };
+                let _ = writeln!(out, "FAILED    {root}: {}{state}{backup}", f.reason);
             }
         }
     }
