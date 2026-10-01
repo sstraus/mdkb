@@ -5696,8 +5696,11 @@ async fn hook_user_prompt_submit_impl_timed(
             );
             Some((scored_results, observed, doc_hits, rerank_pool))
         });
-        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) =
-            leg.await
+        let joined = leg.await;
+        if let Err(error) = &joined {
+            tracing::warn!("recall search task failed: {error}");
+        }
+        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) = joined
         else {
             return json!({});
         };
@@ -5863,6 +5866,7 @@ async fn hook_user_prompt_submit_impl_timed(
             })
             .await;
             neighbors = found
+                .map_err(|error| tracing::warn!("recall neighbor task failed: {error}"))
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(path, relation, _)| (path, relation))
