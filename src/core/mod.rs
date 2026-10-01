@@ -143,16 +143,21 @@ pub fn run_mutation_verify_after_release<T>(
             // The slot was released for the probe, so it may hold a newer
             // context now (reopened over a rebuilt file). The verdict is about
             // the file this one opened; it must not tear down its successor.
-            let mut guard = slot.blocking_lock();
-            if guard
-                .as_ref()
-                .is_some_and(|ctx| ctx.generation == generation)
-            {
-                close_over_corruption(&mut guard);
-            }
+            close_over_corruption_of(&mut slot.blocking_lock(), generation);
         }
     }
     Some(result)
+}
+
+/// [`close_over_corruption`] for a verdict about one opening of the store
+/// (`generation`): a slot that holds a newer context is left alone.
+pub(crate) fn close_over_corruption_of(slot: &mut Option<Context>, generation: u64) {
+    if slot
+        .as_ref()
+        .is_some_and(|ctx| ctx.generation == generation)
+    {
+        close_over_corruption(slot);
+    }
 }
 
 /// Drop a long-lived context that saw corruption, and with it the process's

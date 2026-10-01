@@ -216,11 +216,34 @@ fn touch_marker(marker: &Path) {
     let _ = std::fs::File::create(marker);
 }
 
+/// How many times a writer announced itself ([`invalidate_marker`]) per
+/// database, in this process. A lock-free probe compares it before and after:
+/// a writer that has announced itself but not yet written leaves the file's
+/// stamp unchanged, yet a verdict recorded then would certify a write in flight.
+static INVALIDATIONS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+fn bump_invalidations(db_path: &Path) {
+    let mut guard = INVALIDATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard
+        .get_or_insert_with(HashMap::new)
+        .entry(db_path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+fn invalidations(db_path: &Path) -> u64 {
+    let guard = INVALIDATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(db_path).copied())
+        .unwrap_or(0)
+}
+
 /// Invalidate the last successful integrity probe before an index-wide write.
 ///
 /// If the process crashes mid-mutation, the next open cannot trust an old
 /// marker and will run `quick_check` before using the index.
 pub fn invalidate_marker(db_path: &Path) {
+    bump_invalidations(db_path);
     forget_process_probe(db_path);
     let _ = std::fs::remove_file(marker_path(db_path));
 }
@@ -348,8 +371,8 @@ fn write_stamp(db_path: &Path) -> WriteStamp {
 /// megabytes does not queue every other writer behind it.
 ///
 /// The verdict ("sound as of the probe's start") is recorded, in the marker and
-/// in this process's memory, only when neither file was written or replaced
-/// while the probe ran; a write that landed in between leaves both unset and
+/// in this process's memory, only when neither file was written or replaced and
+/// no writer announced itself while the probe ran; a write that landed in between leaves both unset and
 /// the next write cycle probes again. The probe itself reads a WAL snapshot,
 /// which a concurrent writer cannot tear.
 pub fn verify_and_mark_unadmitted(db_path: &Path) -> Result<()> {
@@ -369,11 +392,11 @@ pub fn verify_and_mark_unadmitted_with(
     if !db_path.exists() {
         return Ok(());
     }
-    let before = write_stamp(db_path);
+    let before = (write_stamp(db_path), invalidations(db_path));
     let conn = open_probe(db_path)?;
     match probe(&conn) {
         Soundness::Sound => {
-            if write_stamp(db_path) == before {
+            if (write_stamp(db_path), invalidations(db_path)) == before {
                 touch_marker(&marker_path(db_path));
                 set_process_verified(db_path, Some(started));
             }

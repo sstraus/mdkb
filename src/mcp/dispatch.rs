@@ -729,22 +729,29 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
     Ok(())
 }
 
-/// Run one daemon-backed memory mutation under the cross-process mutation lock,
-/// verify the resulting database through a fresh connection, and release the
-/// long-lived context immediately if the index is corrupt.
+/// Run one daemon-backed memory mutation under the cross-process writer and
+/// mutation locks, verify the resulting database through a fresh connection, and
+/// release the long-lived context if the index is corrupt.
 ///
 /// Memory tools used to write directly through `RepoHandle::ctx`. That bypassed
 /// both the project lock and [`crate::core::run_mutation`], so a daemon
 /// could retain the live lock after detecting corruption and block its own
 /// quarantine indefinitely. The fresh-connection probe is intentional: the
 /// working connection's pager can report a file torn underneath it as healthy.
-fn run_handle_memory_mutation<T>(
-    slot: &mut Option<Context>,
+///
+/// Same contract as [`crate::core::run_mutation`] (the probe runs after the slot
+/// and the locks are released and records its verdict; a corrupt verdict closes
+/// only the context it probed), for closures that borrow from the caller and so
+/// cannot move to a blocking thread: the slot is the async mutex, the probe goes
+/// to `spawn_blocking`.
+async fn run_handle_memory_mutation<T>(
+    slot: &tokio::sync::Mutex<Option<Context>>,
     what: &str,
     f: impl FnOnce(&Context) -> Result<T, McpError>,
 ) -> Result<T, McpError> {
-    let (result, verification) = {
-        let ctx = slot
+    let (db_path, generation, result) = {
+        let guard = slot.lock().await;
+        let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
         let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
@@ -754,24 +761,34 @@ fn run_handle_memory_mutation<T>(
 
         crate::store::heal::invalidate_marker(&ctx.db_path);
         let result = f(ctx);
-        let verification = crate::store::heal::verify_and_mark_throttled(&ctx.db_path);
-        (result, verification)
+        (ctx.db_path.clone(), ctx.generation, result)
     };
 
-    let result = close_context_on_reported_corruption(slot, what, result);
+    let probe_path = db_path.clone();
+    let verification = tokio::task::spawn_blocking(move || {
+        crate::store::heal::verify_and_mark_unadmitted(&probe_path)
+    })
+    .await
+    .map_err(|e| mcp_error(format!("integrity probe task failed after {what}: {e}")))?;
 
-    if let Err(error) = verification {
+    if result.as_ref().is_err_and(mcp_error_reports_corruption)
+        || verification.as_ref().is_err_and(|e| e.is_index_corrupt())
+    {
         tracing::error!(
             operation = what,
-            error = %error,
             "index is corrupt after memory mutation — closing this connection so the next open can quarantine, salvage memory and rebuild"
         );
-        crate::core::close_over_corruption(slot);
-        return Err(mcp_error(format!(
-            "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
-        )));
+        crate::core::close_over_corruption_of(&mut *slot.lock().await, generation);
     }
-
+    if let Err(error) = verification {
+        return Err(mcp_error(if error.is_index_corrupt() {
+            format!(
+                "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
+            )
+        } else {
+            format!("Integrity probe after {what} reached no verdict: {error}")
+        }));
+    }
     result
 }
 
@@ -957,14 +974,14 @@ pub async fn memory_delete_impl(
         });
     }
 
-    let mut ctx_guard = handle.ctx.lock().await;
-    let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
+    let deleted = run_handle_memory_mutation(&handle.ctx, "memory delete", |ctx| {
         // Literally the same door as `mdkb memory rm`, not a copy of it: the
         // archive-then-delete order that keeps a retired entry from being
         // re-imported must not exist twice.
         crate::core::memory::handle_memory_rm(ctx, id)
             .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
-    })?;
+    })
+    .await?;
 
     Ok(if deleted {
         format!("Deleted memory entry '{id}'.")
@@ -992,8 +1009,7 @@ pub async fn memory_confirm_impl_for_session(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let mut ctx_guard = handle.ctx.lock().await;
-    run_handle_memory_mutation(&mut ctx_guard, "memory confirm", |ctx| {
+    run_handle_memory_mutation(&handle.ctx, "memory confirm", |ctx| {
         if let Some(message) = crate::store::priors::record_model_verdict(
             &ctx.conn,
             id,
@@ -1018,6 +1034,7 @@ pub async fn memory_confirm_impl_for_session(
             .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))?;
         Ok(message)
     })
+    .await
 }
 
 /// Generic error returned for any `source_file` rejection (missing,
@@ -1167,8 +1184,8 @@ pub async fn memory_write_impl(
         dry_run,
     };
 
-    let mut ctx_guard = handle.ctx.lock().await;
     if dry_run {
+        let mut ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1177,7 +1194,7 @@ pub async fn memory_write_impl(
         close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
         let id = input.id;
-        run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
+        run_handle_memory_mutation(&handle.ctx, "memory write", |ctx| {
             let output = crate::core::memory::write_memory(&ctx.conn, input)
                 .map_err(|error| mcp_store_error("Memory write failed", error))?;
             // Same door as `mdkb memory add`: the file exists the moment the
@@ -1185,6 +1202,7 @@ pub async fn memory_write_impl(
             crate::core::memory_sync::project_after_write(ctx, id, chrono::Utc::now().timestamp());
             Ok(output)
         })
+        .await
     }
 }
 
@@ -1301,15 +1319,15 @@ pub async fn memory_write_batch_impl(
         Ok((results.join("\n"), count))
     };
 
-    let mut ctx_guard = handle.ctx.lock().await;
     if dry_run {
+        let mut ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
         let result = run(ctx);
         close_context_on_reported_corruption(&mut ctx_guard, "memory write batch dry run", result)
     } else {
-        run_handle_memory_mutation(&mut ctx_guard, "memory write batch", run)
+        run_handle_memory_mutation(&handle.ctx, "memory write batch", run).await
     }
 }
 
@@ -6682,8 +6700,7 @@ async fn cli_mutate_impl(
         } => {
             ensure_handle_context(handle).await?;
             let (prune, index_bytes) = {
-                let mut slot = handle.ctx.lock().await;
-                run_handle_memory_mutation(&mut slot, "compact", |ctx| {
+                run_handle_memory_mutation(&handle.ctx, "compact", |ctx| {
                     let prune = if prune_sessions {
                         let raw = older_than.as_deref().ok_or_else(|| mcp_error(
                             "--prune-sessions requires --older-than <e.g. 90d> to avoid deleting recent archives",
@@ -6702,6 +6719,7 @@ async fn cli_mutate_impl(
                         .map_err(|e| mcp_store_error("Failed to vacuum index.sqlite", e))?;
                     Ok((prune, ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0)))
                 })
+                .await
                 .map_err(|e| mcp_error(format!("compact failed: {e}")))?
             };
 
@@ -6728,18 +6746,17 @@ async fn cli_mutate_impl(
         mutation => {
             let is_embed = matches!(mutation, CliMutation::Embed { .. });
             ensure_handle_context(handle).await?;
-            let mut slot = handle.ctx.lock().await;
             // No outer wrap: `run_handle_memory_mutation` already returns an
             // `McpError`, so re-wrapping stringified one error inside another and
             // repeated both the code and the phrase, pushing the one fact the
             // operator needs to the end of the line. It also flattened the code
             // the inner error had earned, which is what tells the CLI whether the
             // write started.
-            let outcome = run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
+            let outcome = run_handle_memory_mutation(&handle.ctx, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
-            });
-            drop(slot);
+            })
+            .await;
             // The reranker weights are 280 MB: fetch them after the embedding,
             // so an offline machine still gets its vectors, and after the store
             // lock is released, or every hook for this repo waits at `lock_wait`
@@ -7487,8 +7504,7 @@ mod tests {
             .expect("initialize context");
 
         let error = {
-            let mut slot = handle.ctx.lock().await;
-            run_handle_memory_mutation(&mut slot, "corruption regression test", |ctx| {
+            run_handle_memory_mutation(&handle.ctx, "corruption regression test", |ctx| {
                 ctx.conn
                     .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .expect("checkpoint before truncation");
@@ -7500,6 +7516,7 @@ mod tests {
                 file.set_len(len / 2).unwrap();
                 Ok(())
             })
+            .await
             .expect_err("fresh-connection verification must detect the torn file")
         };
 
