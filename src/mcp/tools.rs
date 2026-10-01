@@ -22,7 +22,8 @@ const GRAMMAR_HINT: &str = "Run `mdkb cheatsheet` for the root grammar.";
 pub enum RootTerm {
     /// An absolute path, used as written.
     Path(PathBuf),
-    /// A repo name, resolved against the known roots by last path component.
+    /// A repo name, resolved against the known roots by last path component, or
+    /// by trailing components when it contains `/`.
     Name(String),
 }
 
@@ -210,7 +211,9 @@ pub fn workspace_anchor(scope: &[PathBuf], roots: &[PathBuf]) -> Option<PathBuf>
     anchors.next().is_none().then(|| first.clone())
 }
 
-/// Resolve one term. A path is itself; a name is looked up by last component.
+/// Resolve one term. A path is itself; a name is looked up by last component,
+/// or by trailing path components when it holds a `/` (`tuicommander/plugins`),
+/// which is how a name several repos share is made unambiguous.
 fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
     let name = match term {
         RootTerm::Path(path) => return Ok(path.clone()),
@@ -219,7 +222,13 @@ fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
 
     let hits: Vec<&PathBuf> = known
         .iter()
-        .filter(|root| root.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+        .filter(|root| {
+            if name.contains('/') {
+                root.ends_with(name)
+            } else {
+                root.file_name().and_then(|n| n.to_str()) == Some(name.as_str())
+            }
+        })
         .collect();
 
     match hits.len() {
@@ -232,7 +241,7 @@ fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
             known_names(known)
         )),
         _ => Err(format!(
-            "\"{name}\" names {} repos: {}. Pass one of those paths. {GRAMMAR_HINT}",
+            "\"{name}\" names {} repos: {}. Pass one of those paths, or a longer suffix such as parent/name. {GRAMMAR_HINT}",
             hits.len(),
             hits.iter()
                 .map(|r| r.display().to_string())

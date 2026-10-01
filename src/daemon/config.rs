@@ -111,6 +111,11 @@ pub struct DaemonConfig {
     /// See [`DEFAULT_DISCOVERY_CACHE_SECS`]. `0` disables the cache.
     pub discovery_cache_secs: u64,
 
+    /// Directories whose stores are never discovered and never part of
+    /// `root="*"`: a path here silences every store at or below it. Hand-owned
+    /// like the rest of this file; `~/` is expanded.
+    pub ignore: Vec<String>,
+
     /// Global `[priors]` layer applied as the base for every repo. The distiller
     /// (program/args/model) is a machine-wide choice, so it belongs here — set it
     /// once instead of per-repo. A repo's `.mdkb/config.toml` `[priors]` overrides
@@ -146,6 +151,7 @@ impl Default for DaemonConfig {
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            ignore: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         }
@@ -176,6 +182,18 @@ impl DaemonConfig {
     /// this config.
     pub fn repo_map_path(&self) -> Option<PathBuf> {
         self.state_dir.as_ref().map(|d| d.join(REPO_MAP_NAME))
+    }
+
+    /// [`ignore`](Self::ignore) as the canonical paths discovery compares
+    /// against. A path that does not resolve is kept as written.
+    pub fn ignored_paths(&self) -> Vec<PathBuf> {
+        self.ignore
+            .iter()
+            .map(|entry| {
+                let path = expand_tilde(entry);
+                crate::domain::canonicalize_plain(&path).unwrap_or(path)
+            })
+            .collect()
     }
 
     /// Save config to a TOML file.
@@ -362,6 +380,7 @@ mod tests {
                 },
             ],
             discovery_cache_secs: 90,
+            ignore: Vec::new(),
             priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
             state_dir: Some(PathBuf::from("/Users/me/.mdkb")),
         };
@@ -427,6 +446,7 @@ whitelist_dirs = ["~/Code"]
                 root: "/foo/bar".to_string(),
             }],
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            ignore: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         };

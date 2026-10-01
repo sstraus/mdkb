@@ -1591,6 +1591,7 @@ mdkb schema [COMMAND]                                   # the CLI as JSON, for m
 (omitted)                                               # the declared workspace, and every store nested under it
 root=\"/abs/path\"                                        # one repo by path; need not be a known repo
 root=\"name\"                                             # one repo by name, the last component of a known root
+root=\"parent/name\"                                     # the same, by trailing path components: how a name several repos share is told apart
 root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
 root=\"*\"                                                # every known repo (`mdkb daemon status` lists them)
 # Only `search` fans out; every other tool needs a selector naming one repo —

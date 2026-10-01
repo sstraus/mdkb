@@ -101,8 +101,11 @@ mod platform {
             println!("mdkb daemon: not running");
         }
         println!("  base:       {}", s.base_dir.display());
-        let known = crate::daemon::repo_map::read_known_roots(&s.base_dir.join("repos.json"));
-        let discoverable = crate::daemon::repo_map::discover_nested_stores(&known);
+        let ignore =
+            crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml"))?.ignored_paths();
+        let mut known = crate::daemon::repo_map::read_known_roots(&s.base_dir.join("repos.json"));
+        known.retain(|root| !crate::daemon::repo_map::is_ignored(root, &ignore));
+        let discoverable = crate::daemon::repo_map::discover_nested_stores(&known, &ignore);
         println!(
             "  repos:      {} known, {} discoverable",
             known.len(),

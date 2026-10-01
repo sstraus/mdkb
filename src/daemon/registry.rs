@@ -486,7 +486,16 @@ impl RepoRegistry {
             .collect();
         walk.extend(uncovered);
         roots.extend(self.walk_for(&walk));
+        self.retain_unignored(&mut roots);
         roots.into_iter().collect()
+    }
+
+    /// Drop the roots `daemon.toml` says to ignore.
+    pub fn retain_unignored(&self, roots: &mut std::collections::BTreeSet<PathBuf>) {
+        let ignore = self.daemon_config.ignored_paths();
+        if !ignore.is_empty() {
+            roots.retain(|root| !super::repo_map::is_ignored(root, &ignore));
+        }
     }
 
     /// The stores nested under `walk`, from the cache when it is still valid.
@@ -510,8 +519,9 @@ impl RepoRegistry {
     /// twice, exactly as before; the last one to finish wins the slot.
     fn walk_for(&self, walk: &[PathBuf]) -> Vec<PathBuf> {
         let ttl = std::time::Duration::from_secs(self.daemon_config.discovery_cache_secs);
+        let ignore = self.daemon_config.ignored_paths();
         if ttl.is_zero() {
-            return super::repo_map::discover_nested_stores(walk)
+            return super::repo_map::discover_nested_stores(walk, &ignore)
                 .into_iter()
                 .collect();
         }
@@ -525,7 +535,7 @@ impl RepoRegistry {
         {
             return hit.roots.clone();
         }
-        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk)
+        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk, &ignore)
             .into_iter()
             .collect();
         *self.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery {

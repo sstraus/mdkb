@@ -108,15 +108,25 @@ pub fn classify(root: &Path) -> RootHealth {
     }
 }
 
+/// Directory names the discovery walk never enters. `.tmp` holds scratch
+/// copies of repos (coverage and mutation runs), which are not repos.
+const SKIPPED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".mdkb", ".tmp"];
+
+/// Is `path` at or below one of the `ignore` paths?
+pub fn is_ignored(path: &Path, ignore: &[PathBuf]) -> bool {
+    ignore.iter().any(|ignored| path.starts_with(ignored))
+}
+
 /// Find stores below roots the daemon already knows, without opening or
 /// registering them. A store is identified by its SQLite file; walking stops
-/// at `.mdkb` so index internals are never traversed.
-pub fn discover_nested_stores(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
+/// at `.mdkb` so index internals are never traversed, and at every directory
+/// in [`SKIPPED_DIRS`] or under an `ignore` path.
+pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
     for root in roots {
         let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            !matches!(name.as_ref(), ".git" | "target" | "node_modules") && name != ".mdkb"
+            !SKIPPED_DIRS.contains(&name.as_ref()) && !is_ignored(entry.path(), ignore)
         });
         for entry in walker.filter_map(Result::ok) {
             if !entry.file_type().is_dir() {
@@ -124,7 +134,12 @@ pub fn discover_nested_stores(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
             }
             let candidate = entry.path().join(".mdkb/index.sqlite");
             if candidate.is_file() {
-                found.insert(canonical_key(entry.path()));
+                let key = canonical_key(entry.path());
+                // The walk compares the path as it was reached; the key is the
+                // canonical spelling the ignore entries are written in.
+                if !is_ignored(&key, ignore) {
+                    found.insert(key);
+                }
             }
         }
     }

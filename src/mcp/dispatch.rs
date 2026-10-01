@@ -1927,6 +1927,7 @@ pub fn resolve_root_selector(
             registry.known_roots().into_iter().collect()
         };
         set.extend(open.iter().cloned());
+        registry.retain_unignored(&mut set);
         set.into_iter().collect()
     };
     // A `root`-less call means the workspace the client declared and every
