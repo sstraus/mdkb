@@ -1,7 +1,9 @@
 //! Critic cases for story 214-1b93: attacks on the pruning of auto-detected
 //! collections whose directory is gone.
 
-use mdkb::cli::handlers::{handle_collection_add, handle_collection_update, handle_init, handle_update};
+use mdkb::cli::handlers::{
+    handle_collection_add, handle_collection_update, handle_init, handle_update,
+};
 use mdkb::core::Context;
 use mdkb::core::ops::handle_search;
 
@@ -35,7 +37,11 @@ fn a_convention_collection_the_user_repointed_is_not_pruned() {
     handle_update(&ctx, &root).expect("first update");
     handle_collection_update(&ctx, "docs", Some("notes"), None).expect("repoint docs at notes");
     handle_update(&ctx, &root).expect("second update");
-    assert_eq!(hits(&ctx, "repointeddoc"), 1, "precondition: repointed docs indexed");
+    assert_eq!(
+        hits(&ctx, "repointeddoc"),
+        1,
+        "precondition: repointed docs indexed"
+    );
 
     std::fs::remove_dir_all(root.join("notes")).unwrap();
     let result = handle_update(&ctx, &root).expect("third update");
@@ -69,7 +75,10 @@ fn a_failed_update_after_a_prune_does_not_leave_a_false_vanished_report() {
     std::fs::remove_dir_all(root.join("ext")).unwrap();
     std::os::unix::fs::symlink(outside.path(), root.join("ext")).unwrap();
     let failed = handle_update(&ctx, &root);
-    assert!(failed.is_err(), "precondition: the escaping collection fails the update");
+    assert!(
+        failed.is_err(),
+        "precondition: the escaping collection fails the update"
+    );
 
     // Run 3: healthy again.
     std::fs::remove_file(root.join("ext")).unwrap();
@@ -102,8 +111,16 @@ fn a_pruned_directory_that_returns_is_registered_and_indexed_again() {
     write_doc(&root, "archive", "new.md", "# New\n\nsecondgeneration\n");
     let result = handle_update(&ctx, &root).expect("restore update");
 
-    assert_eq!(hits(&ctx, "secondgeneration"), 1, "the returned directory is indexed");
-    assert_eq!(hits(&ctx, "firstgeneration"), 0, "the old generation stays gone");
+    assert_eq!(
+        hits(&ctx, "secondgeneration"),
+        1,
+        "the returned directory is indexed"
+    );
+    assert_eq!(
+        hits(&ctx, "firstgeneration"),
+        0,
+        "the old generation stays gone"
+    );
     assert!(result.collections_pruned.is_empty());
     assert!(result.collections_vanished.is_empty());
 }
