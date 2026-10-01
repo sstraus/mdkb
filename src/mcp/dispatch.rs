@@ -676,6 +676,7 @@ impl DispatchContext {
         }
 
         let mut ctx_guard = handle.ctx.lock().await;
+        let _hold = crate::core::SlotHold::start("record_persistent_call");
         if ctx_guard.is_none() {
             return;
         }
@@ -701,6 +702,7 @@ impl DispatchContext {
 /// Ensure the repo's database context is initialized.
 pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("ensure_handle_context");
     open_handle_context(&mut ctx_guard, handle)
 }
 
@@ -737,6 +739,64 @@ fn open_handle_context(
     Ok(())
 }
 
+/// Test seam: stalls a hook's acquisitions of its store, for the tests that
+/// need a hook cut by its deadline. Holding the slot no longer does that, since
+/// a hook bypasses a busy slot (#209-bc4b).
+#[cfg(test)]
+mod store_stall {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    struct Stall {
+        pass: usize,
+        hold: Duration,
+        every: bool,
+    }
+
+    static STALLS: LazyLock<Mutex<HashMap<PathBuf, Stall>>> = LazyLock::new(Default::default);
+
+    /// Let `pass` acquisitions of `root` through, then stall the next for `hold`.
+    pub fn arm(root: &Path, pass: usize, hold: Duration) {
+        let stall = Stall {
+            pass,
+            hold,
+            every: false,
+        };
+        STALLS.lock().unwrap().insert(root.to_path_buf(), stall);
+    }
+
+    /// Stall every acquisition of `root` for `hold`.
+    pub fn arm_all(root: &Path, hold: Duration) {
+        let stall = Stall {
+            pass: 0,
+            hold,
+            every: true,
+        };
+        STALLS.lock().unwrap().insert(root.to_path_buf(), stall);
+    }
+
+    pub async fn maybe_stall(root: &Path) {
+        let hold = {
+            let mut stalls = STALLS.lock().unwrap();
+            let Some(stall) = stalls.get_mut(root) else {
+                return;
+            };
+            if stall.pass > 0 {
+                stall.pass -= 1;
+                return;
+            }
+            let hold = stall.hold;
+            if !stall.every {
+                stalls.remove(root);
+            }
+            hold
+        };
+        tokio::time::sleep(hold).await;
+    }
+}
+
 /// How a hook reaches the store for its read legs.
 ///
 /// A mutation (watcher reindex, update, session index, embedding backfill) holds
@@ -746,7 +806,10 @@ fn open_handle_context(
 /// that finds the slot busy reads through its own, and never queues.
 enum HookStore {
     /// The long-lived context, locked. The slot was free.
-    Slot(tokio::sync::OwnedMutexGuard<Option<Context>>),
+    Slot(
+        tokio::sync::OwnedMutexGuard<Option<Context>>,
+        crate::core::SlotHold,
+    ),
     /// A private read-only context; the slot is busy and left alone.
     ///
     /// A corrupt read empties it, like [`crate::core::run_guarded_read`] does the
@@ -756,10 +819,14 @@ enum HookStore {
 }
 
 impl HookStore {
+    fn is_bypass(&self) -> bool {
+        matches!(self, Self::Bypass(_))
+    }
+
     /// The slot-shaped view the guarded readers take.
     fn slot(&mut self) -> &mut Option<Context> {
         match self {
-            Self::Slot(guard) => &mut **guard,
+            Self::Slot(guard, _) => &mut **guard,
             Self::Bypass(ctx) => ctx,
         }
     }
@@ -769,7 +836,8 @@ impl HookStore {
     async fn for_write(&mut self, handle: &RepoHandle) -> Result<&mut Option<Context>, McpError> {
         if matches!(self, Self::Bypass(_)) {
             ensure_handle_context(handle).await?;
-            *self = Self::Slot(Arc::clone(&handle.ctx).lock_owned().await);
+            let guard = Arc::clone(&handle.ctx).lock_owned().await;
+            *self = Self::Slot(guard, crate::core::SlotHold::start("hook write"));
         }
         Ok(self.slot())
     }
@@ -784,7 +852,7 @@ impl HookStore {
         f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
     ) {
         match self {
-            Self::Slot(guard) => {
+            Self::Slot(guard, _) => {
                 log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
             }
             Self::Bypass(_) => write_behind_slot(Arc::clone(ctx), what, f),
@@ -792,10 +860,13 @@ impl HookStore {
     }
 }
 
-/// Log the outcome of a best-effort write to the slot.
+/// Log the outcome of a best-effort write to the slot. `None` means the slot
+/// was empty (closed by a holder's probe), so the write was lost.
 fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
-    if let Some(Err(error)) = outcome {
-        tracing::warn!("{what} failed: {error}");
+    match outcome {
+        Some(Ok(())) => {}
+        Some(Err(error)) => tracing::warn!("{what} failed: {error}"),
+        None => tracing::warn!("{what} dropped: the store was closed before it could be written"),
     }
 }
 
@@ -807,7 +878,14 @@ fn write_behind_slot(
 ) {
     tokio::spawn(async move {
         let mut guard = ctx.lock_owned().await;
-        log_slot_write(what, crate::core::run_guarded_write(&mut guard, what, f));
+        let written = tokio::task::spawn_blocking(move || {
+            crate::core::run_guarded_write(&mut guard, what, f)
+        })
+        .await;
+        match written {
+            Ok(outcome) => log_slot_write(what, outcome),
+            Err(error) => tracing::warn!("{what} task failed: {error}"),
+        }
     });
 }
 
@@ -826,7 +904,10 @@ async fn ensure_handle_context_unless_busy(handle: &RepoHandle) -> Result<(), Mc
 /// busy. `None` when the slot is busy and no read-only context opens.
 fn hook_store_if_open(handle: &RepoHandle) -> Option<HookStore> {
     match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(guard) => Some(HookStore::Slot(guard)),
+        Ok(guard) => Some(HookStore::Slot(
+            guard,
+            crate::core::SlotHold::start("hook read"),
+        )),
         Err(_) => Context::open_read_only(&handle.root)
             .ok()
             .map(|ctx| HookStore::Bypass(Some(ctx))),
@@ -837,16 +918,25 @@ fn hook_store_if_open(handle: &RepoHandle) -> Option<HookStore> {
 /// context if needed), otherwise a private read-only context. Falls back to
 /// waiting for the slot when no read-only context can be opened (stale schema).
 async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
+    #[cfg(test)]
+    store_stall::maybe_stall(&handle.root).await;
     if let Ok(mut guard) = Arc::clone(&handle.ctx).try_lock_owned() {
         open_handle_context(&mut guard, handle)?;
-        return Ok(HookStore::Slot(guard));
+        return Ok(HookStore::Slot(
+            guard,
+            crate::core::SlotHold::start("hook read"),
+        ));
     }
     match Context::open_read_only(&handle.root) {
         Ok(ctx) => Ok(HookStore::Bypass(Some(ctx))),
         Err(error) => {
             tracing::debug!("hook read bypass unavailable, waiting for the store: {error}");
             ensure_handle_context(handle).await?;
-            Ok(HookStore::Slot(Arc::clone(&handle.ctx).lock_owned().await))
+            let guard = Arc::clone(&handle.ctx).lock_owned().await;
+            Ok(HookStore::Slot(
+                guard,
+                crate::core::SlotHold::start("hook read"),
+            ))
         }
     }
 }
@@ -953,6 +1043,7 @@ async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
         // Cheap indexed COUNT(*): only a positive count is worth loading the model.
         let pending = {
             let mut guard = ctx.blocking_lock();
+            let _hold = crate::core::SlotHold::start("embedding backlog count");
             crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
                 crate::store::memory::count_pending_embeddings(&ctx.conn)
             })
@@ -1018,6 +1109,7 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("status_impl");
     let mut output = crate::core::run_guarded_read(&mut ctx_guard, "status", |ctx| {
         let index_status = search::get_status(&ctx.conn)?;
 
@@ -1083,6 +1175,7 @@ pub async fn memory_delete_impl(
 
     if dry_run {
         let mut ctx_guard = handle.ctx.lock().await;
+        let _hold = crate::core::SlotHold::start("memory_delete_impl");
         let exists =
             crate::core::run_guarded_read(&mut ctx_guard, "memory delete dry run", |ctx| {
                 memory::get_entry_without_tracking(&ctx.conn, id)
@@ -1309,6 +1402,7 @@ pub async fn memory_write_impl(
 
     if dry_run {
         let mut ctx_guard = handle.ctx.lock().await;
+        let _hold = crate::core::SlotHold::start("memory_write_impl");
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1444,6 +1538,7 @@ pub async fn memory_write_batch_impl(
 
     if dry_run {
         let mut ctx_guard = handle.ctx.lock().await;
+        let _hold = crate::core::SlotHold::start("memory_write_batch_impl");
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1471,6 +1566,7 @@ pub async fn memory_list_impl(
     ensure_handle_context(handle).await?;
 
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("memory_list_impl");
     let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory list", |ctx| {
         memory::list_entries_sorted(
             &ctx.conn,
@@ -1554,6 +1650,7 @@ pub async fn search_impl(
     match scope {
         Some(crate::mcp::tools::SearchScope::Docs) => {
             let mut ctx_guard = handle.ctx.lock().await;
+            let _hold = crate::core::SlotHold::start("search_impl");
             let results = crate::core::run_guarded_read(&mut ctx_guard, "document search", |ctx| {
                 handle_hybrid_search(
                     ctx,
@@ -1581,6 +1678,7 @@ pub async fn search_impl(
         Some(crate::mcp::tools::SearchScope::Memory) => {
             let query_embedding = embed_query_off_lock(&params.query).await;
             let mut ctx_guard = handle.ctx.lock().await;
+            let _hold = crate::core::SlotHold::start("search_impl");
             let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory search", |ctx| {
                 memory::search_entries_recall(
                     &ctx.conn,
@@ -1611,6 +1709,7 @@ pub async fn search_impl(
         None => {
             let query_embedding = embed_query_off_lock(&params.query).await;
             let mut ctx_guard = handle.ctx.lock().await;
+            let _hold = crate::core::SlotHold::start("search_impl");
             let (doc_results, mem_entries) =
                 crate::core::run_guarded_read(&mut ctx_guard, "combined search", |ctx| {
                     let docs = handle_hybrid_search(
@@ -1743,6 +1842,7 @@ pub async fn search_impl(
             // so it does not take the code-index guard the other code scopes
             // need. It does take the memory connection, for the ignore-list.
             let mut ctx_guard = handle.ctx.lock().await;
+            let _hold = crate::core::SlotHold::start("search_impl");
             let report =
                 crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
                     crate::core::dup::handle_dup(
@@ -2451,6 +2551,7 @@ async fn get_batch_impl(
     }
 
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("get_batch_impl");
 
     let mut output = String::new();
     let mut found = 0usize;
@@ -2577,6 +2678,7 @@ async fn get_glob_impl(
 
     let (output, result_count) = {
         let mut ctx_guard = handle.ctx.lock().await;
+        let _hold = crate::core::SlotHold::start("get_glob_impl");
         let results = crate::core::run_guarded_read(&mut ctx_guard, "glob retrieval", |ctx| {
             handle_mget(ctx, pattern, None)
         })
@@ -2653,6 +2755,7 @@ pub async fn get_impl(
     }
 
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("get_impl");
 
     if let Ok(numeric_id) = id.parse::<i64>() {
         let doc = crate::core::run_guarded_read(&mut ctx_guard, "document get", |ctx| {
@@ -3134,6 +3237,7 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
 
     ensure_handle_context(handle).await?;
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("graph_impl");
 
     let relation = params.relation.as_deref();
     let entity = &params.entity;
@@ -3628,6 +3732,7 @@ pub async fn usage_impl(
     ensure_handle_context(handle).await?;
 
     let mut ctx_guard = handle.ctx.lock().await;
+    let _hold = crate::core::SlotHold::start("usage_impl");
     let (session, session_tool_usage, lifetime, lifetime_tool_usage) =
         crate::core::run_guarded_read(&mut ctx_guard, "usage report", |ctx| {
             let session = if session_id > 0 {
@@ -4694,6 +4799,7 @@ async fn hook_session_start_inner(
     // blamed for.
     phases.mark("context");
     let limit = cfg.warmup_limit.max(1);
+    let bypassed = store.is_bypass();
     let startup_data = crate::core::run_guarded_read(store.slot(), "hook session warmup", |ctx| {
         let (due_lines, entries) = get_warmup_entries(&ctx.conn, limit)?;
         let collection_names: Vec<String> = collections::list_collections(&ctx.conn)?
@@ -4703,9 +4809,13 @@ async fn hook_session_start_inner(
         // The cheap doctor checks, read against the store this session
         // opened — in a namespace, not `.mdkb/` — so a quarantine or a
         // drift is reported for the store the model will actually use.
-        let doctor = crate::cli::doctor::session_block(&crate::domain::doctor::findings(
-            &crate::cli::doctor::collect(&handle.root, Some(ctx), false),
-        ));
+        let mut facts = crate::cli::doctor::collect(&handle.root, Some(ctx), false);
+        if bypassed {
+            // The check counts live projection files against the rows of this
+            // snapshot, so a write in flight reads as drift.
+            facts.projection = None;
+        }
+        let doctor = crate::cli::doctor::session_block(&crate::domain::doctor::findings(&facts));
         Ok((due_lines, entries, collection_names, doctor))
     });
     let (due_lines, entries, collection_names, doctor_block) = match startup_data {
@@ -6855,8 +6965,9 @@ async fn write_hook_call(
         })
     })
     .await;
-    if let Ok(Some(Err(error))) = written {
-        tracing::warn!("record hook call: {error}");
+    match written {
+        Ok(outcome) => log_slot_write("hook telemetry", outcome),
+        Err(error) => tracing::warn!("hook telemetry task failed: {error}"),
     }
 }
 
@@ -13167,8 +13278,8 @@ mod tests {
         });
         seed_memory_entry(&handle, "stalled-topic").await;
 
-        // Another session's prompt holds the store: recall cannot finish.
-        let held = handle.ctx.lock().await;
+        // The store stalls: recall cannot finish.
+        store_stall::arm_all(&handle.root, std::time::Duration::from_secs(5));
         let t0 = std::time::Instant::now();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -13177,7 +13288,6 @@ mod tests {
         .await
         .expect("the hook must not wait for the store");
         let waited = t0.elapsed();
-        drop(held);
 
         assert_eq!(result, json!({}), "no recall block past the deadline");
         assert!(
@@ -13238,14 +13348,13 @@ mod tests {
         seed_memory_entry(&handle, "queued-topic").await;
         let dctx = make_dctx();
 
-        let held = handle.ctx.lock().await;
+        store_stall::arm_all(&handle.root, std::time::Duration::from_secs(5));
         let t0 = std::time::Instant::now();
         let (a, b) = tokio::join!(
             prompt_hook(&handle, &dctx, "one"),
             prompt_hook(&handle, &dctx, "two")
         );
         let waited = t0.elapsed();
-        drop(held);
 
         assert_eq!((a, b), (json!({}), json!({})));
         assert!(
@@ -13263,9 +13372,8 @@ mod tests {
         });
         seed_memory_entry(&handle, "phase-topic").await;
 
-        let held = handle.ctx.lock().await;
+        store_stall::arm_all(&handle.root, std::time::Duration::from_secs(5));
         prompt_hook(&handle, &make_dctx(), "phases").await;
-        drop(held);
 
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert_eq!(row["outcome"], "deadline");
@@ -13552,57 +13660,19 @@ mod tests {
         assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1000);
     }
 
-    /// One link of a chain of store holders. tokio's mutex is FIFO and the hook
-    /// takes the store once per phase, so a holder that queues its successor
-    /// while the hook waits behind it sits between two of the hook's
-    /// acquisitions. The last link holds the store past any deadline used here.
-    fn stall_store<T: Send + 'static>(
-        ctx: Arc<tokio::sync::Mutex<T>>,
-        later: usize,
-        hold_ms: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-        Box::pin(async move {
-            let guard = Arc::clone(&ctx).lock_owned().await;
-            // Let the hook queue behind this link before queueing the next.
-            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
-            if later == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                drop(guard);
-                return;
-            }
-            let next = tokio::spawn(stall_store(ctx, later - 1, 100));
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            drop(guard);
-            next.await.unwrap();
-        })
-    }
-
     /// Run one prompt whose search finishes but whose store acquisition number
-    /// `later + 2` cannot get the store: `later` links pass it to the hook and
-    /// back before the last one keeps it past the deadline. The hook takes it
-    /// for: 1 context, 2 search, 3 recall log, 4-5 enrichment (only with
-    /// entries), then 2 for the prior lookup, so `later = 4` cuts the run in
-    /// the prior lookup, after the shadow recall is set. Returns the hook answer.
+    /// `later + 1` stalls past the deadline: `later` acquisitions pass. The hook
+    /// takes the store for: 1 search, 2 enrichment (only with entries), then 3
+    /// for the prior lookup, so `later = 1` cuts the run in the enrichment,
+    /// after the search. Returns the hook answer.
     async fn prompt_cut_after_search(
         handle: &Arc<RepoHandle>,
         dctx: &DispatchContext,
         session: &str,
         later: usize,
     ) -> Value {
-        let held = Arc::clone(&handle.ctx).lock_owned().await;
-        let ctx = Arc::clone(&handle.ctx);
-        let mut blocker = None;
-        let (result, ()) = tokio::join!(prompt_hook(handle, dctx, session), async {
-            // The hook is queued on the store by now; queue the first holder behind it.
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            // The first holder outlasts the hook's embedding, which runs off the
-            // lock, so the hook is queued for its search before the next link is.
-            blocker = Some(tokio::spawn(stall_store(ctx, later, 400)));
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            drop(held);
-        });
-        blocker.unwrap().await.unwrap();
-        result
+        store_stall::arm(&handle.root, later, std::time::Duration::from_secs(5));
+        prompt_hook(handle, dctx, session).await
     }
 
     #[tokio::test]
@@ -13615,7 +13685,7 @@ mod tests {
         seed_memory_entry(&handle, "cut-topic").await;
         let dctx = make_dctx();
 
-        let cut = prompt_cut_after_search(&handle, &dctx, "cut", 4).await;
+        let cut = prompt_cut_after_search(&handle, &dctx, "cut", 1).await;
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert_eq!(row["outcome"], "deadline", "{row}");
         assert!(
