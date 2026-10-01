@@ -23,7 +23,7 @@ fn run_session_start_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     // them in the fixture home, through the real command, and pin the profile dir.
     let registered = mdkb_bin()
         .args(["setup", "hooks", "claude", "--scope", "user"])
-        .current_dir(home.path())
+        .current_dir(dir)
         .env("MDKB_NO_DAEMON", "1")
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
