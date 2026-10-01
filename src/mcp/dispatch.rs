@@ -4412,26 +4412,26 @@ fn admit_doc_hits(
         .collect()
 }
 
-/// A closure for [`admit_doc_hits`]: whether the file behind an indexed document
-/// is still on disk. Between a deletion and the next `update` the index still
+/// A closure for [`admit_doc_hits`] and [`doc_graph_neighbors`]: whether the file
+/// behind an indexed document (`collection`, `path`) is still on disk. Between a deletion and the next `update` the index still
 /// lists it, and recall must not point at it. Read-only: `update` prunes the
 /// row. A collection's directory is resolved once per collection; a stat that
 /// fails for any reason but absence keeps the document, as `update` does.
 fn indexed_file_present<'a>(
     conn: &'a rusqlite::Connection,
     root: &'a std::path::Path,
-) -> impl FnMut(&crate::domain::SearchResult) -> bool + 'a {
+) -> impl FnMut(&str, &str) -> bool + 'a {
     let mut dirs: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
-    move |hit| {
-        let dir = dirs.entry(hit.collection.clone()).or_insert_with(|| {
-            crate::store::collections::get_collection(conn, &hit.collection)
+    move |collection, path| {
+        let dir = dirs.entry(collection.to_string()).or_insert_with(|| {
+            crate::store::collections::get_collection(conn, collection)
                 .ok()
                 .flatten()
                 .map(|c| root.join(c.path))
         });
         dir.as_ref()
-            .is_none_or(|dir| !matches!(dir.join(&hit.path).try_exists(), Ok(false)))
+            .is_none_or(|dir| !matches!(dir.join(path).try_exists(), Ok(false)))
     }
 }
 
@@ -5618,11 +5618,12 @@ async fn hook_user_prompt_submit_impl_timed(
                         false,
                     )
                     .map(|hits| {
+                        let mut present = indexed_file_present(&ctx.conn, &root);
                         admit_doc_hits(
                             hits,
                             &prompt,
                             docs_min_cosine,
-                            indexed_file_present(&ctx.conn, &root),
+                            |hit| present(&hit.collection, &hit.path),
                             docs_limit,
                         )
                     })
@@ -5803,6 +5804,7 @@ async fn hook_user_prompt_submit_impl_timed(
                         &seen,
                         handle.config.graph.doc_neighbor_cap,
                         query_embedding.as_deref(),
+                        indexed_file_present(&ctx.conn, &handle.root),
                     )
                 },
             ) {
@@ -6168,16 +6170,18 @@ async fn prompt_prior_block(
 /// at `cap`. Soft wikilink edges are skipped (frontmatter relations are the
 /// strong, curated signal) and so are non-document targets (entity tags like
 /// `themes`/`owner`). Neighbors whose canonical path is in `seen`
-/// (already-injected memory ids) or already emitted are de-duplicated.
+/// (already-injected memory ids) or already emitted are de-duplicated, and so are
+/// those whose file is gone (`present`; see [`indexed_file_present`]).
 fn doc_graph_neighbors(
     conn: &rusqlite::Connection,
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
     cap: usize,
     query_embedding: Option<&[f32]>,
+    mut present: impl FnMut(&str, &str) -> bool,
 ) -> crate::Result<Vec<(String, String)>> {
     use crate::store::graph;
-    let mut candidates: Vec<((String, String), Option<f32>)> = Vec::new();
+    let mut candidates: Vec<((String, String, String), Option<f32>)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tok in tokens {
         let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
@@ -6196,10 +6200,10 @@ fn doc_graph_neighbors(
             let Some(target_id) = graph::resolve_ref_to_doc(conn, &edge.target_ref)? else {
                 continue;
             };
-            let path: String = conn.query_row(
-                "SELECT relative_path FROM documents WHERE id=?1",
+            let (path, collection): (String, String) = conn.query_row(
+                "SELECT relative_path, collection FROM documents WHERE id=?1",
                 [target_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if seen.contains(&path) || !emitted.insert(path.clone()) {
                 continue;
@@ -6213,14 +6217,17 @@ fn doc_graph_neighbors(
                 .ok()
                 .and_then(|blob| graph_neighbor_cosine(&blob, query))
             });
-            candidates.push(((path, edge.relation), score));
+            candidates.push(((path, edge.relation, collection), score));
         }
     }
     rank_graph_candidates(&mut candidates);
+    // The file check runs in rank order and stops at `cap`: one stat per
+    // neighbor that could be injected, not per edge.
     Ok(candidates
         .into_iter()
+        .filter(|((path, _, collection), _)| present(collection, path))
         .take(cap)
-        .map(|(item, _)| item)
+        .map(|((path, relation, _), _)| (path, relation))
         .collect())
 }
 
@@ -11069,6 +11076,7 @@ mod tests {
             &std::collections::HashSet::new(),
             1,
             Some(&[1.0, 0.0]),
+            |_, _| true,
         )
         .unwrap();
         assert_eq!(
@@ -11083,6 +11091,7 @@ mod tests {
             &std::collections::HashSet::new(),
             1,
             None,
+            |_, _| true,
         )
         .unwrap();
         assert_eq!(cold, [("newer-b.md".into(), "related".into())]);
@@ -11093,6 +11102,7 @@ mod tests {
                 &std::collections::HashSet::new(),
                 1,
                 Some(&[f32::NAN, 0.0]),
+                |_, _| true,
             )
             .unwrap(),
             cold,
