@@ -15776,4 +15776,223 @@ mod tests {
         let _ = close_context_on_reported_corruption::<()>(&mut slot, "test", Err(error));
         assert!(slot.is_none() && !crate::store::heal::has_process_probe(&db_path));
     }
+
+    /// Holds the store slot inside a mutation closure: `work` runs first, then
+    /// the closure waits for the release signal, then `finish` runs.
+    async fn critic_hold_slot(
+        handle: &RepoHandle,
+        work: impl FnOnce(&Context) + Send + 'static,
+        finish: impl FnOnce(&Context) + Send + 'static,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        ensure_handle_context(handle).await.unwrap();
+        let ctx = Arc::clone(&handle.ctx);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = tokio::task::spawn_blocking(move || {
+            crate::core::run_mutation(&ctx, "critic hold", |ctx| -> crate::error::Result<()> {
+                work(ctx);
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(20));
+                finish(ctx);
+                Ok(())
+            });
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the mutation never took the slot");
+        (release_tx, held)
+    }
+
+    /// Catches (#209-bc4b): the session-start doctor comparing the live entry
+    /// files with the snapshot's rows while a memory mutation has written a file
+    /// and not yet committed its row, so every session that starts during a
+    /// memory write opens with a false "memory.projection_drift" warning.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_session_start_during_an_in_flight_projection_write_reports_no_drift() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warm-1").await;
+        let entries_dir = {
+            let guard = handle.ctx.lock().await;
+            guard.as_ref().unwrap().memory_dir().join("entries")
+        };
+        std::fs::create_dir_all(&entries_dir).unwrap();
+        std::fs::write(entries_dir.join("warm-1.md"), "projection of warm-1").unwrap();
+
+        let baseline = hook_session_start_impl(&handle, None).await;
+        assert!(
+            !additional_context(&baseline).contains("memory.projection_drift"),
+            "the baseline already drifts, the test proves nothing: {baseline}"
+        );
+
+        let inflight = entries_dir.join("inflight.md");
+        let (release, held) = critic_hold_slot(
+            &handle,
+            move |_| std::fs::write(&inflight, "written, row not committed yet").unwrap(),
+            |_| {},
+        )
+        .await;
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hook_session_start_impl(&handle, None),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let during = during.expect("the session start waited for the mutation");
+
+        // Control: the same file with no row IS drift once nothing is in flight,
+        // so the channel under test does carry the finding.
+        let after = hook_session_start_impl(&handle, None).await;
+        assert!(
+            additional_context(&after).contains("memory.projection_drift"),
+            "control: a settled orphan file must be reported: {after}"
+        );
+        assert!(
+            !additional_context(&during).contains("memory.projection_drift"),
+            "a half-applied mutation was reported as drift: {during}"
+        );
+    }
+
+    /// Catches (#209-bc4b): a bypass connection that sees a mutation's
+    /// uncommitted rows (shared connection, immutable open), delivering a
+    /// trigger line from a half-applied write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_a_bypass_read_never_sees_an_uncommitted_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        let (release, held) = critic_hold_slot(
+            &handle,
+            |ctx| {
+                ctx.conn
+                    .execute_batch(
+                        "BEGIN IMMEDIATE; \
+                         INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, triggers) \
+                         VALUES ('half', 'half', 'Half applied rule.', 'decision', '[]', 1, 1, '[{\"prompt_contains\":\"zzhalf\"}]');",
+                    )
+                    .unwrap();
+            },
+            |ctx| ctx.conn.execute_batch("COMMIT;").unwrap(),
+        )
+        .await;
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_body(&dctx, &handle, "zzhalf please", "half-session"),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let during = during.expect("the prompt waited for the mutation");
+        let after = prompt_body(&dctx, &handle, "zzhalf please", "half-session-2").await;
+
+        assert!(!during.contains("Half applied rule."), "{during}");
+        assert!(
+            after.contains("Half applied rule."),
+            "control: the committed row must be delivered: {after}"
+        );
+    }
+
+    /// Catches (#209-bc4b): a PreToolUse/PostToolUse hook still locking the slot
+    /// (or the tool path giving up on a busy slot) so that it waits out the
+    /// mutation even when no trigger matches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_post_tool_use_during_a_reindex_does_not_wait_for_it() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "edit-rule",
+            "Only for Edit.",
+            r#"[{"tool":"Edit"}]"#,
+        )
+        .await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hook_post_tool_use_impl(
+                &handle,
+                &json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "tool-bypass"}),
+            ),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let out = out.expect("the post-tool hook waited for the mutation");
+        assert!(!additional_context(&out).contains("edit-rule"), "{out}");
+    }
+
+    /// Catches (#209-bc4b): two hooks of one session that both read a trigger as
+    /// undelivered from the bypass snapshot and both inject it, because the
+    /// once-per-session record was taken from the snapshot instead of the slot.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_concurrent_tool_hooks_during_a_reindex_deliver_a_trigger_once() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(&handle, "bash-rule", "Use rg.", r#"[{"tool":"Bash"}]"#).await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            release.send(()).unwrap();
+        });
+        let event =
+            json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "twice"});
+        let (a, b) = tokio::join!(
+            hook_post_tool_use_impl(&handle, &event),
+            hook_post_tool_use_impl(&handle, &event)
+        );
+        releaser.join().unwrap();
+        held.await.unwrap();
+
+        let delivered = [&a, &b]
+            .iter()
+            .filter(|out| additional_context(out).contains("bash-rule"))
+            .count();
+        assert_eq!(delivered, 1, "a: {a} b: {b}");
+    }
+
+    /// Catches (#209-bc4b): the query-event row a prompt writes while the slot is
+    /// busy being dropped, instead of landing once the mutation lets go.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_query_event_written_during_a_reindex_lands_after_it() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.telemetry.query_events = true;
+        });
+        seed_memory_entry(&handle, "qe-mem").await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hook_user_prompt_submit_impl(
+                &handle,
+                "what do we know about the recall_gate_fixture topic content",
+            ),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+        out.expect("the prompt waited for the mutation");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows: i64 = {
+                let guard = handle.ctx.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM query_events", [], |r| r.get(0))
+                    .unwrap()
+            };
+            if rows >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred query event never landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }
