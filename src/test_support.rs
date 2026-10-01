@@ -88,13 +88,11 @@ impl Stub<'_> {
 
         let path = dir.join("stub.sh");
         std::fs::write(&path, body).expect("stub script must be written");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("stub script must be executable");
-        }
-        (path.to_string_lossy().into_owned(), Vec::new())
+        // Run it as `sh stub.sh`, never as `./stub.sh`: exec of a file that was
+        // just written fails with ETXTBSY whenever another test thread forked
+        // while the write fd was open, because that child holds a copy of the
+        // fd until its own exec. Interpreting the script only reads it.
+        ("sh".to_string(), vec![path.to_string_lossy().into_owned()])
     }
 
     #[cfg_attr(not(windows), allow(dead_code))]
