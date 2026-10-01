@@ -16385,4 +16385,285 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
+
+    // ---- critic 226-d09e: recall drops documents whose file is gone ----
+
+    fn quarantine_hits(n: usize) -> Vec<(crate::domain::SearchResult, Option<f64>)> {
+        (0..n)
+            .map(|i| scored_hit(&format!("docs/d{i}.md"), "Quarantine autoheal", None))
+            .collect()
+    }
+
+    /// Catches: the file check running on every search hit (or on hits the
+    /// admission gate already dropped) instead of lazily until `limit` are found.
+    /// 10 admitted hits, limit 2, all present: exactly 2 stats.
+    #[test]
+    fn critic_226_file_check_stops_at_the_limit() {
+        let mut calls = 0;
+        let got = admit_doc_hits(
+            quarantine_hits(10),
+            "how does quarantine autoheal work",
+            0.55,
+            |_| {
+                calls += 1;
+                true
+            },
+            2,
+        );
+        assert_eq!(got.len(), 2);
+        assert_eq!(calls, 2, "one stat per injected candidate, not per hit");
+    }
+
+    /// Catches: `.take(limit)` placed before the file filter, so a missing
+    /// top-ranked document eats a slot and fewer than `limit` are injected
+    /// although later hits exist.
+    #[test]
+    fn critic_226_missing_hits_do_not_consume_the_limit() {
+        let got = admit_doc_hits(
+            quarantine_hits(5),
+            "how does quarantine autoheal work",
+            0.55,
+            |hit| !matches!(hit.path.as_str(), "docs/d0.md" | "docs/d1.md"),
+            2,
+        );
+        let paths: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, ["docs/d2.md", "docs/d3.md"]);
+    }
+
+    /// Catches: the file check running before the admission gate, paying a stat
+    /// for hits that were never going to be injected.
+    #[test]
+    fn critic_226_unadmitted_hits_are_not_stat_ed() {
+        let mut calls = 0;
+        let got = admit_doc_hits(
+            vec![scored_hit("archive/x.md", "Unrelated title", Some(0.1))],
+            "how does quarantine autoheal work",
+            0.55,
+            |_| {
+                calls += 1;
+                true
+            },
+            3,
+        );
+        assert!(got.is_empty());
+        assert_eq!(calls, 0);
+    }
+
+    /// Catches: only the first hit being checked / limit 1 with a deleted top
+    /// hit returning nothing. End to end: limit 1, top-ranked file deleted, the
+    /// next hit is injected instead.
+    #[tokio::test]
+    async fn critic_226_limit_one_falls_through_to_the_next_present_document() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 1;
+        });
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        for name in ["a", "b", "c"] {
+            seed_document(
+                &handle,
+                &format!("docs/{name}.md"),
+                &format!("Quarantine autoheal {name}"),
+                content,
+            )
+            .await;
+        }
+        for name in ["a", "b"] {
+            std::fs::remove_file(tmp.path().join(format!("docs/docs/{name}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/c.md"), "{body}");
+        assert!(!body.contains("docs/a.md") && !body.contains("docs/b.md"), "{body}");
+    }
+
+    /// Catches: the whole collection directory removed (not one file): every
+    /// document under it must go, and the hook must not error out.
+    #[tokio::test]
+    async fn critic_226_collection_directory_removed_drops_all_its_documents() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/one.md", "Quarantine autoheal one", content).await;
+        seed_document(&handle, "docs/two.md", "Quarantine autoheal two", content).await;
+        std::fs::remove_dir_all(tmp.path().join("docs")).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(!body.contains("docs/one.md") && !body.contains("docs/two.md"), "{body}");
+    }
+
+    /// Catches: the collection directory resolved once for ALL collections (or
+    /// from the first collection seen), so a document in a second collection is
+    /// judged against the wrong directory and dropped though its file exists.
+    #[tokio::test]
+    async fn critic_226_each_collection_is_resolved_against_its_own_directory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/main.md", "Quarantine autoheal main", content).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                conn,
+                &crate::domain::Collection {
+                    name: "other".into(),
+                    path: "./elsewhere".into(),
+                    pattern: "**/*.md".into(),
+                    source: "manual".into(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: "other".into(),
+                relative_path: "guide.md".into(),
+                hash: crate::store::documents::compute_hash(content),
+                title: Some("Quarantine autoheal guide".into()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".into()),
+            };
+            crate::store::documents::index_document(conn, &doc, content).unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::fs::write(tmp.path().join("elsewhere/guide.md"), "x").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("guide.md"), "present file in 2nd collection: {body}");
+        assert!(body.contains("docs/main.md"), "{body}");
+    }
+
+    /// Catches: a collection with an ABSOLUTE path (sessions-style, outside the
+    /// root) being resolved by string concatenation instead of `Path::join`, which
+    /// would drop every document of it.
+    #[tokio::test]
+    async fn critic_226_absolute_collection_path_is_honoured() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/seed.md", "Quarantine autoheal seed", content).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            conn.execute(
+                "UPDATE collections SET path = ?1 WHERE name = 'default'",
+                [outside.path().to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(outside.path().join("docs")).unwrap();
+        std::fs::write(outside.path().join("docs/seed.md"), "x").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/seed.md"), "{body}");
+    }
+
+    /// Catches: `try_exists` on a dangling symlink being read as present (a
+    /// `symlink_metadata` check would keep it); the index entry points at a file
+    /// that cannot be read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226_dangling_symlink_counts_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/link.md", "Quarantine autoheal link", content).await;
+        seed_document(&handle, "docs/real.md", "Quarantine autoheal real", content).await;
+        let link = tmp.path().join("docs/docs/link.md");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("docs/docs/nowhere.md"), &link).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(!body.contains("docs/link.md"), "{body}");
+        assert!(body.contains("docs/real.md"), "{body}");
+    }
+
+    /// Catches: a path that exists but is now a DIRECTORY (file replaced by a
+    /// folder) being treated as present because the check is `exists`, not
+    /// `is_file`. `update` indexes files only, so it would prune this row.
+    #[tokio::test]
+    async fn critic_226_path_replaced_by_a_directory_is_not_injected() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/now_dir.md", "Quarantine autoheal dir", content).await;
+        seed_document(&handle, "docs/file.md", "Quarantine autoheal file", content).await;
+        let p = tmp.path().join("docs/docs/now_dir.md");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(!body.contains("docs/now_dir.md"), "{body}");
+        assert!(body.contains("docs/file.md"), "{body}");
+    }
+
+    /// Catches: `.take(cap)` before the file filter in `doc_graph_neighbors`, so
+    /// missing neighbors fill the cap and the present one is never listed.
+    #[tokio::test]
+    async fn critic_226_missing_neighbors_do_not_consume_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.graph.doc_neighbor_cap = 1;
+        });
+        for name in ["seed", "gone1", "gone2", "kept"] {
+            seed_document(&handle, &format!("notes/{name}.md"), name, "alpha beta").await;
+        }
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for target in ["notes/gone1.md", "notes/gone2.md", "notes/kept.md"] {
+                crate::store::graph::add_edge(
+                    conn,
+                    seed_id,
+                    target,
+                    "related",
+                    crate::store::graph::KIND_FRONTMATTER,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        for name in ["gone1", "gone2"] {
+            std::fs::remove_file(tmp.path().join(format!("docs/notes/{name}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("notes/kept.md (related)"), "{body}");
+        assert!(!body.contains("gone"), "{body}");
+    }
+
+    /// Catches: a stat error other than absence (EACCES on the parent dir)
+    /// dropping the document. `update` keeps the row in that case, so recall
+    /// must too (documented in `indexed_file_present`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226_unreadable_directory_keeps_the_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "sub/locked.md", "Quarantine autoheal locked", content).await;
+        let dir = tmp.path().join("docs/sub");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root bypasses permission bits: the stat then succeeds and the doc is kept anyway.
+        let body = additional_context(&out);
+        assert!(body.contains("sub/locked.md"), "{body}");
+    }
 }
