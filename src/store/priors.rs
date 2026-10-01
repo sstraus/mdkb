@@ -4012,4 +4012,249 @@ mod tests {
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.error_signature.as_deref(), Some("first failure"));
     }
+
+    // --- mutation survivors: score arithmetic, nearest cluster, curation report ---
+
+    fn assert_score(c: &PriorCluster, expected: f64) {
+        let got = cluster_injection_score(c, c.last_seen_at);
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "score {got} != documented {expected}"
+        );
+    }
+
+    // Catches: a wrong recurrence/belief/product formula that still crosses the
+    // 0.3 threshold the same way (`/` -> `%` or `*`, `+` -> `-`, `*` -> `/`).
+    #[test]
+    fn the_score_equals_the_values_the_docstring_publishes() {
+        let mut c = promoted_cluster("clu-score", r#"{"path_glob":"src/**"}"#, 2);
+        // Zero days since last seen, no verdicts: recurrence x 1/2.
+        for (sessions, expected) in [(2, 1.0 / 3.0), (3, 3.0 / 8.0), (7, 7.0 / 16.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+        // One confirmation plus one refutation leaves belief at 2/4.
+        c.confirmed_count = 1;
+        c.refuted_count = 1;
+        for (sessions, expected) in [(2, 1.0 / 3.0), (3, 3.0 / 8.0), (7, 7.0 / 16.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+        // One more refutation: belief 2/5.
+        c.refuted_count = 2;
+        for (sessions, expected) in [(2, 4.0 / 15.0), (3, 3.0 / 10.0), (7, 7.0 / 20.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+    }
+
+    fn embedded_cluster(conn: &Connection, id: &str, embedding: &[f32]) {
+        let mut c = promoted_cluster(id, r#"{"tool":"Edit","path_glob":"src/**"}"#, 1);
+        c.state = "candidate".into();
+        upsert_cluster(conn, &c).unwrap();
+        set_cluster_embedding(conn, id, embedding).unwrap();
+    }
+
+    fn edit_matcher() -> TriggerMatcher {
+        serde_json::from_str(r#"{"tool":"Edit","path_glob":"src/**"}"#).unwrap()
+    }
+
+    // Catches: `sim > best` weakened so the first (or the worst) cluster over
+    // the threshold wins instead of the closest.
+    #[test]
+    fn the_closest_cluster_over_the_threshold_is_the_one_returned() {
+        let conn = conn();
+        embedded_cluster(&conn, "clu-a", &[0.8, 0.6]); // cos 0.80
+        embedded_cluster(&conn, "clu-b", &[0.95, (1.0_f32 - 0.95 * 0.95).sqrt()]); // 0.95
+        embedded_cluster(&conn, "clu-c", &[0.9, (1.0_f32 - 0.9 * 0.9).sqrt()]); // 0.90
+
+        let found = find_cluster_by_embedding(&conn, &[1.0, 0.0], 0.7, &edit_matcher()).unwrap();
+
+        assert_eq!(found.as_deref(), Some("clu-b"));
+    }
+
+    // Catches: `>=` letting a later cluster displace an equally close earlier one.
+    #[test]
+    fn a_tie_keeps_the_first_cluster() {
+        let conn = conn();
+        embedded_cluster(&conn, "clu-a", &[0.8, 0.6]);
+        embedded_cluster(&conn, "clu-b", &[0.8, 0.6]);
+
+        let found = find_cluster_by_embedding(&conn, &[1.0, 0.0], 0.7, &edit_matcher()).unwrap();
+
+        assert_eq!(found.as_deref(), Some("clu-a"));
+    }
+
+    // Catches: keeping a candidate's `cluster_id` whose cluster row is gone
+    // (match guard forced true), which links evidence to nothing.
+    #[test]
+    fn recluster_recreates_a_cluster_whose_row_is_gone() {
+        let conn = conn();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let cand = sample_candidate(Some("clu-gone"));
+        upsert_candidate(&conn, &cand).unwrap();
+
+        recluster(&conn, 5000).unwrap();
+
+        let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
+        let rebuilt = cluster_id_for_key(&key);
+        assert_ne!(rebuilt, "clu-gone");
+        assert!(get_cluster(&conn, "clu-gone").unwrap().is_none());
+        let linked = get_candidate(&conn, &cand.id).unwrap().unwrap();
+        assert_eq!(linked.cluster_id.as_deref(), Some(rebuilt.as_str()));
+        let cluster = get_cluster(&conn, &rebuilt).unwrap().unwrap();
+        assert_eq!(cluster.evidence_count, 1);
+    }
+
+    /// Two clusters of one family, each with one candidate from `sessions[n]`.
+    /// Returns the ids, oldest first (same `created_at`, so by id).
+    fn family(conn: &Connection, sessions: [&str; 2]) -> Vec<String> {
+        let mut ids = Vec::new();
+        for (n, session) in sessions.iter().enumerate() {
+            let mut cand = sample_candidate(None);
+            cand.id = format!("family-{n}");
+            cand.trigger_matcher = format!(r#"{{"tool":"Edit","path_glob":"src/{n}/**"}}"#);
+            cand.source_session = Some((*session).to_string());
+            seed_own_cluster(conn, &cand, &[1.0, 0.0]);
+            ids.push(cluster_id_for_key(&canonical_trigger_key(
+                &cand.trigger_kind,
+                &cand.trigger_matcher,
+            )));
+        }
+        ids.sort();
+        ids
+    }
+
+    // Catches: `!was_promotable` dropped, so a survivor that only became
+    // promotable through the merge is not reported.
+    #[test]
+    fn curation_reports_a_survivor_the_merge_made_promotable() {
+        let conn = conn();
+        let ids = family(&conn, ["s-a", "s-b"]);
+
+        let report = curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
+
+        assert_eq!(report.newly_promotable, vec![ids[0].clone()]);
+    }
+
+    // Catches: `!was_promotable` dropped or `&&` -> `||`, which re-report a
+    // survivor that was already over the gate before the merge.
+    #[test]
+    fn curation_does_not_report_a_survivor_that_was_already_promotable() {
+        let conn = conn();
+        let ids = family(&conn, ["s-a", "s-b"]);
+        let mut survivor = get_cluster(&conn, &ids[0]).unwrap().unwrap();
+        survivor.distinct_sessions = PROMOTION_MIN_SESSIONS;
+        upsert_cluster(&conn, &survivor).unwrap();
+
+        let report = curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
+
+        assert!(report.newly_promotable.is_empty());
+    }
+
+    // Catches: `&&` -> `||`, which reports a survivor that never cleared the gate.
+    #[test]
+    fn curation_does_not_report_a_survivor_that_stays_under_the_gate() {
+        let conn = conn();
+        let ids = family(&conn, ["s-a", "s-a"]);
+
+        let report = curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
+
+        assert!(report.newly_promotable.is_empty());
+        assert_eq!(report.moved, 1);
+    }
+
+    /// Promote a two-session cluster whose first candidate carries the given
+    /// evidence, and return the stored prior's content.
+    fn promoted_content(failure: Option<&str>, fix: Option<&str>) -> String {
+        let conn = conn();
+        let mut first = cand_with("c1", "s1", MATCHER);
+        first.evidence_failure = failure.map(str::to_string);
+        first.evidence_fix = fix.map(str::to_string);
+        integrate_candidate(&conn, &first, 1000).unwrap();
+        let cluster_id = integrate_candidate(&conn, &cand_with("c2", "s2", MATCHER), 2000).unwrap();
+        let mem_id = promote_cluster(&conn, &cluster_id, 3000).unwrap().unwrap();
+        crate::store::memory::get_entry_without_tracking(&conn, &mem_id)
+            .unwrap()
+            .unwrap()
+            .content
+    }
+
+    const LESSON: &str = "Do not edit generated files; change the generator.";
+
+    // Catches: either `!` dropped in the evidence guard, which discards real
+    // evidence and keeps a footer built from blank text.
+    #[test]
+    fn a_promoted_prior_carries_its_evidence_footer_only_when_both_halves_are_real() {
+        assert_eq!(
+            promoted_content(Some("it broke"), Some("regenerate")),
+            format!("{LESSON}\n\nFailure: it broke\nFix: regenerate")
+        );
+        assert_eq!(promoted_content(Some("   "), Some("regenerate")), LESSON);
+        assert_eq!(promoted_content(Some("it broke"), Some("  ")), LESSON);
+        assert_eq!(promoted_content(None, None), LESSON);
+    }
+
+    // Catches: a blank signature stored on the cluster (the emptiness filter
+    // inverted), which later matches nothing yet counts as observable.
+    #[test]
+    fn a_blank_error_signature_leaves_the_cluster_unset_and_a_real_one_is_trimmed() {
+        let conn = conn();
+        let d = sample_distilled();
+        let key = canonical_trigger_key(&d.trigger_kind, &d.trigger_matcher);
+        let cluster_id = cluster_id_for_key(&key);
+
+        integrate_distilled(&conn, &d, "sess-1", 1000, None, Some("   ")).unwrap();
+        assert_eq!(
+            get_cluster(&conn, &cluster_id)
+                .unwrap()
+                .unwrap()
+                .error_signature,
+            None
+        );
+
+        integrate_distilled(&conn, &d, "sess-2", 2000, None, Some("  boom failed  ")).unwrap();
+        assert_eq!(
+            get_cluster(&conn, &cluster_id)
+                .unwrap()
+                .unwrap()
+                .error_signature
+                .as_deref(),
+            Some("boom failed")
+        );
+    }
+
+    // Catches: `len() > 1` -> `>= 1`, which keeps one-character tokens so two
+    // different failures sharing letters look like one.
+    #[test]
+    fn one_character_tokens_do_not_make_two_failures_look_alike() {
+        let tokens = signature_tokens("a b cd 7 x1 42");
+        let mut sorted: Vec<_> = tokens.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["cd".to_string(), "x1".to_string()]);
+        assert!(!signatures_match("a b c boom", "a b c other"));
+    }
+
+    // Catches: `&&` -> `||` in is_empty, which calls a report empty while one
+    // list still holds a cluster.
+    #[test]
+    fn a_settle_report_is_empty_only_when_every_list_is_empty() {
+        assert!(SettleReport::default().is_empty());
+        let one = || vec!["clu-a".to_string()];
+        let with_refuted = SettleReport {
+            refuted: one(),
+            ..Default::default()
+        };
+        let with_unobservable = SettleReport {
+            unobservable: one(),
+            ..Default::default()
+        };
+        let with_unrefuted = SettleReport {
+            unrefuted: one(),
+            ..Default::default()
+        };
+        assert!(!with_refuted.is_empty());
+        assert!(!with_unobservable.is_empty());
+        assert!(!with_unrefuted.is_empty());
+    }
 }
