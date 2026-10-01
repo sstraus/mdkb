@@ -882,22 +882,24 @@ async fn stats_reports_a_fresh_code_index_after_an_editing_session() {
     );
 }
 
-/// A drop is acted on even when not one delivered event routes anywhere.
+/// A burst of paths no sink acts on never reaches the channel, so it neither
+/// drops an event nor schedules a rescan.
 ///
-/// The recovery reads the watcher's dropped-events flag, and that read used to
-/// live in the flush arm — which only runs when a batch, a doc update or a
-/// memory sync is already pending. So a burst whose delivered events all route
-/// nowhere (the shape of a `cargo build`: hundreds of artifacts, not one of
-/// them a source file) left the loop blocked on `recv` with the flag set and
-/// nothing scheduled to read it. The source edit that was dropped in the same
-/// burst stayed out of the index until the next routed change happened to
-/// arrive — which, for someone who asked mdkb a question instead of typing,
-/// is the stale answer the review reported.
+/// Story 101-58b1 guarded the shape "every delivered event routes nowhere while
+/// the drop flag is set" (a `cargo build` filling the channel with artifacts).
+/// Story 196-7e19 removed that shape at the source: the watcher filters with
+/// `routed_path_filter` before the bounded channel, so a delivered event always
+/// routes somewhere and only an overflow of *routed* events can set the flag —
+/// and that overflow is read on the next delivered event. The recovery of a
+/// routed overflow is `a_burst_larger_than_the_channel_still_indexes_every_file`.
 ///
-/// Files with no known language are used rather than excluded ones so the test
-/// states the routing fact directly: `classify_change` sends these nowhere.
+/// What is left to protect here is the wiring: 600 files with no known language
+/// are six times the channel, so if `set_filter` stopped being installed they
+/// would overflow it, set the flag and force a full rescan. The final routed
+/// write is the control: it proves the watcher was live, so the silence before
+/// it is the filter and not a deaf watcher.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_drop_is_recovered_even_when_every_delivered_event_routes_nowhere() {
+async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     let _serial = WATCHER_TESTS.lock().await;
     let tmp = canonical_tempdir();
     let root = tmp.path().to_path_buf();
@@ -944,28 +946,34 @@ async fn a_drop_is_recovered_even_when_every_delivered_event_routes_nowhere() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
 
-    // Six times the channel, so the tail is certain to be dropped: measured
-    // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls.
+    // Six times the channel: unfiltered, the tail would be dropped (measured
+    // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls).
     const BURST: usize = 600;
-    let burst = || {
-        for n in 0..BURST {
-            std::fs::write(junk.join(format!("artifact{n}.o")), format!("{n}\n")).unwrap();
-        }
-    };
-    burst();
+    for n in 0..BURST {
+        std::fs::write(junk.join(format!("artifact{n}.o")), format!("{n}\n")).unwrap();
+    }
 
+    // Far longer than debounce (50ms) plus flush idle (200ms): a rescan caused
+    // by the burst would have completed well inside this.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        CODE_REINDEX_COUNT.load(Ordering::Relaxed),
+        code_before,
+        "a burst of unrouted files scheduled a reindex: the delivery filter is \
+         not installed, so the channel overflowed and forced a full rescan"
+    );
+
+    // Control: a routed change is still delivered and reindexed.
+    let routed = || std::fs::write(src.join("routed.rs"), "pub fn routed() {}\n").unwrap();
+    routed();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if CODE_REINDEX_COUNT.load(Ordering::Relaxed) > code_before {
-            break;
-        }
+    while CODE_REINDEX_COUNT.load(Ordering::Relaxed) == code_before {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the watcher dropped events during a burst that routed nowhere and never \
-             scheduled the recovery rescan (CODE_REINDEX_COUNT stuck at {code_before})"
+            "the watcher never reindexed a routed source file after the burst"
         );
         // Same nudge as the burst test: FSEvents arms its stream lazily.
-        burst();
+        routed();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
