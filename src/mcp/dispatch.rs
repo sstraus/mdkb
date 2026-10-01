@@ -2082,8 +2082,10 @@ fn format_outdated_line(outdated: &[std::path::PathBuf]) -> String {
         .iter()
         .take(COVERAGE_SHOWN)
         .map(|root| {
-            root.file_name()
-                .map_or_else(|| root.display().to_string(), |n| n.to_string_lossy().into())
+            root.file_name().map_or_else(
+                || root.display().to_string(),
+                |n| n.to_string_lossy().into(),
+            )
         })
         .collect();
     let more = outdated.len().saturating_sub(names.len());

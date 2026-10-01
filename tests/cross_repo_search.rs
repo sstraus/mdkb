@@ -663,7 +663,10 @@ async fn a_refreshed_store_is_read_by_the_next_cross_repo_search() {
         .await
         .expect("search");
     assert_eq!(found, 0, "{before}");
-    assert!(before.contains("Schema outdated, not searched (1)"), "{before}");
+    assert!(
+        before.contains("Schema outdated, not searched (1)"),
+        "{before}"
+    );
 
     mdkb::core::refresh::refresh_store(&old, "t1").expect("refresh");
 

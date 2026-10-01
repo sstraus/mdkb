@@ -197,7 +197,11 @@ fn a_v17_store_keeps_its_memory_rows_and_only_the_planned_cluster_changes() {
         Some(MINED_PRIOR_CREATED + PRIOR_TTL_SECS),
         "the mined prior is dated from its creation"
     );
-    assert_eq!(expires_at(&conn, "stated-prior"), None, "a stated prior is not");
+    assert_eq!(
+        expires_at(&conn, "stated-prior"),
+        None,
+        "a stated prior is not"
+    );
     assert_eq!(cluster_state(&conn, "reachable"), "candidate");
     assert_eq!(cluster_state(&conn, "unreachable"), "archived");
     let lesson: String = conn
@@ -270,7 +274,11 @@ fn the_backup_is_a_verified_copy_at_the_old_schema_next_to_the_store() {
         .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
         .expect("version");
     assert_eq!(version, 17, "the copy is the store as it was");
-    assert_eq!(memory_ids(&copy).len(), 5, "including the row the migration evicted");
+    assert_eq!(
+        memory_ids(&copy).len(),
+        5,
+        "including the row the migration evicted"
+    );
 }
 
 /// Fail closed: when the copy cannot be written the store is not opened for
@@ -316,12 +324,21 @@ fn a_failed_migration_rolls_back_every_step_and_keeps_the_backup() {
 
     let failure = refresh_store(&root, "t1").expect_err("the migration must fail");
 
-    assert!(failure.reason.contains("refused by the test"), "{failure:?}");
-    let backup = failure.backup.expect("the copy was taken before the attempt");
+    assert!(
+        failure.reason.contains("refused by the test"),
+        "{failure:?}"
+    );
+    let backup = failure
+        .backup
+        .expect("the copy was taken before the attempt");
     assert!(backup.exists());
     let conn = db(&root);
     assert_eq!(version_of(&root), 17);
-    assert_eq!(expires_at(&conn, "mined-prior"), None, "v22 was rolled back");
+    assert_eq!(
+        expires_at(&conn, "mined-prior"),
+        None,
+        "v22 was rolled back"
+    );
     assert_eq!(memory_ids(&conn).len(), 5, "v21 was rolled back");
     assert_eq!(cluster_state(&conn, "unreachable"), "candidate");
 }
@@ -385,14 +402,24 @@ fn the_command_migrates_every_outdated_store_and_exits_nonzero_on_a_failure() {
         .expect("run mdkb repos refresh");
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    assert!(!out.status.success(), "a failed store must fail the command: {stdout}");
+    assert!(
+        !out.status.success(),
+        "a failed store must fail the command: {stdout}"
+    );
     assert!(
         stdout.contains("1 migrated, 1 already current, 0 newer than this binary, 1 failed"),
         "{stdout}"
     );
     assert!(stdout.contains("FAILED"), "{stdout}");
-    assert!(stdout.contains("pre-migrate-v17"), "the kept backup is named: {stdout}");
-    assert_eq!(version_of(&outdated), SCHEMA_VERSION, "the failure did not stop the run");
+    assert!(
+        stdout.contains("pre-migrate-v17"),
+        "the kept backup is named: {stdout}"
+    );
+    assert_eq!(
+        version_of(&outdated),
+        SCHEMA_VERSION,
+        "the failure did not stop the run"
+    );
     assert_eq!(version_of(&broken), 17);
 
     // A second run has nothing left to do for the migrated store.
@@ -415,11 +442,22 @@ fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .output()
         .expect("run git");
-    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
@@ -457,7 +495,10 @@ fn a_whole_tree_update_records_head_and_nothing_else_does() {
     );
 
     mdkb::cli::handlers::handle_update(&ctx, &root).expect("update");
-    assert_eq!(mdkb::store::index_head::read(&ctx.conn).expect("read"), Some(first));
+    assert_eq!(
+        mdkb::store::index_head::read(&ctx.conn).expect("read"),
+        Some(first)
+    );
 
     let second = commit(&root, "docs/b.md", "# b");
     mdkb::core::indexing::handle_update_files(&ctx, &root, &["docs/b.md".to_string()])
@@ -476,5 +517,8 @@ fn a_whole_tree_update_records_head_and_nothing_else_does() {
 
     std::fs::remove_dir_all(root.join(".git")).expect("leave git");
     mdkb::cli::handlers::handle_update(&ctx, &root).expect("update");
-    assert_eq!(mdkb::store::index_head::read(&ctx.conn).expect("read"), None);
+    assert_eq!(
+        mdkb::store::index_head::read(&ctx.conn).expect("read"),
+        None
+    );
 }

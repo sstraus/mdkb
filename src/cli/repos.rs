@@ -75,7 +75,9 @@ fn render_refresh(reports: &[RefreshReport]) -> (String, usize) {
         "{migrated} migrated, {current} already current, {newer} newer than this binary, {failed} failed"
     );
     if migrated > 0 {
-        out.push_str("Restart a running daemon so it serves the migrated stores: mdkb daemon restart\n");
+        out.push_str(
+            "Restart a running daemon so it serves the migrated stores: mdkb daemon restart\n",
+        );
     }
     (out, failed)
 }

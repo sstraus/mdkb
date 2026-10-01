@@ -36,10 +36,10 @@ use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, DaemonCommand, ReposCommand, EvalCommand, EvolveCommand, ExperimentCommand,
+    Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
     GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
-    RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
-    SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
+    RemoveHooksCommand, RemoveMcpCommand, ReposCommand, SessionCommand, SetupCommand,
+    SetupHooksCommand, SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
 };
 use mdkb::core::Context;
 use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
