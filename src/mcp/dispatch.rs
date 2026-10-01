@@ -7342,6 +7342,10 @@ mod tests {
         assert!(!entry_in_scope(&entry, "lattice"));
     }
 
+    /// Deadline of every test handle that does not set one: far above any
+    /// loaded-box recall.
+    const CONTENT_TEST_DEADLINE_MS: u64 = 60_000;
+
     /// The one `RepoHandle::from_shared` in these tests.
     ///
     /// Every handle a test builds differs only in its root and in a line or
@@ -7350,6 +7354,10 @@ mod tests {
     fn handle_at(root: std::path::PathBuf, tweak: impl FnOnce(&mut Config)) -> Arc<RepoHandle> {
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
         let mut config = Config::default();
+        // Tests that check what a prompt returns must not inherit the
+        // production deadline: a loaded box cuts a cold store and the answer
+        // is empty (story 208). A test about the deadline sets its own below.
+        config.hooks.user_prompt_submit_deadline_ms = CONTENT_TEST_DEADLINE_MS;
         tweak(&mut config);
         let mut handle = RepoHandle::from_shared(
             root,
@@ -7437,6 +7445,29 @@ mod tests {
     /// A handle rooted at `tmp`, with the config the caller asks for.
     fn make_handle_with(tmp: &TempDir, tweak: impl FnOnce(&mut Config)) -> Arc<RepoHandle> {
         handle_at(tmp.path().to_path_buf(), tweak)
+    }
+
+    /// A second handle over the same store and root as `handle`, with its own
+    /// config: the way a test changes the deadline between two prompts, since a
+    /// handle's config is fixed once built.
+    fn handle_sharing_store_of(
+        handle: &RepoHandle,
+        tweak: impl FnOnce(&mut Config),
+    ) -> Arc<RepoHandle> {
+        let mut config = handle.config.clone();
+        config.hooks.user_prompt_submit_deadline_ms = CONTENT_TEST_DEADLINE_MS;
+        tweak(&mut config);
+        let mut shared = RepoHandle::from_shared(
+            handle.root.clone(),
+            Arc::clone(&handle.ctx),
+            Arc::clone(&handle.code_index),
+            config,
+            handle.code_ignore_patterns.clone(),
+            Arc::clone(&handle.doc_reindex_active),
+            Arc::clone(&handle.code_reindex_active),
+        );
+        shared.reranker = Arc::clone(&handle.reranker);
+        Arc::new(shared)
     }
 
     /// A handle rooted at `tmp/name` — a store nested under another one, which
@@ -15239,7 +15270,10 @@ mod tests {
         // Let the orphaned search end and release the store.
         drop(handle.ctx.lock().await);
 
-        let again = prompt_hook(&handle, &dctx, "same-session").await;
+        // The same store under a generous deadline: this half checks what the
+        // next prompt returns, and 400 ms is not enough for it on a loaded box.
+        let patient = handle_sharing_store_of(&handle, |_| {});
+        let again = prompt_hook(&patient, &dctx, "same-session").await;
         assert!(
             additional_context(&again).contains("after-cut-topic"),
             "next prompt after a cut run got nothing: {again}"

@@ -16,6 +16,9 @@ fn mdkb_bin() -> Command {
     Command::new(bin)
 }
 
+/// Deadline the content tests run under: far above any loaded-box recall.
+const CONTENT_TEST_DEADLINE_MS: u64 = 60_000;
+
 fn run_user_prompt_submit_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     // Recall is automatic by default. Pin the key to `false` so these
     // plain (un-prefixed) prompt tests keep their intent if the default moves. The gate itself is covered by
@@ -25,25 +28,37 @@ fn run_user_prompt_submit_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     // the file: `init` writes its defaults commented out, so there is no
     // `... = true` to patch, and a rewrite that matches nothing silently
     // leaves the gate on and every test here reading an empty stdout.
-    const KEY: &str = "user_prompt_submit_require_sigil = false";
+    //
+    // The deadline is pinned for the same reason. These tests check what recall
+    // returns; the production default (1000 ms) cuts a cold store on a loaded
+    // box and the answer is then empty, which tests nothing about recall. The
+    // deadline itself is tested in `src/mcp/dispatch.rs` with an explicit value.
+    let keys = [
+        "user_prompt_submit_require_sigil = false".to_string(),
+        format!("user_prompt_submit_deadline_ms = {CONTENT_TEST_DEADLINE_MS}"),
+    ];
     let cfg = dir.join(".mdkb/config.toml");
     let body = fs::read_to_string(&cfg).unwrap_or_default();
-    if !body.contains(KEY) {
+    let missing: Vec<&String> = keys
+        .iter()
+        .filter(|key| !body.contains(key.as_str()))
+        .collect();
+    if !missing.is_empty() {
         // A `[hooks]` table already put there by the caller has to receive the
-        // key; declaring the table twice is not valid TOML. Match the line, not
+        // keys; declaring the table twice is not valid TOML. Match the line, not
         // the substring: the commented defaults contain `# [hooks]` too.
         let mut patched: Vec<String> = Vec::new();
         let mut placed = false;
         for line in body.lines() {
             patched.push(line.to_string());
             if line.trim_end() == "[hooks]" {
-                patched.push(KEY.to_string());
+                patched.extend(missing.iter().map(|key| key.to_string()));
                 placed = true;
             }
         }
         if !placed {
             patched.push(String::from("\n[hooks]"));
-            patched.push(KEY.to_string());
+            patched.extend(missing.iter().map(|key| key.to_string()));
         }
         let _ = fs::write(&cfg, patched.join("\n") + "\n");
     }
