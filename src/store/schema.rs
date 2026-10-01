@@ -536,9 +536,9 @@ pub fn refuse_future_schema(conn: &Connection) -> Result<()> {
 
 /// Create the missing tables and migrate to the current version, in one
 /// transaction. The version is read AFTER `BEGIN IMMEDIATE` took the write
-/// lock: two openers of one stale store (`Context::open` takes only a shared
-/// lock) both see it stale, and the second must find it already migrated
-/// rather than run every step again.
+/// lock: two connections can both see a stale store before either holds the
+/// lock, and the second must find it already migrated (no-op) or migrated by a
+/// newer binary (refused), not run every step again.
 ///
 /// Atomic: a failure, or a crash, rolls the whole thing back.
 fn migrate_with_tables(conn: &Connection) -> Result<()> {
@@ -547,7 +547,15 @@ fn migrate_with_tables(conn: &Connection) -> Result<()> {
             create_tables(conn)?;
             migrate_schema_inner(conn, from)
         }
-        _ => Ok(()),
+        Some(_) => {
+            // Migrated while this connection waited for the lock. A newer
+            // binary's store must be refused here too: the check in
+            // `init_schema` ran before the wait.
+            refuse_future_schema(conn)
+        }
+        None => Err(Error::other(
+            "store has no schema version inside the migration",
+        )),
     })
 }
 
