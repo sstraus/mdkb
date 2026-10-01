@@ -4387,7 +4387,7 @@ async fn record_recall(
 const DOC_RECALL_POOL_FACTOR: usize = 4;
 
 /// The documents recall may inject: those with absolute evidence of relevance,
-/// in rank order, as `(path, title)`.
+/// in rank order.
 ///
 /// A hit is admitted when the cosine of its closest chunk reaches `min_cosine`,
 /// or when the prompt quotes its title or path
@@ -4399,7 +4399,7 @@ fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
     prompt: &str,
     min_cosine: f32,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<crate::domain::SearchResult> {
     hits.into_iter()
         .filter(|(hit, cosine)| {
             cosine.is_some_and(|c| c >= f64::from(min_cosine))
@@ -4408,7 +4408,65 @@ fn admit_doc_hits(
                     &format!("{} {}", hit.path, hit.title.as_deref().unwrap_or_default()),
                 )
         })
-        .map(|(hit, _)| (hit.path, hit.title.filter(|t| !t.is_empty())))
+        .map(|(hit, _)| hit)
+        .collect()
+}
+
+/// Pair each candidate with the file behind it, for [`take_present`]. The
+/// directory of a collection is resolved once; a collection the index does not
+/// know, or one without files on disk (sessions: their documents are virtual
+/// `{sid}-chunk-NNN` keys), pairs with `None`. This touches the index only, so
+/// it runs under the store guard; the filesystem is asked afterwards, outside
+/// it — a stat on a hung mount must not hold the store lock past the hook
+/// deadline.
+fn with_files<T>(
+    conn: &rusqlite::Connection,
+    root: &std::path::Path,
+    items: Vec<T>,
+    key: impl Fn(&T) -> (&str, &str),
+) -> Vec<(T, Option<std::path::PathBuf>)> {
+    let mut dirs: std::collections::HashMap<String, Option<std::path::PathBuf>> =
+        std::collections::HashMap::new();
+    items
+        .into_iter()
+        .map(|item| {
+            let (collection, path) = key(&item);
+            let file = dirs
+                .entry(collection.to_string())
+                .or_insert_with(|| {
+                    crate::store::collections::get_collection(conn, collection)
+                        .ok()
+                        .flatten()
+                        .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
+                        .map(|c| root.join(c.path))
+                })
+                .as_ref()
+                .map(|dir| dir.join(path));
+            (item, file)
+        })
+        .collect()
+}
+
+/// The first `cap` candidates whose file is still there, in rank order, one stat
+/// per candidate visited — not one per search hit or edge. Between a deletion
+/// and the next `update` the index still lists the document, and recall must not
+/// point at it; the row stays, `update` prunes it. A missing file, a dangling
+/// symlink, a directory in the file's place (`update` indexes files only) and a
+/// parent that is no longer a directory all count as gone; a stat that fails for
+/// any other reason keeps the document, as does `None`, as `update` does.
+fn take_present<T>(candidates: Vec<(T, Option<std::path::PathBuf>)>, cap: usize) -> Vec<T> {
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+    candidates
+        .into_iter()
+        .filter(|(_, file)| {
+            file.as_ref()
+                .is_none_or(|file| match std::fs::metadata(file) {
+                    Ok(meta) => meta.is_file(),
+                    Err(error) => !matches!(error.kind(), NotFound | NotADirectory),
+                })
+        })
+        .take(cap)
+        .map(|(item, _)| item)
         .collect()
 }
 
@@ -5489,6 +5547,8 @@ async fn hook_user_prompt_submit_impl_timed(
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
             let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
             let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
+            let mut doc_candidates: Vec<(crate::domain::SearchResult, Option<std::path::PathBuf>)> =
+                Vec::new();
             let search_t0 = std::time::Instant::now();
             let search = crate::core::run_guarded_read(store.slot(), "hook memory recall", |ctx| {
                 memory::search_entries_hybrid_fts(
@@ -5594,13 +5654,19 @@ async fn hook_user_prompt_submit_impl_timed(
                         None,
                         false,
                     )
+                    .map(|hits| {
+                        // Admission and ranking happen here, under the guard;
+                        // the files are only resolved, and checked below once
+                        // the guard is gone.
+                        with_files(
+                            &ctx.conn,
+                            &root,
+                            admit_doc_hits(hits, &prompt, docs_min_cosine),
+                            |hit| (hit.collection.as_str(), hit.path.as_str()),
+                        )
+                    })
                 }) {
-                    Some(Ok(hits)) => {
-                        doc_hits = admit_doc_hits(hits, &prompt, docs_min_cosine)
-                            .into_iter()
-                            .take(docs_limit)
-                            .collect();
-                    }
+                    Some(Ok(admitted)) => doc_candidates = admitted,
                     Some(Err(error)) => {
                         // Degrade silently (hooks must not block) but stay observable.
                         tracing::debug!("recall doc search failed: {error}");
@@ -5629,10 +5695,19 @@ async fn hook_user_prompt_submit_impl_timed(
                     None => {}
                 }
             }
+            drop(store);
+            doc_hits.extend(
+                take_present(doc_candidates, docs_limit)
+                    .into_iter()
+                    .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty()))),
+            );
             Some((scored_results, observed, doc_hits, rerank_pool))
         });
-        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) =
-            leg.await
+        let joined = leg.await;
+        if let Err(error) = &joined {
+            tracing::warn!("recall search task failed: {error}");
+        }
+        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) = joined
         else {
             return json!({});
         };
@@ -5766,23 +5841,43 @@ async fn hook_user_prompt_submit_impl_timed(
         if let Ok(mut store) = hook_store(handle).await {
             let seen: std::collections::HashSet<String> =
                 results.iter().map(|e| e.id.clone()).collect();
-            match crate::core::run_guarded_read(
-                store.slot(),
-                "hook document graph neighbors",
-                |ctx| {
-                    doc_graph_neighbors(
-                        &ctx.conn,
-                        &path_tokens,
-                        &seen,
-                        handle.config.graph.doc_neighbor_cap,
-                        query_embedding.as_deref(),
-                    )
-                },
-            ) {
-                Some(Ok(found)) => neighbors = found,
-                Some(Err(error)) => tracing::debug!("hook document neighbors failed: {error}"),
-                None => {}
-            }
+            let (tokens, embedding) = (path_tokens.clone(), query_embedding.clone());
+            let (root, cap) = (handle.root.clone(), handle.config.graph.doc_neighbor_cap);
+            // On the blocking pool, like the docs leg: the file checks run once
+            // the store guard is dropped, and a stat that hangs must not hold a
+            // runtime worker past the hook deadline.
+            let found = tokio::task::spawn_blocking(move || {
+                let candidates = crate::core::run_guarded_read(
+                    store.slot(),
+                    "hook document graph neighbors",
+                    |ctx| {
+                        let found =
+                            doc_graph_neighbors(&ctx.conn, &tokens, &seen, embedding.as_deref())?;
+                        Ok(with_files(
+                            &ctx.conn,
+                            &root,
+                            found,
+                            |(path, _, collection)| (collection.as_str(), path.as_str()),
+                        ))
+                    },
+                );
+                drop(store);
+                match candidates {
+                    Some(Ok(found)) => take_present(found, cap),
+                    Some(Err(error)) => {
+                        tracing::debug!("hook document neighbors failed: {error}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            })
+            .await;
+            neighbors = found
+                .map_err(|error| tracing::warn!("recall neighbor task failed: {error}"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, relation, _)| (path, relation))
+                .collect();
         }
     }
 
@@ -6137,8 +6232,8 @@ async fn prompt_prior_block(
 }
 
 /// Resolve doc-path `tokens` to their 1-hop *frontmatter* graph neighbors that
-/// point at real documents, formatted as `- <path> (<relation>)` lines, capped
-/// at `cap`. Soft wikilink edges are skipped (frontmatter relations are the
+/// point at real documents, as `(path, relation, collection)` in rank order.
+/// Soft wikilink edges are skipped (frontmatter relations are the
 /// strong, curated signal) and so are non-document targets (entity tags like
 /// `themes`/`owner`). Neighbors whose canonical path is in `seen`
 /// (already-injected memory ids) or already emitted are de-duplicated.
@@ -6146,11 +6241,10 @@ fn doc_graph_neighbors(
     conn: &rusqlite::Connection,
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
-    cap: usize,
     query_embedding: Option<&[f32]>,
-) -> crate::Result<Vec<(String, String)>> {
+) -> crate::Result<Vec<(String, String, String)>> {
     use crate::store::graph;
-    let mut candidates: Vec<((String, String), Option<f32>)> = Vec::new();
+    let mut candidates: Vec<((String, String, String), Option<f32>)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tok in tokens {
         let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
@@ -6169,10 +6263,10 @@ fn doc_graph_neighbors(
             let Some(target_id) = graph::resolve_ref_to_doc(conn, &edge.target_ref)? else {
                 continue;
             };
-            let path: String = conn.query_row(
-                "SELECT relative_path FROM documents WHERE id=?1",
+            let (path, collection): (String, String) = conn.query_row(
+                "SELECT relative_path, collection FROM documents WHERE id=?1",
                 [target_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             if seen.contains(&path) || !emitted.insert(path.clone()) {
                 continue;
@@ -6186,15 +6280,11 @@ fn doc_graph_neighbors(
                 .ok()
                 .and_then(|blob| graph_neighbor_cosine(&blob, query))
             });
-            candidates.push(((path, edge.relation), score));
+            candidates.push(((path, edge.relation, collection), score));
         }
     }
     rank_graph_candidates(&mut candidates);
-    Ok(candidates
-        .into_iter()
-        .take(cap)
-        .map(|(item, _)| item)
-        .collect())
+    Ok(candidates.into_iter().map(|(item, _)| item).collect())
 }
 
 /// Number of trailing transcript lines that form the mined episode window.
@@ -8730,6 +8820,99 @@ mod tests {
             status: Some("current".to_string()),
         };
         crate::store::documents::index_document(&ctx.conn, &doc, content).expect("seed doc");
+        // The file recall checks for: where `update` found it, under the
+        // collection's directory.
+        let file = handle.root.join("./docs").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+    }
+
+    /// Between a deletion and the next `update` the index still lists the
+    /// document. Catches: recall trusting the index and injecting a path whose
+    /// file is gone. On the old code the `deleted` assertion fails (the path is
+    /// in the injected block); the `kept` assertion shows the check drops only
+    /// the missing file, and recall stays read-only (the row survives).
+    #[tokio::test]
+    async fn recall_drops_a_document_whose_file_was_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(
+            &handle,
+            "docs/deleted.md",
+            "Quarantine autoheal deleted",
+            content,
+        )
+        .await;
+        seed_document(&handle, "docs/kept.md", "Quarantine autoheal kept", content).await;
+        std::fs::remove_file(tmp.path().join("docs/docs/deleted.md")).unwrap();
+
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(
+            !body.contains("docs/deleted.md"),
+            "a document whose file is gone must not be injected: {body}"
+        );
+        assert!(
+            body.contains("docs/kept.md"),
+            "a document whose file exists must still be injected: {body}"
+        );
+
+        let ctx_guard = handle.ctx.lock().await;
+        let rows: i64 = ctx_guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "recall must not prune the index; update does");
+    }
+
+    /// The doc-graph block is a recall injection too. Catches: a frontmatter
+    /// neighbor whose file is gone being listed under "related docs" because the
+    /// edge and the row outlive the file until the next `update`. On the old code
+    /// the `!body.contains("notes/gone.md")` assertion fails.
+    #[tokio::test]
+    async fn recall_drops_a_graph_neighbor_whose_file_was_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        for name in ["seed", "gone", "kept"] {
+            seed_document(&handle, &format!("notes/{name}.md"), name, "alpha beta").await;
+        }
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for target in ["notes/gone.md", "notes/kept.md"] {
+                crate::store::graph::add_edge(
+                    conn,
+                    seed_id,
+                    target,
+                    "related",
+                    crate::store::graph::KIND_FRONTMATTER,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        std::fs::remove_file(tmp.path().join("docs/notes/gone.md")).unwrap();
+
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(
+            body.contains("notes/kept.md (related)"),
+            "a neighbor whose file exists must still be listed: {body}"
+        );
+        assert!(
+            !body.contains("notes/gone.md"),
+            "a neighbor whose file is gone must not be listed: {body}"
+        );
     }
 
     #[tokio::test]
@@ -9258,7 +9441,7 @@ mod tests {
         assert!(admit_doc_hits(hits(), "how does the sandbox work today", 0.55).is_empty());
         let by_identifier = admit_doc_hits(hits(), "where is quarantine.md described", 0.55);
         assert_eq!(by_identifier.len(), 1);
-        assert_eq!(by_identifier[0].0, "docs/quarantine.md");
+        assert_eq!(by_identifier[0].path, "docs/quarantine.md");
     }
 
     /// Story 193: the docs leg had no absolute floor. RRF normalization pins
@@ -10832,6 +11015,21 @@ mod tests {
         assert_eq!(graph_neighbor_cosine(&zero, &[1.0, 0.0]), None);
     }
 
+    /// The best-ranked neighbor of `seed.md`, as `(path, relation)`.
+    fn top_neighbor(conn: &rusqlite::Connection, query: Option<&[f32]>) -> Vec<(String, String)> {
+        doc_graph_neighbors(
+            conn,
+            &["seed.md".into()],
+            &std::collections::HashSet::new(),
+            query,
+        )
+        .unwrap()
+        .into_iter()
+        .take(1)
+        .map(|(path, relation, _)| (path, relation))
+        .collect()
+    }
+
     #[test]
     fn document_expansion_picks_an_older_relevant_neighbor_before_newer_edges() {
         crate::store::vectors::init_sqlite_vec();
@@ -10933,38 +11131,17 @@ mod tests {
             .unwrap();
         }
 
-        let out = doc_graph_neighbors(
-            &conn,
-            &["seed.md".into()],
-            &std::collections::HashSet::new(),
-            1,
-            Some(&[1.0, 0.0]),
-        )
-        .unwrap();
+        let out = top_neighbor(&conn, Some(&[1.0, 0.0]));
         assert_eq!(
             out,
             [("relevant.md".into(), "related".into())],
             "identical vector has cosine 1; both newer orthogonal vectors have cosine 0"
         );
 
-        let cold = doc_graph_neighbors(
-            &conn,
-            &["seed.md".into()],
-            &std::collections::HashSet::new(),
-            1,
-            None,
-        )
-        .unwrap();
+        let cold = top_neighbor(&conn, None);
         assert_eq!(cold, [("newer-b.md".into(), "related".into())]);
         assert_eq!(
-            doc_graph_neighbors(
-                &conn,
-                &["seed.md".into()],
-                &std::collections::HashSet::new(),
-                1,
-                Some(&[f32::NAN, 0.0]),
-            )
-            .unwrap(),
+            top_neighbor(&conn, Some(&[f32::NAN, 0.0])),
             cold,
             "non-finite query scores fall back to stable edge order"
         );
@@ -16244,5 +16421,670 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    // ---- critic 226-d09e: recall drops documents whose file is gone ----
+
+    /// Catches: `.take(limit)` placed before the file check, so missing
+    /// top-ranked documents eat the slots and fewer than `limit` are injected
+    /// although later hits exist. Limit 2, five matching documents, the first
+    /// two deleted: the next two are injected, and no more.
+    #[tokio::test]
+    async fn critic_226_missing_documents_do_not_consume_the_docs_limit() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 2;
+        });
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        for i in 0..5 {
+            seed_document(
+                &handle,
+                &format!("docs/d{i}.md"),
+                "Quarantine autoheal",
+                content,
+            )
+            .await;
+        }
+        for i in [0, 1] {
+            std::fs::remove_file(tmp.path().join(format!("docs/docs/d{i}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert_eq!(body.matches("docs/d").count(), 2, "{body}");
+        assert!(
+            !body.contains("docs/d0.md") && !body.contains("docs/d1.md"),
+            "{body}"
+        );
+    }
+
+    /// Catches: only the first hit being checked / limit 1 with a deleted top
+    /// hit returning nothing. End to end: limit 1, top-ranked file deleted, the
+    /// next hit is injected instead.
+    #[tokio::test]
+    async fn critic_226_limit_one_falls_through_to_the_next_present_document() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 1;
+        });
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        for name in ["a", "b", "c"] {
+            seed_document(
+                &handle,
+                &format!("docs/{name}.md"),
+                &format!("Quarantine autoheal {name}"),
+                content,
+            )
+            .await;
+        }
+        for name in ["a", "b"] {
+            std::fs::remove_file(tmp.path().join(format!("docs/docs/{name}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/c.md"), "{body}");
+        assert!(
+            !body.contains("docs/a.md") && !body.contains("docs/b.md"),
+            "{body}"
+        );
+    }
+
+    /// Catches: the whole collection directory removed (not one file): every
+    /// document under it must go, and the hook must not error out.
+    #[tokio::test]
+    async fn critic_226_collection_directory_removed_drops_all_its_documents() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/one.md", "Quarantine autoheal one", content).await;
+        seed_document(&handle, "docs/two.md", "Quarantine autoheal two", content).await;
+        std::fs::remove_dir_all(tmp.path().join("docs")).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(
+            !body.contains("docs/one.md") && !body.contains("docs/two.md"),
+            "{body}"
+        );
+    }
+
+    /// Catches: the collection directory resolved once for ALL collections (or
+    /// from the first collection seen), so a document in a second collection is
+    /// judged against the wrong directory and dropped though its file exists.
+    #[tokio::test]
+    async fn critic_226_each_collection_is_resolved_against_its_own_directory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/main.md", "Quarantine autoheal main", content).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                conn,
+                &crate::domain::Collection {
+                    name: "other".into(),
+                    path: "./elsewhere".into(),
+                    pattern: "**/*.md".into(),
+                    source: "manual".into(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: "other".into(),
+                relative_path: "guide.md".into(),
+                hash: crate::store::documents::compute_hash(content),
+                title: Some("Quarantine autoheal guide".into()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".into()),
+            };
+            crate::store::documents::index_document(conn, &doc, content).unwrap();
+        }
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::fs::write(tmp.path().join("elsewhere/guide.md"), "x").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(
+            body.contains("guide.md"),
+            "present file in 2nd collection: {body}"
+        );
+        assert!(body.contains("docs/main.md"), "{body}");
+    }
+
+    /// Catches: a collection with an ABSOLUTE path (sessions-style, outside the
+    /// root) being resolved by string concatenation instead of `Path::join`, which
+    /// would drop every document of it.
+    #[tokio::test]
+    async fn critic_226_absolute_collection_path_is_honoured() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/seed.md", "Quarantine autoheal seed", content).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            conn.execute(
+                "UPDATE collections SET path = ?1 WHERE name = 'default'",
+                [outside.path().to_string_lossy().to_string()],
+            )
+            .unwrap();
+        }
+        std::fs::create_dir_all(outside.path().join("docs")).unwrap();
+        std::fs::write(outside.path().join("docs/seed.md"), "x").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/seed.md"), "{body}");
+    }
+
+    /// Catches: `try_exists` on a dangling symlink being read as present (a
+    /// `symlink_metadata` check would keep it); the index entry points at a file
+    /// that cannot be read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226_dangling_symlink_counts_as_missing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/link.md", "Quarantine autoheal link", content).await;
+        seed_document(&handle, "docs/real.md", "Quarantine autoheal real", content).await;
+        let link = tmp.path().join("docs/docs/link.md");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("docs/docs/nowhere.md"), &link).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(!body.contains("docs/link.md"), "{body}");
+        assert!(body.contains("docs/real.md"), "{body}");
+    }
+
+    /// Catches: a path that exists but is now a DIRECTORY (file replaced by a
+    /// folder) being treated as present because the check is `exists`, not
+    /// `is_file`. `update` indexes files only, so it would prune this row.
+    #[tokio::test]
+    async fn critic_226_path_replaced_by_a_directory_is_not_injected() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(
+            &handle,
+            "docs/now_dir.md",
+            "Quarantine autoheal dir",
+            content,
+        )
+        .await;
+        seed_document(&handle, "docs/file.md", "Quarantine autoheal file", content).await;
+        let p = tmp.path().join("docs/docs/now_dir.md");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(!body.contains("docs/now_dir.md"), "{body}");
+        assert!(body.contains("docs/file.md"), "{body}");
+    }
+
+    /// Catches: `.take(cap)` before the file filter in `doc_graph_neighbors`, so
+    /// missing neighbors fill the cap and the present one is never listed.
+    #[tokio::test]
+    async fn critic_226_missing_neighbors_do_not_consume_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.graph.doc_neighbor_cap = 1;
+        });
+        for name in ["seed", "gone1", "gone2", "kept"] {
+            seed_document(&handle, &format!("notes/{name}.md"), name, "alpha beta").await;
+        }
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for target in ["notes/gone1.md", "notes/gone2.md", "notes/kept.md"] {
+                crate::store::graph::add_edge(
+                    conn,
+                    seed_id,
+                    target,
+                    "related",
+                    crate::store::graph::KIND_FRONTMATTER,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        for name in ["gone1", "gone2"] {
+            std::fs::remove_file(tmp.path().join(format!("docs/notes/{name}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("notes/kept.md (related)"), "{body}");
+        assert!(!body.contains("gone"), "{body}");
+    }
+
+    /// Catches: the file check dropping a session chunk. Its collection has no
+    /// files, its keys (`{sid}-chunk-NNN`) are virtual, so a stat would always
+    /// say "missing" and recall would never list a session as a graph neighbor.
+    /// (The docs leg never returns sessions: the search leaves them out.)
+    #[tokio::test]
+    async fn critic_226_sessions_documents_have_no_file_to_check() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "notes/seed.md", "seed", "alpha beta").await;
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                conn,
+                &crate::domain::Collection {
+                    name: "claude_sessions".to_string(),
+                    path: "./no-such-dir".to_string(),
+                    pattern: "**/*".to_string(),
+                    source: crate::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: "claude_sessions".to_string(),
+                relative_path: "sid-chunk-001".to_string(),
+                hash: crate::store::documents::compute_hash(content),
+                title: Some("Quarantine autoheal session chunk".to_string()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".to_string()),
+            };
+            crate::store::documents::index_document(conn, &doc, content).unwrap();
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::store::graph::add_edge(
+                conn,
+                seed_id,
+                "sid-chunk-001",
+                "related",
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("sid-chunk-001 (related)"), "neighbor: {body}");
+    }
+
+    /// Catches: a stat error other than absence (EACCES on the parent dir)
+    /// dropping the document. `update` keeps the row in that case, so recall
+    /// must too (documented in `take_present`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226_unreadable_directory_keeps_the_document() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(
+            &handle,
+            "sub/locked.md",
+            "Quarantine autoheal locked",
+            content,
+        )
+        .await;
+        let dir = tmp.path().join("docs/sub");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Root bypasses permission bits: the stat then succeeds and the doc is kept anyway.
+        let body = additional_context(&out);
+        assert!(body.contains("sub/locked.md"), "{body}");
+    }
+
+    // ---- critic 226-d09e round 2: the neighbor leg and the stat errors ----
+
+    /// Seeds `notes/seed.md` plus one frontmatter edge from it to each of
+    /// `targets` (path, collection), registering the collections and documents.
+    async fn seed_neighbor_graph(handle: &RepoHandle, targets: &[(&str, &str)]) {
+        seed_document(handle, "notes/seed.md", "seed", "alpha beta").await;
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let now = chrono::Utc::now().timestamp();
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (path, collection) in targets {
+            if *collection != "default" {
+                let _ = crate::store::collections::add_collection(
+                    conn,
+                    &crate::domain::Collection {
+                        name: collection.to_string(),
+                        path: format!("./{collection}"),
+                        pattern: "**/*.md".into(),
+                        source: "manual".into(),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                );
+            }
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: collection.to_string(),
+                relative_path: path.to_string(),
+                hash: crate::store::documents::compute_hash("alpha beta"),
+                title: Some(path.to_string()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".into()),
+            };
+            crate::store::documents::index_document(conn, &doc, "alpha beta").unwrap();
+            let dir = if *collection == "default" {
+                "docs"
+            } else {
+                collection
+            };
+            let file = handle.root.join(dir).join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
+            crate::store::graph::add_edge(
+                conn,
+                seed_id,
+                path,
+                "related",
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Catches: the neighbor leg resolving every neighbor against the default
+    /// collection directory, so a neighbor in another collection is judged by
+    /// the wrong path: its present file is dropped.
+    #[tokio::test]
+    async fn critic_226r2_neighbor_is_checked_in_its_own_collection_directory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(
+            &handle,
+            &[("guide.md", "elsewhere"), ("gone.md", "elsewhere")],
+        )
+        .await;
+        std::fs::remove_file(tmp.path().join("elsewhere/gone.md")).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("guide.md (related)"), "{body}");
+        assert!(!body.contains("gone.md"), "{body}");
+    }
+
+    /// Catches: `is_file` applied to documents but not to neighbors (a plain
+    /// `exists`): a neighbor whose path is now a directory is listed.
+    #[tokio::test]
+    async fn critic_226r2_neighbor_replaced_by_a_directory_is_not_listed() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/now_dir.md", "default"),
+                ("notes/file.md", "default"),
+            ],
+        )
+        .await;
+        let p = tmp.path().join("docs/notes/now_dir.md");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("notes/file.md (related)"), "{body}");
+        assert!(!body.contains("now_dir.md"), "{body}");
+    }
+
+    /// Catches: ENOTDIR (a parent of the file is now a regular file) counting as
+    /// "some other stat error" and keeping the document. The file is gone as
+    /// surely as with ENOENT, and `update` would prune the row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226r2_parent_replaced_by_a_file_counts_as_gone() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "sub/lost.md", "Quarantine autoheal lost", content).await;
+        seed_document(&handle, "docs/kept.md", "Quarantine autoheal kept", content).await;
+        let sub = tmp.path().join("docs/sub");
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "now a file").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/kept.md"), "{body}");
+        assert!(!body.contains("sub/lost.md"), "{body}");
+    }
+
+    /// Catches: a stat error other than absence dropping a graph neighbor (the
+    /// docs leg has its own test): same rule on both legs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226r2_unreadable_directory_keeps_the_neighbor() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(&handle, &[("locked/n.md", "default")]).await;
+        let dir = tmp.path().join("docs/locked");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = additional_context(&out);
+        assert!(body.contains("locked/n.md (related)"), "{body}");
+    }
+
+    /// Catches: the candidate list handed to the file check holding a seen path
+    /// or the same neighbor twice (reached by two relations), so a hub document
+    /// costs more than one stat per neighbor. 6 targets, one `seen`, one reached
+    /// by two relations: 5 distinct candidates.
+    #[test]
+    fn critic_226r2_neighbor_candidates_are_deduped_and_exclude_seen() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', '.', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        for id in ["seed", "n0", "n1", "n2", "n3", "n4", "n5"] {
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+                 VALUES ('docs', ?1, 'h', 1, 1)",
+                [format!("{id}.md")],
+            )
+            .unwrap();
+        }
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (target, relation) in [
+            ("n0.md", "related"),
+            ("n1.md", "related"),
+            ("n1.md", "supersedes"),
+            ("n2.md", "related"),
+            ("n3.md", "related"),
+            ("n4.md", "related"),
+            ("n5.md", "related"),
+        ] {
+            crate::store::graph::add_edge(
+                &conn,
+                seed_id,
+                target,
+                relation,
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+        let seen: std::collections::HashSet<String> = ["n0.md".to_string()].into();
+        let got = doc_graph_neighbors(&conn, &["seed.md".into()], &seen, None).unwrap();
+        let mut paths: Vec<&str> = got.iter().map(|(p, _, _)| p.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["n1.md", "n2.md", "n3.md", "n4.md", "n5.md"]);
+    }
+
+    // ---- critic 226-d09e round 3: the cap moved into `take_present` ----
+
+    fn related_paths(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .filter_map(|l| l.strip_suffix(" (related)"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Catches: the neighbor leg losing its `doc_neighbor_cap` when the cap left
+    /// `doc_graph_neighbors` (`take_present` called with `usize::MAX`, or the cap
+    /// applied to the wrong list): three present neighbors, cap 2, all three listed.
+    #[tokio::test]
+    async fn critic_226r3_neighbor_cap_limits_present_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.graph.doc_neighbor_cap = 2;
+        });
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/a.md", "default"),
+                ("notes/b.md", "default"),
+                ("notes/c.md", "default"),
+            ],
+        )
+        .await;
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let listed = related_paths(additional_context(&out));
+        assert_eq!(listed.len(), 2, "{listed:?}");
+    }
+
+    /// Catches: the file check reordering the ranked neighbors (or filtering
+    /// before ranking): with the top-ranked neighbor deleted, the rest keep
+    /// the all-present ranking order.
+    #[tokio::test]
+    async fn critic_226r3_deleted_top_neighbor_keeps_the_rest_in_rank_order() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.graph.doc_neighbor_cap = 3;
+        });
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/a.md", "default"),
+                ("notes/b.md", "default"),
+                ("notes/c.md", "default"),
+            ],
+        )
+        .await;
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let ranking = related_paths(additional_context(&out));
+        assert_eq!(ranking.len(), 3, "{ranking:?}");
+
+        std::fs::remove_file(tmp.path().join("docs").join(&ranking[0])).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        assert_eq!(related_paths(additional_context(&out)), ranking[1..]);
+    }
+
+    /// Catches: `take_present` dropping index-only candidates (`None`), counting
+    /// missing ones against the cap, or reordering: [missing, present, None,
+    /// present] with cap 2 keeps exactly the 2nd and 3rd, in order; cap 0 keeps none.
+    #[test]
+    fn critic_226r3_take_present_keeps_none_skips_missing_and_caps_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let present = tmp.path().join("p.md");
+        std::fs::write(&present, "x").unwrap();
+        let candidates = || {
+            vec![
+                (1, Some(tmp.path().join("gone.md"))),
+                (2, Some(present.clone())),
+                (3, None),
+                (4, Some(present.clone())),
+            ]
+        };
+        assert_eq!(take_present(candidates(), 2), [2, 3]);
+        assert_eq!(take_present(candidates(), 10), [2, 3, 4]);
+        assert!(take_present(candidates(), 0).is_empty());
+    }
+
+    /// Catches: `with_files` resolving a sessions collection or an unknown
+    /// collection to a path (every such candidate would then be stat-ed and
+    /// dropped), or using one collection's directory for another.
+    #[test]
+    fn critic_226r3_with_files_resolves_per_collection_and_skips_virtual_ones() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for (name, path, source) in [
+            ("a", "./da", "manual"),
+            ("b", "./db", "manual"),
+            ("s", "./ds", crate::domain::COLLECTION_SOURCE_SESSIONS),
+        ] {
+            crate::store::collections::add_collection(
+                &conn,
+                &crate::domain::Collection {
+                    name: name.into(),
+                    path: path.into(),
+                    pattern: "**/*".into(),
+                    source: source.into(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+        }
+        let root = std::path::Path::new("/r");
+        let items = vec![
+            ("a", "x.md"),
+            ("b", "y.md"),
+            ("s", "sid-chunk-001"),
+            ("nope", "z.md"),
+            ("a", "w.md"),
+        ];
+        let got: Vec<_> = with_files(&conn, root, items, |(c, p)| (*c, *p))
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                Some(root.join("./da").join("x.md")),
+                Some(root.join("./db").join("y.md")),
+                None,
+                None,
+                Some(root.join("./da").join("w.md")),
+            ]
+        );
     }
 }
