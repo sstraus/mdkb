@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cli::hook_client::HOOK_TIMEOUT_USER_PROMPT_SUBMIT;
 use crate::config::HooksConfig;
 use crate::llm::rerank::Reranker;
 use crate::store::memory::MemoryEntry;
@@ -99,17 +98,13 @@ pub fn min_score_for(cfg: &HooksConfig, prompt: &str) -> f32 {
 /// How long the reranker may run, or `None` when what is left of the hook
 /// cannot hold a call.
 ///
-/// `elapsed_ms` is the hook's own clock. Two cuts answer with nothing when they
-/// fire, which is worse than the MiniLM fallback: the hook deadline, and the
-/// hook client's socket timeout ([`HOOK_TIMEOUT_USER_PROMPT_SUBMIT`]), which
-/// applies even when the deadline is `0`. The reranker's budget is what is left
-/// before the nearer of the two, after the work behind it.
+/// `elapsed_ms` is the hook's own clock. When the hook deadline fires the host
+/// gets nothing, which is worse than the MiniLM fallback. The hook client waits
+/// that deadline plus a margin (`HooksConfig::user_prompt_submit_effective_deadline_ms`),
+/// so this one value is the ceiling, also when the deadline is `0`. The
+/// reranker's budget is what is left of it, after the work behind it.
 pub fn rerank_budget(cfg: &HooksConfig, elapsed_ms: u64) -> Option<Duration> {
-    let client = HOOK_TIMEOUT_USER_PROMPT_SUBMIT.as_millis() as u64;
-    let ceiling = match cfg.user_prompt_submit_deadline_ms {
-        0 => client,
-        hook => hook.min(client),
-    };
+    let ceiling = cfg.user_prompt_submit_effective_deadline_ms();
     let budget = cfg.recall_rerank_deadline_ms.min(
         ceiling
             .saturating_sub(elapsed_ms)
@@ -243,15 +238,15 @@ mod tests {
         // MiniLM's.
         let cfg = HooksConfig::default();
         assert_eq!(rerank_budget(&cfg, 0), Some(Duration::from_millis(700)));
-        let client = HOOK_TIMEOUT_USER_PROMPT_SUBMIT.as_millis() as u64;
-        let left = client - 200 - RESERVE_AFTER_RERANK_MS;
+        let deadline = cfg.user_prompt_submit_deadline_ms;
+        let left = deadline - 200 - RESERVE_AFTER_RERANK_MS;
         assert_eq!(rerank_budget(&cfg, 200), Some(Duration::from_millis(left)));
-        assert_eq!(rerank_budget(&cfg, client - 100), None);
+        assert_eq!(rerank_budget(&cfg, deadline - 100), None);
         assert_eq!(rerank_budget(&cfg, 10_000), None);
     }
 
     #[test]
-    fn a_short_hook_deadline_beats_the_client_timeout() {
+    fn a_short_hook_deadline_clamps_the_budget() {
         let mut cfg = HooksConfig::default();
         cfg.user_prompt_submit_deadline_ms = 500;
         assert_eq!(
@@ -261,9 +256,9 @@ mod tests {
     }
 
     #[test]
-    fn hook_deadline_zero_still_stops_at_the_client_timeout() {
+    fn hook_deadline_zero_still_stops_at_the_default_deadline() {
         // Catches: `deadline = 0` read as "no limit", so a slow reranker runs
-        // past the 1 s the hook client waits and the host gets nothing.
+        // past the wait the hook client keeps and the host gets nothing.
         let mut cfg = HooksConfig::default();
         cfg.user_prompt_submit_deadline_ms = 0;
         assert_eq!(rerank_budget(&cfg, 0), Some(Duration::from_millis(700)));

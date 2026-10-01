@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The UserPromptSubmit deadline is reachable on the daemon path.** The hook
+  client gave up after a fixed 1 s, so a daemon answer between 1 s and the
+  1500 ms deadline was dropped and the host got no recall. The client now waits
+  `user_prompt_submit_deadline_ms` plus a 250 ms margin, and the default
+  deadline drops to 1000 ms so the interactive prompt latency stays at the
+  former 1 s. Raise `[hooks] user_prompt_submit_deadline_ms` to trade latency
+  for the 1.0 – 1.25 s warm rows; the client wait follows. The rerank budget
+  clamps to the same deadline (`0` still stops at the default). Story 203-353e.
+
 ### Changed
 
 - **Automatic recall is the default.** `[hooks] user_prompt_submit_require_sigil`
@@ -30,7 +41,7 @@
   back while it loads. Sigil prompts are not reranked. Story 202-4c67.
 
 - **UserPromptSubmit has a hard deadline.** `[hooks] user_prompt_submit_deadline_ms`
-  (default 1500, `0` disables) stops recall that has not finished, answers with
+  (default 1000 since story 203-353e, was 1500; `0` disables) stops recall that has not finished, answers with
   nothing and logs `outcome = "deadline"`; `mdkb stats` reports the deadline
   hits and the hook rows carry per-phase timings. The default comes from the
   2026-09-30 hook logs: warm rows sit at 5 ms – 1.25 s, rows taken at host load
