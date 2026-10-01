@@ -227,11 +227,24 @@ fn housekeeping(root: &Path) {
     // each names the setting the user has to look at.
     let config_path = mdkb_dir.join("config.toml");
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
-        for key in crate::config::unknown_keys(&raw) {
+        for key in unwarned_keys(&config_path, crate::config::unknown_keys(&raw)) {
             tracing::warn!("config.toml: unknown key `{key}` ignored");
         }
     }
 }
+
+/// Keep only the keys not yet warned about for this `config.toml` in this
+/// process. `housekeeping` runs on every update pass of a long-lived daemon,
+/// so without this the same line is logged once per pass, forever.
+fn unwarned_keys(config_path: &Path, keys: Vec<String>) -> Vec<String> {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<(PathBuf, String)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    keys.into_iter()
+        .filter(|key| warned.insert((config_path.to_path_buf(), key.clone())))
+        .collect()
+}
+
 /// Like [`handle_update`], but `force` reindexes every file regardless of mtime.
 pub fn handle_update_force(
     ctx: &Context,
@@ -1518,5 +1531,23 @@ pub(crate) fn process_wikilink_edges(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod housekeeping_tests {
+    use super::*;
+
+    #[test]
+    fn housekeeping_warns_once_per_key_per_process() {
+        // Catches: the unknown-key warning repeated on every update pass.
+        let path = Path::new("/nonexistent/housekeeping_warns_once/config.toml");
+        let keys = || vec!["a.b".to_string(), "c".to_string()];
+        assert_eq!(unwarned_keys(path, keys()), keys());
+        assert!(unwarned_keys(path, keys()).is_empty());
+        // A new key on the same config still warns; the same key on another repo does too.
+        assert_eq!(unwarned_keys(path, vec!["d".into()]), vec!["d".to_string()]);
+        let other = Path::new("/nonexistent/housekeeping_warns_once_other/config.toml");
+        assert_eq!(unwarned_keys(other, keys()), keys());
     }
 }
