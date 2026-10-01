@@ -1509,6 +1509,19 @@ pub async fn run_file_watcher_inner(
     let memory_entries_dir =
         watched_memory_entries_dir(&root, crate::store::namespace::active()?.as_deref());
 
+    // Deliver only paths some sink would act on. The root watch is recursive, so
+    // without this a build writing `target/**` fills the watcher's bounded channel
+    // and each overflow schedules a full rescan. Same predicate as the routing
+    // below, so no change that routes is dropped here.
+    {
+        let collection_paths = collection_paths.clone();
+        let code_excludes = code_excludes.clone();
+        let memory_entries_dir = memory_entries_dir.clone();
+        watcher.set_filter(move |path| {
+            classify_change(path, &collection_paths, &code_excludes, &memory_entries_dir).any()
+        });
+    }
+
     // Watch root recursively — it covers code, collections inside root, AND the
     // memory entry projection. This registration must NOT be gated on any one
     // sink: it used to sit behind `if code_enabled`, so turning code indexing off

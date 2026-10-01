@@ -2,9 +2,9 @@
 //!
 //! Watches collection paths and triggers reindexing on file changes.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -16,6 +16,9 @@ use crate::error::{ErrorKind, Result};
 /// Minimum gap between "dropped events" warnings, so a burst that overflows the
 /// channel logs once rather than per dropped path.
 const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Decides whether a changed path is worth delivering at all.
+pub type PathFilter = Box<dyn Fn(&Path) -> bool + Send + Sync>;
 
 /// File change event.
 #[derive(Debug, Clone)]
@@ -59,6 +62,11 @@ pub struct FileWatcher {
     /// consumer reads this via [`FileWatcher::take_missed_events`] and forces a
     /// full rescan so silently-dropped changes are not lost.
     missed_events: Arc<AtomicBool>,
+    /// Applied on the debouncer thread, before the bounded channel, so churn the
+    /// consumer would ignore (a `cargo build` writing `target/**`) can neither
+    /// fill the channel nor trigger the full rescan a drop forces. Unset, every
+    /// event is delivered.
+    filter: Arc<OnceLock<PathFilter>>,
 }
 
 impl std::fmt::Debug for FileWatcher {
@@ -74,12 +82,20 @@ impl FileWatcher {
         let missed_events = Arc::new(AtomicBool::new(false));
 
         let missed_for_closure = Arc::clone(&missed_events);
+        let filter = Arc::new(OnceLock::new());
+        let filter_for_closure: Arc<OnceLock<PathFilter>> = Arc::clone(&filter);
         let mut last_warn: Option<std::time::Instant> = None;
         let debouncer = new_debouncer(
             Duration::from_millis(config.debounce_ms),
             move |result: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
                 if let Ok(events) = result {
                     for event in events {
+                        if filter_for_closure
+                            .get()
+                            .is_some_and(|keep| !keep(&event.path))
+                        {
+                            continue;
+                        }
                         let change = FileChange {
                             path: event.path,
                             kind: ChangeKind::CreateOrModify,
@@ -112,7 +128,14 @@ impl FileWatcher {
             _debouncer: debouncer,
             receiver: rx,
             missed_events,
+            filter,
         })
+    }
+
+    /// Drop events whose path `keep` rejects before they reach the channel.
+    /// Set once, before the first [`FileWatcher::watch`]; a later call is ignored.
+    pub fn set_filter(&self, keep: impl Fn(&Path) -> bool + Send + Sync + 'static) {
+        let _ = self.filter.set(Box::new(keep));
     }
 
     /// Returns and clears the "dropped events" flag. When true, the consumer
@@ -225,6 +248,51 @@ mod tests {
 
         let result = timeout(Duration::from_secs(5), watcher.recv()).await;
         assert!(result.is_ok(), "Should receive event within timeout");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_ignores_target_churn_without_overflow() {
+        // Catches: a burst of target/** events filling the 100-slot channel and
+        // forcing a full rescan, while the real source edit is lost in it.
+        let temp = setup_temp_dir();
+        let mut watcher =
+            FileWatcher::new(WatcherConfig { debounce_ms: 50 }).expect("watcher creation");
+        watcher.set_filter(|p| !p.components().any(|c| c.as_os_str() == "target"));
+        watcher
+            .watch(&temp.path().to_path_buf())
+            .expect("watch should succeed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let target = temp.path().join("target/debug");
+        fs::create_dir_all(&target).expect("mkdir");
+        for i in 0..10_000 {
+            fs::write(target.join(format!("f{i}.o")), "x").expect("write");
+        }
+        let src = temp.path().join("lib.rs");
+        fs::write(&src, "fn main() {}").expect("write");
+
+        let seen = timeout(Duration::from_secs(10), async {
+            while let Some(change) = watcher.recv().await {
+                assert!(
+                    !change.path.components().any(|c| c.as_os_str() == "target"),
+                    "target churn reached the channel: {:?}",
+                    change.path
+                );
+                if change.path.file_name() == src.file_name() {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(
+            matches!(seen, Ok(true)),
+            "the source edit must be delivered"
+        );
+        assert!(
+            !watcher.take_missed_events(),
+            "no overflow, so no full rescan"
+        );
     }
 
     #[test]
