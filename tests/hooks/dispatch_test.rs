@@ -16,7 +16,6 @@ fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
     let mut child = mdkb_bin()
         .args(["hook", event])
         .current_dir(scratch.path())
-        .env("HOME", scratch.path())
         .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
