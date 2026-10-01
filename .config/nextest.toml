@@ -1,0 +1,10 @@
+# The dispatcher's rerank tests run the hook against a 1 s client budget, and
+# the first embed in a process takes 230-490 ms on the rb box. Run in parallel
+# with the rest of the suite, the embed outgrows the budget and the hook falls
+# back to "no_budget"/"deadline". One at a time, they measure the reranker.
+[test-groups]
+rerank-dispatch = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(mcp::dispatch::tests::) & test(rerank)'
+test-group = 'rerank-dispatch'

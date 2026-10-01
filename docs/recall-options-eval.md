@@ -156,3 +156,18 @@ python3 scripts/eval-recall-options/a4.py jina-v2-ml bge-base  # paired test + s
 The scripts read the private raw outputs from `~/Gits/.tmp/mdkb-ml/opt/` (not committed).
 
 On the box the hf-hub client fails TLS (`UnknownIssuer`); `box-run.sh` prefetches the pinned model revisions with curl. The private data directory (`eval-data-private/`: corpus, prompts, samples) is shipped to the box untracked and is not committed. Only the OpenRouter translations (`assets/eval/recall-options/`) are committed.
+
+## Reranker on MiniLM top-5, held out (story 202-4c67)
+
+Shipped: jina-reranker-v2 int8 on MiniLM's top five, per-language floor on the reranker score, per entry (`hooks.recall_rerank_min_score_it` -1.05, `..._en` -1.95). Floors are the lowest 0.05 step above the best negative of the 2026-09-30 fit data (IT best -1.081, EN best -1.986). Per-entry admission injects 20 entries for 12 IT hits on the fit pool; admitting all five once the top passes injects 75 for 14.
+
+Held-out set, written after the fit, four-gram check against the corpus passed: 44 IT positives and 24 IT negatives, 36 EN positives and 24 EN negatives. Harness: `scripts/eval-recall-options/a6.py` (`pool`, `report`). Floors not refitted on it. Wilson 95% intervals.
+
+| Language | Recall, expected id injected | Negatives admitted | MiniLM alone at cosine 0.50 |
+|---|---|---|---|
+| IT | 21/44 = 0.477 (0.34-0.62) | 0/24 = 0.00 (0.00-0.14) | 0/44 recall, 0/24 admitted |
+| EN | 12/36 = 0.333 (0.20-0.50) | 3/24 = 0.125 (0.04-0.31) | 8/36 = 0.222 (0.12-0.38), 0/24 admitted |
+
+Caveats. The IT positives were written after reading the corpus chunks, so vocabulary overlap likely makes IT recall optimistic. The EN corpus is 12 synthetic memories, so the EN floor was fitted on 40 negatives against a tiny store and did not hold: three held-out EN negatives score -1.45 to -1.68, above -1.95. EN needs a fit on a real English store before the EN floor is trusted.
+
+Latency on this Mac (M4 Max, own daemon, 37 memories of ~1.4 kB, top-5 pool, at host load average 36-65 from other jobs, so contended): unbounded rerank phase p50 972 ms, p95 1513 ms, max 2424 ms (153 reranked hooks); daemon RSS 1.45-2.2 GB with the model loaded (6.6 MB before). At the 700 ms deadline most calls time out (65 timeout, 165 busy, 9 finished of 256) and the hook falls back to the MiniLM result; no hook exceeded 866 ms. An unloaded Mac run was not possible. The hook client waits 1 s (`HOOK_TIMEOUT_USER_PROMPT_SUBMIT`), not the 1500 ms hook deadline, so the rerank budget is clamped to that.

@@ -259,15 +259,22 @@ fn shared_cache_dir() -> PathBuf {
     PathBuf::from(".fastembed_cache")
 }
 
-/// The directory fastembed reads the AllMiniLML6V2 weights from.
+/// The directory the hf-hub cache layout (`models--org--name/snapshots/…`)
+/// lives in.
 ///
 /// fastembed resolves `HF_HOME` before the cache dir we pass it, so the same
 /// order applies here — otherwise a presence check could look in one place
-/// while `EmbeddingService::new` downloads into another.
-pub fn model_cache_path() -> PathBuf {
-    let base = std::env::var("HF_HOME")
+/// while a download goes into another.
+pub fn cache_base_dir() -> PathBuf {
+    std::env::var("HF_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| shared_cache_dir());
+        .unwrap_or_else(|_| shared_cache_dir())
+}
+
+/// The directory fastembed reads the AllMiniLML6V2 weights from (see
+/// [`cache_base_dir`]).
+pub fn model_cache_path() -> PathBuf {
+    let base = cache_base_dir();
     let code = TextEmbedding::get_model_info(&EmbeddingModel::AllMiniLML6V2)
         .map(|info| info.model_code.clone())
         .unwrap_or_else(|_| "Qdrant/all-MiniLM-L6-v2-onnx".to_string());

@@ -54,6 +54,9 @@ pub struct RepoHandle {
     /// Handle to the spawned file watcher task. Aborted on drop to prevent
     /// orphan watcher threads (notify-rs debouncer + fsevents) after LRU eviction.
     watcher_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The cross-encoder automatic recall reranks with. Every handle points at
+    /// the one process-wide instance; a test swaps in its own.
+    pub reranker: Arc<dyn crate::llm::rerank::Reranker>,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -149,6 +152,7 @@ impl RepoHandle {
             reindex_send_warned: AtomicBool::new(false),
             backfill_in_flight: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
+            reranker: crate::llm::rerank::shared(),
         }
     }
 
@@ -181,6 +185,7 @@ impl RepoHandle {
             reindex_send_warned: AtomicBool::new(false),
             backfill_in_flight: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
+            reranker: crate::llm::rerank::shared(),
         }
     }
 

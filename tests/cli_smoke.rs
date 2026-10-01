@@ -637,9 +637,51 @@ fn smoke_update_machine_formats_emit_a_single_document() {
 #[test]
 fn smoke_embed() {
     let repo = Repo::new();
+    // `embed` fetches the 280 MB reranker weights unless the reranker is off.
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[hooks]\nrecall_rerank_it = false\nrecall_rerank_en = false\n",
+    )
+    .unwrap();
     run(&["update"], &repo.root);
     let out = run(&["embed"], &repo.root);
     assert_ok(&out, "embed");
+}
+
+/// An offline machine with the reranker on: the vectors must still be written,
+/// and the missing reranker weights are their own non-zero exit.
+#[cfg(unix)]
+#[test]
+fn embed_still_embeds_when_the_reranker_download_fails() {
+    // Catches: the weights fetched before the embedding, so a failed download
+    // aborts `mdkb embed` with no vectors written.
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    // A model cache that holds MiniLM but not the reranker, and an endpoint
+    // nothing listens on.
+    let cache = tempfile::tempdir().expect("tempdir");
+    let minilm = "models--Qdrant--all-MiniLM-L6-v2-onnx";
+    std::os::unix::fs::symlink(
+        cli::model_cache_dir().join(minilm),
+        cache.path().join(minilm),
+    )
+    .expect("link the MiniLM cache");
+    let cache_dir = cache.path().to_str().unwrap();
+    let out = run_env(
+        &["embed"],
+        &repo.root,
+        &[
+            ("FASTEMBED_CACHE_DIR", cache_dir),
+            ("HF_ENDPOINT", "http://127.0.0.1:1"),
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "a failed reranker fetch must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("embeddings are done"), "{stderr}");
+    assert!(stdout(&out).contains("Generated:"), "{}", stdout(&out));
 }
 
 #[test]

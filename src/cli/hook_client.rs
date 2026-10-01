@@ -219,8 +219,9 @@ fn hook_socket_path() -> PathBuf {
 
 #[cfg(unix)]
 const HOOK_TIMEOUT_SESSION_START: Duration = Duration::from_secs(2);
-#[cfg(unix)]
-const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
+/// `pub`: the recall reranker sizes its budget against it (`mcp::recall_rerank`). Past this the
+/// host gets nothing, whatever `user_prompt_submit_deadline_ms` says.
+pub const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
 #[cfg(unix)]
 const HOOK_TIMEOUT_POST_TOOL_USE: Duration = Duration::from_millis(500);
 #[cfg(unix)]
@@ -372,6 +373,8 @@ fn in_process_config(root: &Path) -> Result<DaemonConfig> {
 /// a source snippet, so it is folded onto one line: a host shows hook stderr
 /// as-is.
 async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: impl FnOnce(&Value)) {
+    // This process ends with the hook: a reranker loaded here is never ready.
+    crate::llm::rerank::forbid_load();
     let config = match in_process_config(root) {
         Ok(config) => config,
         Err(e) => {
