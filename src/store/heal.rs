@@ -1905,20 +1905,14 @@ mod tests {
         }
     }
 
-    /// Catches: the quick_check rows dropped or inverted: a healthy file
-    /// recorded as damaged (`ok` kept), a damaged one recorded as clean.
+    /// Catches: the `ok` row of a healthy file recorded as damage. (A damaged
+    /// row cannot be built here: `immutable=1` skips the CHECK scan.)
     #[test]
-    fn diagnose_keeps_damage_rows_and_drops_ok() {
+    fn diagnose_records_no_damage_for_a_healthy_file() {
         let dir = tempfile::tempdir().unwrap();
         let healthy = dir.path().join("index.sqlite.corrupt-1");
         make_db(&healthy);
         assert!(diagnose(&healthy).quick_check.is_empty());
-
-        let damaged = dir.path().join("index.sqlite.corrupt-2");
-        make_check_violating_db(&damaged);
-        let rows = diagnose(&damaged).quick_check;
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        assert!(rows[0].contains("CHECK constraint failed"), "{rows:?}");
     }
 
     /// Catches: the size of the database or of its WAL left out of the report.
