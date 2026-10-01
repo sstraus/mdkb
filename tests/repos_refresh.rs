@@ -225,7 +225,7 @@ fn a_v32_store_gains_index_head_and_no_row_changes() {
     let dump = |conn: &Connection| -> Vec<String> {
         let mut rows = Vec::new();
         for sql in [
-            "SELECT id || '|' || title || '|' || content || '|' || state FROM prior_clusters",
+            "SELECT id || '|' || lesson || '|' || state FROM prior_clusters",
             "SELECT id || '|' || title || '|' || content || '|' || ifnull(expires_at, 'null') FROM memory_entries",
         ] {
             let mut stmt = conn.prepare(sql).expect("prepare");
