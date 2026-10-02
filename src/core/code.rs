@@ -190,6 +190,47 @@ pub fn search_symbols_scoped(
     let (symbols, total) = index.query_symbols(name, kind.as_deref(), file_filter, limit);
     Ok(CodeFindResult { symbols, total })
 }
+/// One repo's share of a cross-repo symbol search: symbols whose name is
+/// exactly `query` first (flagged `true`), then fuzzy matches, `limit` in all.
+///
+/// FTS ranks of different stores are not comparable, so the caller merges these
+/// lists by the flag and by repo, never by score.
+pub fn search_symbols_exact_first(
+    index: &crate::code::indexing::IndexFacade,
+    query: &str,
+    kind_filter: Option<&str>,
+    file_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(crate::code::symbol::Symbol, bool)>> {
+    let kind = parse_kind_filter(kind_filter)?;
+    let wildcard = query.is_empty() || query == "*";
+    let mut hits: Vec<(crate::code::symbol::Symbol, bool)> = Vec::new();
+    if !wildcard {
+        let (exact, _) =
+            index.query_symbols(NameMatch::Exact(query), kind.as_deref(), file_filter, limit);
+        hits.extend(exact.into_iter().map(|sym| (sym, true)));
+    }
+    if hits.len() < limit {
+        let name = if wildcard {
+            NameMatch::Any
+        } else {
+            NameMatch::Fuzzy(query)
+        };
+        // Room for the exact rows the fuzzy match repeats.
+        let (fuzzy, _) =
+            index.query_symbols(name, kind.as_deref(), file_filter, limit + hits.len());
+        for sym in fuzzy {
+            if hits.len() >= limit {
+                break;
+            }
+            if !hits.iter().any(|(seen, _)| seen.id == sym.id) {
+                hits.push((sym, false));
+            }
+        }
+    }
+    Ok(hits)
+}
+
 /// Semantic code search behind `scope=code`, shared by the CLI and the MCP
 /// server.
 ///

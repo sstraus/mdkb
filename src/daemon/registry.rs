@@ -639,6 +639,27 @@ impl RepoRegistry {
         })
     }
 
+    /// The code index of `root`, opened read-only for one cross-repo symbol
+    /// search (story 223-cad1). Same gates as [`read_only_context`]; a root
+    /// without `code.sqlite` is [`ReadRefusal::Other`] ("no code index"), so the
+    /// caller reports it as not searched instead of as zero hits.
+    pub fn read_only_code_index(
+        &self,
+        root: &Path,
+    ) -> std::result::Result<IndexFacade, ReadRefusal> {
+        if let Err(e) = self.daemon_config.check_whitelist(root) {
+            return Err(ReadRefusal::Other(format!(
+                "outside the daemon whitelist: {e}"
+            )));
+        }
+        // The code index is not namespaced (see `core::code`).
+        let path = root.join(".mdkb/code.sqlite");
+        if !path.is_file() {
+            return Err(ReadRefusal::Other("no code index".to_string()));
+        }
+        IndexFacade::open_read_only(&path).map_err(|e| ReadRefusal::Other(e.to_string()))
+    }
+
     /// The open handle for `canonical`, reloaded first when `config.toml`
     /// changed on disk since that handle read it.
     ///
