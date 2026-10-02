@@ -189,6 +189,49 @@ pub fn strong_lexical_match(query: &str, entry_text: &str) -> bool {
     shared.len() >= STRONG_LEXICAL_RARE_TERMS
 }
 
+/// Shortest document file stem a prompt word can name on its own, after
+/// [`compact_word`]. "tools", "notes", "plan" and "tracker" are words every
+/// prompt in a repository that has such a file uses in passing; "followup" is
+/// the kind of word nobody writes without meaning that document. Length is the
+/// proxy for the same reason as [`RARE_TERM_LEN`]: no index lookup on the
+/// `UserPromptSubmit` path.
+const STEM_NAME_MIN_LEN: usize = 8;
+
+/// Lowercased letters and digits of `word`, one trailing plural `s` dropped:
+/// `follow-up,` and `followups` both become `followup`.
+fn compact_word(word: &str) -> String {
+    let mut compact: String = word
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if compact.len() > 3 && compact.ends_with('s') {
+        compact.pop();
+    }
+    compact
+}
+
+/// True when a word of `query` is the file stem of `path`, ignoring hyphens,
+/// case and a plural `s` — an Italian prompt asking about "follow-up" names
+/// `followups.md` although [`strong_lexical_match`] sees two unrelated words.
+///
+/// A stem shorter than [`STEM_NAME_MIN_LEN`] never counts. The caller must
+/// still pair this with a cosine: naming a file is evidence the prompt is
+/// about it only when the embedding does not say otherwise.
+pub fn names_file_stem(query: &str, path: &str) -> bool {
+    let Some(stem) = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(compact_word)
+    else {
+        return false;
+    };
+    stem.len() >= STEM_NAME_MIN_LEN
+        && query
+            .split_whitespace()
+            .any(|word| compact_word(word) == stem)
+}
+
 /// The words of `query` that look like code rather than prose, lowercased.
 ///
 /// Split on whitespace, not on punctuation: `content_tokens` would turn

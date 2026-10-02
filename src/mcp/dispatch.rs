@@ -4393,7 +4393,9 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// or when the prompt quotes its title or path
 /// ([`crate::store::hybrid::strong_lexical_match`]) — the arm that keeps a
 /// store without embeddings, or an identifier-shaped query, from losing the
-/// leg. Being in the BM25 result set is not evidence: recall OR-expands the
+/// leg. A prompt word that is the document's file stem
+/// ([`crate::store::hybrid::names_file_stem`]) also counts, but only with the
+/// precision floor's cosine behind it. Being in the BM25 result set is not evidence: recall OR-expands the
 /// prompt, so one common word puts a document there.
 fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
@@ -4403,6 +4405,8 @@ fn admit_doc_hits(
     hits.into_iter()
         .filter(|(hit, cosine)| {
             cosine.is_some_and(|c| c >= f64::from(min_cosine))
+                || cosine.is_some_and(|c| c >= f64::from(crate::config::MIN_RECALL_COSINE_DEFAULT))
+                    && crate::store::hybrid::names_file_stem(prompt, &hit.path)
                 || crate::store::hybrid::strong_lexical_match(
                     prompt,
                     &format!("{} {}", hit.path, hit.title.as_deref().unwrap_or_default()),
@@ -9442,6 +9446,42 @@ mod tests {
         let by_identifier = admit_doc_hits(hits(), "where is quarantine.md described", 0.55);
         assert_eq!(by_identifier.len(), 1);
         assert_eq!(by_identifier[0].path, "docs/quarantine.md");
+    }
+
+    /// Story 197: an Italian prompt asking about "follow-up" scored 0.514 on
+    /// `followups.md` — under the docs floor, and `follow-up` shares no word with
+    /// the path or title. Catches: comparing words without folding the hyphen and
+    /// the plural, so the document the prompt names is dropped.
+    #[test]
+    fn a_prompt_naming_the_file_stem_admits_it_above_the_precision_floor() {
+        let hits = |cosine| vec![scored_hit("followups.md", "Verifiche dovute a Boss", cosine)];
+        let prompt = "cosa ho chiesto di verificare, ci sono follow-up aperti?";
+        assert_eq!(admit_doc_hits(hits(Some(0.514)), prompt, 0.55).len(), 1);
+        assert_eq!(admit_doc_hits(hits(Some(0.41)), "i Followups aperti", 0.55).len(), 1);
+    }
+
+    /// Catches: the stem arm admitting on the word alone, so a document the
+    /// embedding says is unrelated is injected because the prompt mentions its
+    /// name in passing (or the store has no embedding at all).
+    #[test]
+    fn naming_a_file_stem_needs_the_precision_floor_behind_it() {
+        let hits = |cosine| vec![scored_hit("followups.md", "Verifiche dovute a Boss", cosine)];
+        let prompt = "scrivi i follow-up della riunione";
+        assert!(admit_doc_hits(hits(Some(0.39)), prompt, 0.55).is_empty());
+        assert!(admit_doc_hits(hits(None), prompt, 0.55).is_empty());
+    }
+
+    /// Catches: a short, common stem (`tools.md`, `tracker.md`, `plan.md`,
+    /// `notes.md`) admitting on any prompt that uses the word.
+    #[test]
+    fn a_common_short_file_stem_is_not_evidence() {
+        let prompt = "update the tools, the tracker, the plans and the notes";
+        for path in ["tools.md", "tracker.md", "plan.md", "notes.md", "docs/README.md"] {
+            assert!(
+                admit_doc_hits(vec![scored_hit(path, "Whatever", Some(0.5))], prompt, 0.55).is_empty(),
+                "{path}"
+            );
+        }
     }
 
     /// Story 193: the docs leg had no absolute floor. RRF normalization pins
