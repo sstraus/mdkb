@@ -117,6 +117,15 @@ fn hooks_e2e_warmup_recall_and_reindex() {
     );
 
     // --- UserPromptSubmit: relevant memory injection --------------------
+    // This step checks what recall returns, not the deadline: the production
+    // default (1000 ms) cuts a cold store on a loaded box and the hook answers
+    // `{}` (story 237). `init` writes its defaults commented out, so the live
+    // `[hooks]` table is appended rather than patched.
+    let cfg_path = root.join(".mdkb").join("config.toml");
+    let mut cfg = std::fs::read_to_string(&cfg_path).unwrap_or_default();
+    cfg.push_str("\n[hooks]\nuser_prompt_submit_deadline_ms = 60000\n");
+    std::fs::write(&cfg_path, cfg).expect("pin hook deadline");
+
     // Recall is opt-in via the `*` sigil (default); a user triggers it by
     // prefixing the prompt. The `*` is stripped before recall runs.
     let prompt_payload = r#"{"prompt": "* Explain the hook dispatcher architecture and events"}"#;

@@ -4650,6 +4650,120 @@ if (require.main === module) {
         );
     }
 
+    /// A temp repo whose code index holds the functions in `source`; `None`
+    /// leaves it without `code.sqlite`.
+    fn repo_with_symbols(source: Option<&str>) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mdkb")).unwrap();
+        if let Some(source) = source {
+            let src_dir = tmp.path().join("src");
+            std::fs::create_dir_all(&src_dir).unwrap();
+            std::fs::write(src_dir.join("lib.rs"), source).unwrap();
+            let mut facade = IndexFacade::open_or_create(tmp.path().join(".mdkb/code.sqlite"))
+                .expect("open code index");
+            facade.index_directory(&src_dir).expect("index sources");
+        }
+        tmp
+    }
+
+    async fn wildcard_symbols(query: &str, repos: &[&tempfile::TempDir]) -> String {
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        for repo in repos {
+            registry.get_or_open(repo.path()).unwrap();
+        }
+        let server = McpServer::global(registry);
+        let result = server
+            .search(Parameters(SearchParams {
+                query: query.to_string(),
+                limit: 20,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
+                kind: None,
+                file: None,
+                min_confidence: None,
+                since: None,
+                threshold: None,
+                root: Some("*".to_string()),
+            }))
+            .await
+            .expect("wildcard symbol search answers");
+        format!("{result:?}")
+    }
+
+    /// Catches one large repo crowding out the others: five matches in the big
+    /// repo yield three, and the small repo's hit is still listed, each tagged.
+    #[tokio::test]
+    async fn wildcard_symbols_take_three_hits_per_repo_tagged_with_the_repo() {
+        let big = repo_with_symbols(Some(
+            "pub fn handler_a() {}\npub fn handler_b() {}\npub fn handler_c() {}\n\
+             pub fn handler_d() {}\npub fn handler_e() {}\n",
+        ));
+        let small = repo_with_symbols(Some("pub fn handler_z() {}\n"));
+
+        let text = wildcard_symbols("handler", &[&big, &small]).await;
+
+        let tag = |repo: &tempfile::TempDir| {
+            repo.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()
+        };
+        assert_eq!(text.matches(&tag(&big)).count(), 3, "{text}");
+        assert_eq!(text.matches(&tag(&small)).count(), 1, "{text}");
+        assert!(text.contains("handler_z"), "{text}");
+    }
+
+    /// Catches empty confused with unreadable: a repo with no code index is
+    /// named as not searched, and the searched count excludes it.
+    #[tokio::test]
+    async fn wildcard_symbols_report_a_repo_without_a_code_index_as_not_searched() {
+        let indexed = repo_with_symbols(Some("pub fn needle() {}\n"));
+        let bare = repo_with_symbols(None);
+
+        let text = wildcard_symbols("needle", &[&indexed, &bare]).await;
+
+        let bare_name = bare
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(text.contains("Not searched (1)"), "{text}");
+        assert!(text.contains("no code index"), "{text}");
+        assert!(text.contains(&bare_name), "{text}");
+        assert!(text.contains("Searched 1 of 2"), "{text}");
+    }
+
+    /// Catches an accidental semantic fan-out: scope=duplicates with `*` is still refused.
+    #[tokio::test]
+    async fn an_explicit_wildcard_with_duplicates_scope_is_still_refused() {
+        let repo = repo_with_symbols(None);
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        registry.get_or_open(repo.path()).unwrap();
+        let err = McpServer::global(registry)
+            .search(Parameters(SearchParams {
+                query: "anything".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("duplicates".to_string()),
+                kind: None,
+                file: None,
+                min_confidence: None,
+                since: None,
+                threshold: None,
+                root: Some("*".to_string()),
+            }))
+            .await
+            .expect_err("a wildcard duplicates search has no answer");
+        assert!(
+            format!("{err:?}").contains("Cross-repo search is not supported"),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_handle_global_specific_root() {
         let tmp1 = tempfile::tempdir().unwrap();

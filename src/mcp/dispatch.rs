@@ -2574,7 +2574,8 @@ fn search_roots_blocking(
 /// in — and the ones that could not be opened are reported, never counted as
 /// empty.
 ///
-/// Code/symbols scopes are rejected — those indexes are per-repo only.
+/// `symbols` is answered by [`cross_repo_symbols_impl`]; code (semantic) and
+/// duplicates stay per-repo and are rejected.
 pub async fn cross_repo_search_impl(
     registry: &Arc<RepoRegistry>,
     params: &SearchParams,
@@ -2588,16 +2589,15 @@ pub async fn cross_repo_search_impl(
         .map_err(|()| mcp_error("Invalid search scope"))?;
     let limit = params.limit.min(100);
 
+    if scope == Some(crate::mcp::tools::SearchScope::Symbols) {
+        return cross_repo_symbols_impl(registry, params, client_scope, limit).await;
+    }
     if matches!(
         scope,
-        Some(
-            crate::mcp::tools::SearchScope::Code
-                | crate::mcp::tools::SearchScope::Symbols
-                | crate::mcp::tools::SearchScope::Duplicates
-        )
+        Some(crate::mcp::tools::SearchScope::Code | crate::mcp::tools::SearchScope::Duplicates)
     ) {
         return Err(mcp_error(
-            "Cross-repo search is not supported for code/symbols/duplicates scope. Specify a root.",
+            "Cross-repo search is not supported for code/duplicates scope. Specify a root.",
         ));
     }
 
@@ -2684,6 +2684,118 @@ pub async fn cross_repo_search_impl(
     ));
 
     let count = all_results.len();
+    Ok((output, count))
+}
+
+/// Symbols a cross-repo symbol search takes from each repo.
+const CROSS_REPO_SYMBOLS_PER_REPO: usize = 3;
+
+/// Merge per-repo symbol lists without comparing their ranks.
+///
+/// FTS ranks of different stores are not comparable, so there is no score to
+/// merge on. Exact name matches of every repo come first, then the fuzzy hits
+/// interleaved one repo at a time, so one large repo cannot crowd the rest out
+/// of `limit`.
+fn merge_symbol_hits(
+    per_repo: Vec<(std::path::PathBuf, Vec<(crate::code::symbol::Symbol, bool)>)>,
+    limit: usize,
+) -> Vec<(std::path::PathBuf, crate::code::symbol::Symbol)> {
+    let mut merged = Vec::new();
+    let mut fuzzy: Vec<(std::path::PathBuf, std::collections::VecDeque<_>)> = Vec::new();
+    for (root, hits) in per_repo {
+        let (exact, rest): (Vec<_>, Vec<_>) = hits.into_iter().partition(|(_, exact)| *exact);
+        merged.extend(exact.into_iter().map(|(sym, _)| (root.clone(), sym)));
+        fuzzy.push((root, rest.into_iter().map(|(sym, _)| sym).collect()));
+    }
+    while fuzzy.iter().any(|(_, queue)| !queue.is_empty()) {
+        for (root, queue) in &mut fuzzy {
+            if let Some(sym) = queue.pop_front() {
+                merged.push((root.clone(), sym));
+            }
+        }
+    }
+    merged.truncate(limit);
+    merged
+}
+
+/// `search scope=symbols` over the selected repos: up to
+/// [`CROSS_REPO_SYMBOLS_PER_REPO`] hits per repo, each tagged with its root.
+/// A repo without a code index is listed as not searched, never as zero hits.
+async fn cross_repo_symbols_impl(
+    registry: &Arc<RepoRegistry>,
+    params: &SearchParams,
+    client_scope: &[std::path::PathBuf],
+    limit: usize,
+) -> Result<(String, usize), McpError> {
+    let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
+    if resolution.roots.is_empty() {
+        return Err(mcp_error(
+            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+        ));
+    }
+
+    // Off the runtime, one read-only code index open at a time, like the
+    // document fan-out.
+    let outcomes = {
+        let registry = Arc::clone(registry);
+        let roots = resolution.roots.clone();
+        let params = params.clone();
+        tokio::task::spawn_blocking(move || {
+            roots
+                .into_iter()
+                .map(|root| {
+                    let hits = registry
+                        .read_only_code_index(&root)
+                        .map_err(|refusal| refusal.to_string())
+                        .and_then(|index| {
+                            crate::core::code::search_symbols_exact_first(
+                                &index,
+                                &params.query,
+                                params.kind.as_deref(),
+                                params.file.as_deref(),
+                                CROSS_REPO_SYMBOLS_PER_REPO,
+                            )
+                            .map_err(|e| e.to_string())
+                        });
+                    (root, hits)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| mcp_error(format!("cross-repo symbol search task failed: {e}")))?
+    };
+
+    let mut searched = 0_usize;
+    let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut per_repo = Vec::new();
+    for (root, hits) in outcomes {
+        match hits {
+            Ok(hits) => {
+                searched += 1;
+                per_repo.push((root, hits));
+            }
+            Err(why) => skipped.push((root, why)),
+        }
+    }
+
+    let merged = merge_symbol_hits(per_repo, limit);
+    let mut output = if merged.is_empty() {
+        format!("No symbols across the {searched} repos searched. Try a shorter name.")
+    } else {
+        let mut out = format!("Found {} symbol(s):\n\n", merged.len());
+        for (root, sym) in &merged {
+            out.push_str(&format!("{}\n{}\n", root.display(), format_symbol(sym)));
+        }
+        out
+    };
+    output.push_str(&format_cross_repo_coverage(
+        searched,
+        &resolution,
+        &skipped,
+        &[],
+        &[],
+    ));
+    let count = merged.len();
     Ok((output, count))
 }
 
@@ -13141,6 +13253,64 @@ mod tests {
         let (text, count) = search_impl(&handle, &params).await.expect("symbols scope");
         assert_eq!(count, 0, "text: {text}");
         assert!(text.contains("0 matches"), "text: {text}");
+    }
+
+    fn symbol_named(id: u32, name: &str) -> crate::code::symbol::Symbol {
+        use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
+        crate::code::symbol::Symbol::new(
+            SymbolId::new(id).unwrap(),
+            name,
+            SymbolKind::Function,
+            FileId::new(1).unwrap(),
+            Range::new(1, 0, 1, 10),
+        )
+    }
+
+    /// Catches a score merge across incomparable FTS ranks: an exact name match
+    /// of a small repo must precede the fuzzy hits of a repo listed before it,
+    /// and the fuzzy hits must interleave by repo instead of draining the first.
+    #[test]
+    fn merge_symbol_hits_lists_exact_first_then_interleaves_repos() {
+        let big = std::path::PathBuf::from("/big");
+        let small = std::path::PathBuf::from("/small");
+        let merged = merge_symbol_hits(
+            vec![
+                (
+                    big.clone(),
+                    vec![
+                        (symbol_named(1, "render_a"), false),
+                        (symbol_named(2, "render_b"), false),
+                        (symbol_named(3, "render_c"), false),
+                    ],
+                ),
+                (
+                    small.clone(),
+                    vec![
+                        (symbol_named(4, "render"), true),
+                        (symbol_named(5, "render_x"), false),
+                    ],
+                ),
+            ],
+            10,
+        );
+        let order: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|(root, sym)| (root.to_str().unwrap(), &*sym.name))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("/small", "render"),
+                ("/big", "render_a"),
+                ("/small", "render_x"),
+                ("/big", "render_b"),
+                ("/big", "render_c"),
+            ]
+        );
+        assert_eq!(
+            merge_symbol_hits(vec![(big, vec![(symbol_named(1, "a"), false)])], 0).len(),
+            0
+        );
     }
 
     #[tokio::test]
