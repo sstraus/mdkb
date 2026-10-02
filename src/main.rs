@@ -353,6 +353,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // human reading its stderr and nothing to record here, so it ends
             // quietly instead of repeating the refusal on every event.
             None if is_lifecycle_hook(&cli.command) => return Ok(()),
+            // `--root` names the repos itself; the directory it runs from
+            // anchors nothing, so a container of repositories is a fine place
+            // to run it, as it is for the MCP `root` parameter.
+            None if matches!(cli.command, Command::Search { root: Some(_), .. }) => raw_cwd.clone(),
             None => {
                 return Err(mdkb::Error::other(format!(
                     "refusing to anchor a store at {}: it holds git repositories (or is your \
@@ -479,127 +483,24 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             kind,
             file,
             entry_type,
+            root,
         } => {
-            let ctx = open_reader(&cwd)?;
-            announce_no_collections(&ctx)?;
-            match scope.as_deref() {
-                Some("docs") => {
-                    let results = handle_hybrid_search(
-                        &ctx,
-                        &query,
-                        limit,
-                        collection.as_deref(),
-                        include_superseded,
-                    )?;
-                    format_search_results(&results, cli.format);
-                }
-                Some("memory") => {
-                    let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
-                    format_memory_list(&entries, cli.format);
-                }
-                None => {
-                    // Default: search docs + memory
-                    let results = handle_hybrid_search(
-                        &ctx,
-                        &query,
-                        limit,
-                        collection.as_deref(),
-                        include_superseded,
-                    )?;
-                    // `--entry-type` narrows the memory half here too: the flag
-                    // describes the memory corpus, not the scope it was asked
-                    // for, and it used to be dropped silently without `--scope`.
-                    let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
-                    // One JSON document, not two arrays under markdown headings:
-                    // a consumer parsing stdout must never see anything else.
-                    if matches!(cli.format, OutputFormat::Json) {
-                        let out = serde_json::json!({
-                            "documents": results,
-                            "memory": entries,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&out)?);
-                        return Ok(());
-                    }
-                    // The headings label two sections for a human reader. CSV is
-                    // read by a program: a markdown heading in that stream is
-                    // noise, and the two tables stay told apart by their header
-                    // rows.
-                    let headings = !matches!(cli.format, OutputFormat::Csv);
-                    if !results.is_empty() {
-                        if headings {
-                            println!("## Documents\n");
-                        }
-                        format_search_results(&results, cli.format);
-                    }
-                    if !entries.is_empty() {
-                        if headings {
-                            println!("## Memory Entries\n");
-                        } else {
-                            println!();
-                        }
-                        format_memory_list(&entries, cli.format);
-                    }
-                    if results.is_empty() && entries.is_empty() {
-                        println!("No results found.");
-                        if mdkb::store::search::index_is_empty(&ctx.conn)? {
-                            println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
-                        }
-                    }
-                }
-                Some("code") => {
-                    let scored = mdkb::cli::handlers::handle_semantic_code_search(
-                        &cwd,
-                        &ctx.config_path,
-                        &query,
-                        kind.as_deref(),
-                        limit,
-                    )?;
-                    format_scored_symbols(&scored, cli.format);
-                }
-                Some("symbols") => {
-                    let found = mdkb::cli::handlers::handle_symbol_search(
-                        &cwd,
-                        &query,
-                        kind.as_deref(),
-                        file.as_deref(),
-                        limit,
-                    )?;
-                    format_code_symbols(&found.symbols, cli.format);
-                    report_find_truncation(&found);
-                }
-                Some("duplicates") => {
-                    // The query is not a query here: duplication is a sweep,
-                    // and what narrows it is `--file`, not words. An empty
-                    // query is therefore the ordinary case, not a mistake.
-                    let report = run_dup(
-                        &cwd,
-                        Some(&ctx.conn),
-                        &ctx.config_path,
-                        &mdkb::core::dup::DupOverrides {
-                            file: file
-                                .clone()
-                                .or_else(|| (!query.is_empty()).then(|| query.clone())),
-                            ..Default::default()
-                        },
-                    )?;
-                    print!("{}", report.markdown);
-                }
-                Some("coupling") => {
-                    // Same shape as `duplicates` above: a sweep, not a query,
-                    // so there is nothing to pass the query text to.
-                    let report = mdkb::core::coupling::handle_coupling(
-                        &cwd,
-                        &mdkb::core::coupling::CouplingOverrides::default(),
-                    )?;
-                    print!("{}", report.markdown);
-                }
-                Some(invalid) => {
-                    eprintln!(
-                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates, coupling. Omit for docs+memory.",
-                        invalid
-                    );
-                    std::process::exit(1);
-                }
+            let req = SearchRequest {
+                query,
+                limit,
+                collection,
+                include_superseded,
+                scope,
+                kind,
+                file,
+                entry_type,
+            };
+            if let Some(raw_root) = root {
+                run_search_roots(&raw_root, req, cli.format).await?;
+            } else {
+                let ctx = open_reader(&cwd)?;
+                announce_no_collections(&ctx)?;
+                run_search(&cwd, &ctx, req, cli.format)?;
             }
         }
         Command::Dup {
@@ -1506,6 +1407,7 @@ mdkb search <query> --scope symbols                     # symbol definitions (fu
 mdkb search <query> --scope symbols --file hook         # path substring, not a glob
 mdkb search <query> --scope code                        # semantic code search
 mdkb search <query> -c <collection>                     # a collection is -c, NOT --scope
+mdkb search <query> --root NAME                         # another repo: same selector as the MCP `root` below (--root '*' = all)
 mdkb get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
 mdkb get <id> --lines 10:50                             # line range
 mdkb mget <pattern>                                     # several documents at once
@@ -2061,6 +1963,203 @@ async fn run_global_stdio_server(mode_note: &str) -> Result<()> {
         .waiting()
         .await
         .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
+    Ok(())
+}
+
+/// What `mdkb search` was asked, minus where: the same request runs against
+/// one store, or against each store a `--root` names.
+#[derive(Clone)]
+struct SearchRequest {
+    query: String,
+    limit: usize,
+    collection: Option<String>,
+    include_superseded: bool,
+    scope: Option<String>,
+    kind: Option<String>,
+    file: Option<String>,
+    entry_type: Option<String>,
+}
+
+fn run_search(
+    cwd: &Path,
+    ctx: &Context,
+    req: SearchRequest,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let SearchRequest {
+        query,
+        limit,
+        collection,
+        include_superseded,
+        scope,
+        kind,
+        file,
+        entry_type,
+    } = req;
+    match scope.as_deref() {
+        Some("docs") => {
+            let results = handle_hybrid_search(
+                &ctx,
+                &query,
+                limit,
+                collection.as_deref(),
+                include_superseded,
+            )?;
+            format_search_results(&results, format);
+        }
+        Some("memory") => {
+            let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
+            format_memory_list(&entries, format);
+        }
+        None => {
+            // Default: search docs + memory
+            let results = handle_hybrid_search(
+                &ctx,
+                &query,
+                limit,
+                collection.as_deref(),
+                include_superseded,
+            )?;
+            // `--entry-type` narrows the memory half here too: the flag
+            // describes the memory corpus, not the scope it was asked
+            // for, and it used to be dropped silently without `--scope`.
+            let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
+            // One JSON document, not two arrays under markdown headings:
+            // a consumer parsing stdout must never see anything else.
+            if matches!(format, OutputFormat::Json) {
+                let out = serde_json::json!({
+                    "documents": results,
+                    "memory": entries,
+                });
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                return Ok(());
+            }
+            // The headings label two sections for a human reader. CSV is
+            // read by a program: a markdown heading in that stream is
+            // noise, and the two tables stay told apart by their header
+            // rows.
+            let headings = !matches!(format, OutputFormat::Csv);
+            if !results.is_empty() {
+                if headings {
+                    println!("## Documents\n");
+                }
+                format_search_results(&results, format);
+            }
+            if !entries.is_empty() {
+                if headings {
+                    println!("## Memory Entries\n");
+                } else {
+                    println!();
+                }
+                format_memory_list(&entries, format);
+            }
+            if results.is_empty() && entries.is_empty() {
+                println!("No results found.");
+                if mdkb::store::search::index_is_empty(&ctx.conn)? {
+                    println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
+                }
+            }
+        }
+        Some("code") => {
+            let scored = mdkb::cli::handlers::handle_semantic_code_search(
+                &cwd,
+                &ctx.config_path,
+                &query,
+                kind.as_deref(),
+                limit,
+            )?;
+            format_scored_symbols(&scored, format);
+        }
+        Some("symbols") => {
+            let found = mdkb::cli::handlers::handle_symbol_search(
+                &cwd,
+                &query,
+                kind.as_deref(),
+                file.as_deref(),
+                limit,
+            )?;
+            format_code_symbols(&found.symbols, format);
+            report_find_truncation(&found);
+        }
+        Some("duplicates") => {
+            // The query is not a query here: duplication is a sweep,
+            // and what narrows it is `--file`, not words. An empty
+            // query is therefore the ordinary case, not a mistake.
+            let report = run_dup(
+                &cwd,
+                Some(&ctx.conn),
+                &ctx.config_path,
+                &mdkb::core::dup::DupOverrides {
+                    file: file
+                        .clone()
+                        .or_else(|| (!query.is_empty()).then(|| query.clone())),
+                    ..Default::default()
+                },
+            )?;
+            print!("{}", report.markdown);
+        }
+        Some("coupling") => {
+            // Same shape as `duplicates` above: a sweep, not a query,
+            // so there is nothing to pass the query text to.
+            let report = mdkb::core::coupling::handle_coupling(
+                &cwd,
+                &mdkb::core::coupling::CouplingOverrides::default(),
+            )?;
+            print!("{}", report.markdown);
+        }
+        Some(invalid) => {
+            eprintln!(
+                "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates, coupling. Omit for docs+memory.",
+                invalid
+            );
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+/// `mdkb search --root`: the request against every store the selector names,
+/// each under its path when there are several. Several stores only make sense
+/// where the MCP fan-out allows them (docs and memory) and in a format a
+/// reader can still split: a JSON or CSV stream with headings between
+/// documents is neither.
+async fn run_search_roots(
+    raw_root: &str,
+    req: SearchRequest,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    use mdkb::mcp::tools::SearchScope;
+
+    let roots = mdkb::cli::repos::resolve_roots(raw_root).await?;
+    let several = roots.len() > 1;
+    if several {
+        let single_store_scope = req.scope.as_deref().is_some_and(|s| {
+            s == "coupling" || SearchScope::try_from(s).is_ok_and(|scope| !scope.fans_out())
+        });
+        if single_store_scope {
+            return Err(mdkb::Error::other(format!(
+                "--root {raw_root} names {} repos, and --scope {} cannot span repos. Name one \
+                 repo, or search docs and memory.",
+                roots.len(),
+                req.scope.as_deref().unwrap_or_default()
+            )));
+        }
+        if !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+            return Err(mdkb::Error::other(format!(
+                "--root {raw_root} names {} repos; --format json and csv print one repo. \
+                 Name one repo.",
+                roots.len()
+            )));
+        }
+    }
+    for root in &roots {
+        if several {
+            println!("## {}\n", root.display());
+        }
+        let ctx = open_reader(root)?;
+        announce_no_collections(&ctx)?;
+        run_search(root, &ctx, req.clone(), format)?;
+    }
     Ok(())
 }
 

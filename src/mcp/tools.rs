@@ -6,10 +6,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Where the `root` grammar is documented. Every error this module produces
-/// points here, and nothing else does: the grammar is not in the tool schemas
-/// and not in the server instructions, because both are charged on every
-/// request of every session while the cheatsheet costs nothing until an
-/// operator asks for it.
+/// points here. The full grammar is not in the tool schemas or the server
+/// instructions, because both are charged on every request of every session
+/// while the cheatsheet costs nothing until an operator asks for it; `search`
+/// alone carries a one-sentence summary of the accepted forms.
 const GRAMMAR_HINT: &str = "Run `mdkb cheatsheet` for the root grammar.";
 
 /// One item of a `root` selector.
@@ -326,6 +326,7 @@ pub struct SearchParams {
     /// Search query text.
     pub query: String,
 
+    /// Repo to search: a name, an absolute path, a comma list of either, or "*" for every known repo; omit for this workspace.
     #[serde(default)]
     pub root: Option<String>,
 

@@ -952,6 +952,23 @@ fn every_memory_write_input_has_a_cli_spelling() {
     );
 }
 
+/// Catches: the `root` selector reaching MCP `search` and not the CLI (story
+/// 218-78c8) — a caller who knows one surface could not guess the other.
+#[test]
+fn search_root_is_spelled_the_same_on_both_surfaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let help = text(&run(&["search", "--help"], dir.path()));
+    assert!(
+        help.contains("--root"),
+        "`mdkb search` has no --root:\n{help}"
+    );
+    let schema = serde_json::to_value(schemars::schema_for!(SearchParams)).expect("schema");
+    assert!(
+        schema.pointer("/properties/root").is_some(),
+        "MCP search has no root property: {schema}"
+    );
+}
+
 // ── Search (story 067-5ab6) ──────────────────────────────────────────────────
 
 /// The result identifiers in the order a surface printed them.

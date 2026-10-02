@@ -9,17 +9,22 @@ use crate::daemon::config::DaemonConfig;
 use crate::daemon::repo_listing::{list_repos, render_text};
 use crate::daemon::repo_map::{discover_nested_stores, read_known_roots};
 use crate::error::{Error, Result};
+use crate::mcp::tools::RootSelector;
+
+/// The stores nested under `known`, minus what `daemon.toml` ignores.
+fn nested_stores(known: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let home = DaemonConfig::daemon_home();
+    let ignore = DaemonConfig::load_or_default(&home.join("daemon.toml"))?.ignored_paths();
+    Ok(discover_nested_stores(known, &ignore).into_iter().collect())
+}
 
 /// The stores `root="*"` can read: the known roots and the stores nested under
 /// them. Refreshing the same set is what makes the footer's outdated line go
 /// away.
 fn stores_in_scope() -> Result<Vec<PathBuf>> {
-    let home = DaemonConfig::daemon_home();
-    let known = read_known_roots(&home.join("repos.json"));
-    let ignore = DaemonConfig::load_or_default(&home.join("daemon.toml"))?.ignored_paths();
-    Ok(discover_nested_stores(&known, &ignore)
-        .into_iter()
-        .collect())
+    nested_stores(&read_known_roots(
+        &DaemonConfig::daemon_home().join("repos.json"),
+    ))
 }
 
 /// The daemon's own list when one runs (the one source `daemon status` also
@@ -35,6 +40,21 @@ async fn known_roots() -> Result<Vec<PathBuf>> {
             "the running daemon did not list its repos: {e}"
         ))),
     }
+}
+
+/// The repos a `--root` value names: the MCP grammar through the MCP parser
+/// and resolver, against the same map the daemon answers from. Nested stores
+/// join the map only for the selectors that need them (`needs_discovery`), as
+/// on the MCP side, so an absolute path costs no directory walk.
+pub async fn resolve_roots(raw: &str) -> Result<Vec<PathBuf>> {
+    let selector = RootSelector::parse(Some(raw)).map_err(Error::other)?;
+    let mut known = known_roots().await?;
+    if selector.needs_discovery() {
+        known.extend(nested_stores(&known)?);
+        known.sort();
+        known.dedup();
+    }
+    selector.resolve(&known, &[]).map_err(Error::other)
 }
 
 pub async fn handle_list(format: OutputFormat) -> Result<()> {
