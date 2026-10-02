@@ -310,6 +310,8 @@ pub struct RepoRegistry {
     /// `daemon_config.ignore`, validated once: a bad entry is reported when the
     /// registry is built, not on every discovery call.
     ignored: Vec<PathBuf>,
+    /// Which scope each path belongs to, read once with the config.
+    scope_policy: super::scope::ScopePolicy,
     /// Every repo this daemon has ever opened, persisted across restarts.
     /// Deliberately not `handles`: that one is capped at `max_active` and
     /// starts empty in every process.
@@ -352,11 +354,13 @@ impl RepoRegistry {
         let max_active = config.max_active_repos;
         let repo_map = RepoMap::open(config.repo_map_path(), &config.repos);
         let ignored = config.ignored_paths();
+        let scope_policy = super::scope::ScopePolicy::load(&config);
         Self {
             handles: DashMap::new(),
             max_active,
             daemon_config: config,
             ignored,
+            scope_policy,
             repo_map,
             open_gate: std::sync::Mutex::new(()),
             discovery: std::sync::Mutex::new(None),
@@ -453,6 +457,11 @@ impl RepoRegistry {
     /// Number of currently active repo handles.
     pub fn active_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Which scope each path belongs to, for `root="*"`.
+    pub fn scope_policy(&self) -> &super::scope::ScopePolicy {
+        &self.scope_policy
     }
 
     /// Every repo this daemon knows, whether or not a handle is open for it.

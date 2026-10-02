@@ -216,3 +216,50 @@ fn several_repos_are_refused_where_no_merged_answer_exists() {
         stderr(&json)
     );
 }
+
+/// Catches: the CLI skipping the scope rule the MCP side applies. `--root '*'`
+/// from a work directory must not print the home repo's hit and must say it left
+/// one out; `'*:all'` must print both.
+#[test]
+fn a_star_leaves_out_the_other_scope_and_says_so_while_star_all_mixes() {
+    let tmp = TempDir::new().unwrap();
+    let scoped = mdkb::domain::canonicalize_plain(tmp.path())
+        .unwrap()
+        .join("scoped");
+    let home_repo = store(&scoped.join("home"), "h", "zonk_harvest");
+    let work_repo = store(&scoped.join("work"), "w", "zonk_harvest");
+    let home = home_knowing(tmp.path(), &[&home_repo, &work_repo]);
+    std::fs::write(
+        home.join(".mdkb/daemon.toml"),
+        format!(
+            "[[scopes]]\nprefix = \"{}\"\nscope = \"home\"\n\n[[scopes]]\nprefix = \"{}\"\nscope = \"work\"\n",
+            scoped.join("home").display(),
+            scoped.join("work").display()
+        ),
+    )
+    .unwrap();
+
+    let own = search(
+        &home,
+        &work_repo,
+        &["zonk_harvest", "--scope", "memory", "--root", "*"],
+    );
+    assert!(own.status.success(), "{own:?}");
+    let text = stdout(&own);
+    assert!(text.contains("zonk_harvest"), "control: {text}");
+    assert!(!text.contains(&home_repo.display().to_string()), "{text}");
+    assert!(
+        stderr(&own).contains("Excluded by scope: 1"),
+        "{}",
+        stderr(&own)
+    );
+
+    let mixed = search(
+        &home,
+        &work_repo,
+        &["zonk_harvest", "--scope", "memory", "--root", "*:all"],
+    );
+    assert!(mixed.status.success(), "{mixed:?}");
+    assert!(stdout(&mixed).contains(&home_repo.display().to_string()));
+    assert!(!stderr(&mixed).contains("Excluded by scope"));
+}

@@ -1,0 +1,265 @@
+//! `root="*"` respects the caller's scope (story 222-596a).
+//!
+//! Scope comes from `[[scopes]]` prefix rules in `daemon.toml` and from a
+//! `scope` on a `repos.json` entry, which wins. Every store and every config
+//! lives in a temp dir: nothing here touches the real `~/.mdkb`.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use mdkb::core::Context;
+use mdkb::daemon::config::{DaemonConfig, ScopeRule};
+use mdkb::daemon::registry::RepoRegistry;
+use mdkb::mcp::dispatch::{cross_repo_search_impl, resolve_root_selector};
+use mdkb::mcp::tools::SearchParams;
+use mdkb::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
+use serde_json::json;
+
+/// A store at `parent/name` with one memory entry about `needle`.
+fn store(parent: &Path, name: &str, needle: &str) -> PathBuf {
+    let root = parent.join(name);
+    std::fs::create_dir_all(&root).expect("create repo root");
+    let root = mdkb::domain::canonicalize_plain(&root).expect("canonicalize");
+    mdkb::cli::handlers::handle_init(&root).expect("init");
+    let ctx = Context::open(&root).expect("open store");
+    let now = chrono::Utc::now().timestamp();
+    add_entry(
+        &ctx.conn,
+        &MemoryEntry {
+            triggers: Vec::new(),
+            id: format!("{needle}-entry"),
+            title: format!("The {needle} decision"),
+            content: format!("Body mentioning {needle} so the lexical leg has something to match."),
+            entry_type: EntryType::Decision,
+            tags: vec![needle.to_string()],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            last_refuted_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        },
+    )
+    .expect("seed memory entry");
+    root
+}
+
+/// `home/` and `work/` prefixes, one store under each, and one under `free/`
+/// that no rule covers.
+struct World {
+    _tmp: tempfile::TempDir,
+    state: PathBuf,
+    home_dir: PathBuf,
+    work_dir: PathBuf,
+    home_store: PathBuf,
+    work_store: PathBuf,
+    free_store: PathBuf,
+}
+
+fn world() -> World {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let base = mdkb::domain::canonicalize_plain(tmp.path()).expect("canonicalize");
+    let state = base.join("state");
+    std::fs::create_dir_all(&state).expect("state");
+    let (home_dir, work_dir) = (base.join("home"), base.join("work"));
+    let home_store = store(&home_dir, "h", "home_needle");
+    let work_store = store(&work_dir, "w", "work_needle");
+    let free_store = store(&base.join("free"), "f", "free_needle");
+    World {
+        _tmp: tmp,
+        state,
+        home_dir,
+        work_dir,
+        home_store,
+        work_store,
+        free_store,
+    }
+}
+
+fn registry(world: &World) -> Arc<RepoRegistry> {
+    let config = DaemonConfig {
+        whitelist_dirs: vec![world.state.parent().unwrap().to_string_lossy().to_string()],
+        state_dir: Some(world.state.clone()),
+        scopes: vec![
+            ScopeRule {
+                prefix: world.home_dir.to_string_lossy().to_string(),
+                scope: "home".to_string(),
+            },
+            ScopeRule {
+                prefix: world.work_dir.to_string_lossy().to_string(),
+                scope: "work".to_string(),
+            },
+        ],
+        ..DaemonConfig::default()
+    };
+    let registry = Arc::new(RepoRegistry::new(config));
+    for root in [&world.home_store, &world.work_store, &world.free_store] {
+        registry.get_or_open(root).expect("open");
+    }
+    registry
+}
+
+fn memory_search(query: &str, root: &str) -> SearchParams {
+    serde_json::from_value(json!({
+        "query": query,
+        "root": root,
+        "scope": "memory",
+        "limit": 10,
+    }))
+    .expect("search params")
+}
+
+fn sorted(mut roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    roots.sort();
+    roots
+}
+
+/// Catches: HOME content leaking into a WORK answer. A work caller searching
+/// `*` for an entry that lives in a home store must not see it, and the footer
+/// must say a store was left out rather than let the empty answer read as
+/// "nothing matched".
+#[tokio::test]
+async fn a_home_store_is_left_out_of_star_for_a_work_caller_and_the_footer_says_so() {
+    let world = world();
+    let registry = registry(&world);
+    let work_caller = [world.work_store.clone()];
+
+    let (leak, _) =
+        cross_repo_search_impl(&registry, &memory_search("home_needle", "*"), &work_caller)
+            .await
+            .expect("search");
+    assert!(
+        !leak.contains("home_needle"),
+        "home leaked into work: {leak}"
+    );
+    assert!(leak.contains("Excluded by scope: 1"), "{leak}");
+
+    let (own, count) =
+        cross_repo_search_impl(&registry, &memory_search("work_needle", "*"), &work_caller)
+            .await
+            .expect("search");
+    assert!(count >= 1 && own.contains("work_needle"), "control: {own}");
+}
+
+/// Catches: no way to opt in. `*:all` and `scope:home` must reach the home
+/// store from a work caller, and `*:all` must not report an exclusion.
+#[tokio::test]
+async fn star_all_and_a_named_scope_cross_the_boundary() {
+    let world = world();
+    let registry = registry(&world);
+    let work_caller = [world.work_store.clone()];
+
+    let (mixed, _) = cross_repo_search_impl(
+        &registry,
+        &memory_search("home_needle", "*:all"),
+        &work_caller,
+    )
+    .await
+    .expect("search");
+    assert!(mixed.contains("home_needle"), "{mixed}");
+    assert!(!mixed.contains("Excluded by scope"), "{mixed}");
+
+    let (named, _) = cross_repo_search_impl(
+        &registry,
+        &memory_search("home_needle", "scope:home"),
+        &work_caller,
+    )
+    .await
+    .expect("search");
+    assert!(named.contains("home_needle"), "{named}");
+
+    let resolved =
+        resolve_root_selector(&registry, Some("scope:home"), &work_caller).expect("resolve");
+    assert_eq!(resolved.roots, vec![world.home_store.clone()]);
+}
+
+/// Catches: unscoped repos disappearing. A repo no rule covers stays in `*`
+/// for a work caller and a home caller alike, and a caller with no scope of
+/// its own loses nothing.
+#[test]
+fn a_repo_with_no_scope_is_always_in_star() {
+    let world = world();
+    let registry = registry(&world);
+
+    for caller in [
+        vec![world.work_store.clone()],
+        vec![world.home_store.clone()],
+        vec![world.free_store.clone()],
+        Vec::new(),
+    ] {
+        let resolved = resolve_root_selector(&registry, Some("*"), &caller).expect("resolve");
+        assert!(
+            resolved.roots.contains(&world.free_store),
+            "unscoped repo dropped for caller {caller:?}"
+        );
+    }
+
+    let unscoped =
+        resolve_root_selector(&registry, Some("*"), &[world.free_store.clone()]).expect("resolve");
+    assert_eq!(
+        sorted(unscoped.roots),
+        sorted(vec![
+            world.home_store.clone(),
+            world.work_store.clone(),
+            world.free_store.clone()
+        ]),
+        "a caller with no scope must exclude nothing"
+    );
+    assert_eq!(unscoped.excluded_by_scope, 0);
+}
+
+/// Catches: a wrong prefix with no override. A repos.json `scope` moves a
+/// store the home prefix would claim into work, so a work caller keeps it.
+#[test]
+fn a_repos_json_scope_overrides_the_prefix_rule() {
+    let world = world();
+    let moved = store(&world.home_dir, "moved", "moved_needle");
+    std::fs::write(
+        world.state.join("repos.json"),
+        json!({"version": 1, "repos": [{"root": moved, "scope": "work"}]}).to_string(),
+    )
+    .expect("write repos.json");
+    let registry = registry(&world);
+
+    let resolved =
+        resolve_root_selector(&registry, Some("*"), &[world.work_store.clone()]).expect("resolve");
+    assert!(resolved.roots.contains(&moved), "override ignored");
+    assert!(!resolved.roots.contains(&world.home_store));
+    assert_eq!(resolved.excluded_by_scope, 1);
+}
+
+/// Catches: the daemon erasing a hand-written scope. Recording a new root
+/// rewrites repos.json from the in-memory set, which carries no scope; the
+/// override must survive that rewrite.
+#[test]
+fn a_repos_json_scope_survives_the_map_being_rewritten() {
+    let world = world();
+    let moved = store(&world.home_dir, "moved", "moved_needle");
+    let map = world.state.join("repos.json");
+    std::fs::write(
+        &map,
+        json!({"version": 1, "repos": [{"root": moved, "scope": "work"}]}).to_string(),
+    )
+    .expect("write repos.json");
+
+    let registry = registry(&world); // records three new roots: three rewrites
+    drop(registry);
+
+    let text = std::fs::read_to_string(&map).expect("read repos.json");
+    let file: serde_json::Value = serde_json::from_str(&text).expect("json");
+    let entry = file["repos"]
+        .as_array()
+        .expect("repos")
+        .iter()
+        .find(|r| r["root"] == json!(moved))
+        .unwrap_or_else(|| panic!("moved entry missing: {text}"));
+    assert_eq!(entry["scope"], "work", "{text}");
+}

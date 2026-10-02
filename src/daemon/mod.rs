@@ -9,6 +9,7 @@ pub mod ipc_server;
 pub mod registry;
 pub mod repo_listing;
 pub mod repo_map;
+pub mod scope;
 #[cfg(unix)]
 pub mod singleton;
 #[cfg(unix)]

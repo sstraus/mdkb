@@ -104,7 +104,7 @@ use super::tools::RelatesInput;
 use super::tools::{
     CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams,
     MemoryDeleteParams, MemoryListParams, MemoryWriteBatchEntry, RootSelector, RootTerm,
-    SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
+    ScopedRoots, SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
@@ -1899,6 +1899,8 @@ pub struct ResolvedRoots {
     pub roots: Vec<std::path::PathBuf>,
     pub known: usize,
     pub discovered: usize,
+    /// Roots `*` left out because their scope differs from the caller's.
+    pub excluded_by_scope: usize,
 }
 
 pub fn resolve_root_selector(
@@ -1943,7 +1945,9 @@ pub fn resolve_root_selector(
     } else {
         open
     };
-    let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
+    let ScopedRoots { roots, excluded } = selector
+        .resolve_scoped(&known, &open, registry.scope_policy(), scope)
+        .map_err(mcp_error)?;
     let mapped: std::collections::BTreeSet<std::path::PathBuf> = registry
         .known_roots()
         .into_iter()
@@ -1955,6 +1959,7 @@ pub fn resolve_root_selector(
         roots,
         known: known.len() - discovered,
         discovered,
+        excluded_by_scope: excluded,
     })
 }
 
@@ -1992,7 +1997,7 @@ pub fn single_root(
     let ResolvedRoots {
         selector, roots, ..
     } = resolution;
-    if selector == RootSelector::All {
+    if selector.is_wildcard() {
         return Err(mcp_error(RootSelector::wildcard_rejection()));
     }
     match roots.len() {
@@ -2134,10 +2139,10 @@ fn format_cross_repo_coverage(
         format!("{known} known, {discovered} discovered")
     };
     let headline = match resolution.selector {
-        RootSelector::All if discovered == 0 => {
+        RootSelector::All | RootSelector::AllScopes | RootSelector::Scope(_) if discovered == 0 => {
             format!("_Searched {searched} of {known} known repos._")
         }
-        RootSelector::All => {
+        RootSelector::All | RootSelector::AllScopes | RootSelector::Scope(_) => {
             format!(
                 "_Searched {searched} of {} repos ({counted})._",
                 known + discovered
@@ -2151,6 +2156,12 @@ fn format_cross_repo_coverage(
         }
     };
     let mut out = format!("\n{headline}\n");
+    if resolution.excluded_by_scope > 0 {
+        out.push_str(&format!(
+            "Excluded by scope: {} (root=\"*:all\" mixes scopes)\n",
+            resolution.excluded_by_scope
+        ));
+    }
     if !outdated.is_empty() {
         out.push_str(&format_outdated_line(outdated));
     }

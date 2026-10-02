@@ -8,8 +8,9 @@ use crate::core::refresh::{RefreshReport, RefreshStatus, refresh_outdated};
 use crate::daemon::config::DaemonConfig;
 use crate::daemon::repo_listing::{list_repos, render_text};
 use crate::daemon::repo_map::{discover_nested_stores, read_known_roots};
+use crate::daemon::scope::ScopePolicy;
 use crate::error::{Error, Result};
-use crate::mcp::tools::RootSelector;
+use crate::mcp::tools::{RootSelector, ScopedRoots};
 
 /// The stores nested under `known`, minus what `daemon.toml` ignores.
 fn nested_stores(known: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -45,8 +46,9 @@ async fn known_roots() -> Result<Vec<PathBuf>> {
 /// The repos a `--root` value names: the MCP grammar through the MCP parser
 /// and resolver, against the same map the daemon answers from. Nested stores
 /// join the map only for the selectors that need them (`needs_discovery`), as
-/// on the MCP side, so an absolute path costs no directory walk.
-pub async fn resolve_roots(raw: &str) -> Result<Vec<PathBuf>> {
+/// on the MCP side, so an absolute path costs no directory walk. The caller's
+/// scope is the working directory's.
+pub async fn resolve_roots(raw: &str) -> Result<ScopedRoots> {
     let selector = RootSelector::parse(Some(raw)).map_err(Error::other)?;
     let mut known = known_roots().await?;
     if selector.needs_discovery() {
@@ -54,7 +56,14 @@ pub async fn resolve_roots(raw: &str) -> Result<Vec<PathBuf>> {
         known.sort();
         known.dedup();
     }
-    selector.resolve(&known, &[]).map_err(Error::other)
+    let config = DaemonConfig::load_or_default(&DaemonConfig::daemon_home().join("daemon.toml"))?;
+    let caller: Vec<PathBuf> = std::env::current_dir()
+        .map(|cwd| crate::domain::canonicalize_plain(&cwd).unwrap_or(cwd))
+        .into_iter()
+        .collect();
+    selector
+        .resolve_scoped(&known, &[], &ScopePolicy::load(&config), &caller)
+        .map_err(Error::other)
 }
 
 pub async fn handle_list(format: OutputFormat) -> Result<()> {

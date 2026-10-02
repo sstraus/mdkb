@@ -16,7 +16,7 @@
 //! root another process has just recorded. That loss costs one re-record on the
 //! next `get_or_open` of the root, which is why no cross-process lock is taken.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -174,7 +174,7 @@ struct Triage {
 /// A path that resolves to nothing is kept verbatim: it is about to be
 /// classified [`RootHealth::Gone`] and dropped, and the spelling the operator
 /// wrote is the one that belongs in that log line.
-fn canonical_key(root: &Path) -> PathBuf {
+pub(super) fn canonical_key(root: &Path) -> PathBuf {
     let resolved = crate::git::resolve_main_worktree(root);
     // `canonicalize` returns `\\?\C:\...` on Windows, which names the same file
     // and compares equal to nothing. Every key written that way would be a
@@ -197,6 +197,22 @@ fn triage(roots: BTreeSet<PathBuf>) -> Triage {
         out.kept.insert(root);
     }
     out
+}
+
+/// The `scope` each repo carries in the persisted map, keyed by canonical root.
+/// Read without triage or a write-back, like [`read_known_roots`]; a file that
+/// cannot be read or parsed has none.
+pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(file) = serde_json::from_str::<RepoMapFile>(&content) else {
+        return BTreeMap::new();
+    };
+    file.repos
+        .into_iter()
+        .filter_map(|r| Some((canonical_key(Path::new(&r.root)), r.scope?)))
+        .collect()
 }
 
 /// The persisted set of known repository roots.
@@ -327,7 +343,10 @@ impl RepoMap {
             );
             return;
         }
-        if let Err(e) = write_atomic(path, roots) {
+        // The scopes are written by hand, and this process never records one:
+        // read them back from the file so a rewrite for a new root cannot erase
+        // them.
+        if let Err(e) = write_atomic(path, roots, &read_scope_overrides(path)) {
             tracing::warn!(
                 path = %path.display(),
                 "Could not persist the repo map: {e} — the set is still correct in memory"
@@ -445,7 +464,11 @@ fn read_file(path: &Path) -> MapRead {
 /// a complete file or not at all, so no crash can leave a truncated map behind.
 /// The temp file is fsynced first, so the rename cannot publish a name whose
 /// contents are still in the page cache.
-fn write_atomic(path: &Path, roots: &BTreeSet<PathBuf>) -> std::io::Result<()> {
+fn write_atomic(
+    path: &Path,
+    roots: &BTreeSet<PathBuf>,
+    scopes: &BTreeMap<PathBuf, String>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -455,6 +478,7 @@ fn write_atomic(path: &Path, roots: &BTreeSet<PathBuf>) -> std::io::Result<()> {
             .iter()
             .map(|r| RepoEntry {
                 root: r.to_string_lossy().to_string(),
+                scope: scopes.get(r).cloned(),
             })
             .collect(),
     };
@@ -509,6 +533,7 @@ mod tests {
             .iter()
             .map(|r| RepoEntry {
                 root: r.to_string_lossy().to_string(),
+                scope: None,
             })
             .collect()
     }

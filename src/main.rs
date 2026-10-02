@@ -1495,7 +1495,10 @@ root=\"/abs/path\"                                        # one repo by path; ne
 root=\"name\"                                             # one repo by name, the last component of a known root
 root=\"parent/name\"                                     # the same, by trailing path components: how a name several repos share is told apart
 root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
-root=\"*\"                                                # every known repo (`mdkb daemon status` lists them)
+root=\"*\"                                                # every known repo in the caller's scope, plus repos with no scope; the footer counts the rest (Excluded by scope: N)
+root=\"*:all\"                                            # every known repo, scopes mixed
+root=\"scope:home\"                                       # the known repos whose scope is home
+# Scope: `[[scopes]] prefix = \"~/Gits/home\"` / `scope = \"home\"` in daemon.toml, or `\"scope\"` on a repos.json entry (wins over the prefix).
 # Only `search` fans out; every other tool needs a selector naming one repo —
 # with `root` omitted that is the declared workspace itself, when it is a store.
 # A comma always separates repos, so a path containing one is refused, not split.
@@ -2130,7 +2133,8 @@ async fn run_search_roots(
 ) -> mdkb::error::Result<()> {
     use mdkb::mcp::tools::SearchScope;
 
-    let roots = mdkb::cli::repos::resolve_roots(raw_root).await?;
+    let mdkb::mcp::tools::ScopedRoots { roots, excluded } =
+        mdkb::cli::repos::resolve_roots(raw_root).await?;
     let several = roots.len() > 1;
     if several {
         let single_store_scope = req.scope.as_deref().is_some_and(|s| {
@@ -2159,6 +2163,9 @@ async fn run_search_roots(
         let ctx = open_reader(root)?;
         announce_no_collections(&ctx)?;
         run_search(root, &ctx, req.clone(), format)?;
+    }
+    if excluded > 0 {
+        eprintln!("Excluded by scope: {excluded} (--root '*:all' mixes scopes)");
     }
     Ok(())
 }

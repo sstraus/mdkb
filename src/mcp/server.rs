@@ -612,7 +612,10 @@ impl McpServer {
         // answer still states its coverage, and even in standalone mode, where
         // the fan-out refuses. A standalone server holds one store and no map:
         // answering `*` from it would report one repo as if it were every repo.
-        if RootSelector::parse(params.root.as_deref()).map_err(mcp_error)? == RootSelector::All {
+        if RootSelector::parse(params.root.as_deref())
+            .map_err(mcp_error)?
+            .is_wildcard()
+        {
             return self.cross_repo_search(&params).await;
         }
         // A list naming more than one repo fans out too — but only for a
