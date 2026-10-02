@@ -123,12 +123,10 @@ pub(crate) async fn dispatch_hook_message(
     }
 
     if method == REPOS_METHOD {
-        let mut roots: std::collections::BTreeSet<_> = registry.known_roots().into_iter().collect();
-        registry.retain_unignored(&mut roots);
         return json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": { "roots": roots },
+            "result": { "roots": registry.listed_roots() },
         })
         .to_string();
     }

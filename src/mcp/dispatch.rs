@@ -3983,6 +3983,25 @@ pub async fn usage_impl(
         .map_err(|e| mcp_error(format!("Failed to serialize usage: {e}")))
 }
 
+/// `repos` — one row per known repo, rendered by the code `mdkb repos list`
+/// prints with. `registry` is the daemon's own list (global mode); without one,
+/// the persisted map, which is what the CLI reads when no daemon runs.
+pub async fn repos_impl(registry: Option<&RepoRegistry>) -> Result<String, McpError> {
+    let roots = match registry {
+        Some(registry) => registry.listed_roots(),
+        None => crate::daemon::repo_map::read_known_roots(
+            &crate::daemon::config::DaemonConfig::daemon_home().join("repos.json"),
+        ),
+    };
+    let rows = tokio::task::spawn_blocking(move || crate::daemon::repo_listing::list_repos(&roots))
+        .await
+        .map_err(|e| mcp_error(format!("repos: listing task failed: {e}")))?;
+    if rows.is_empty() {
+        return Ok("No repos known.\n".to_string());
+    }
+    Ok(crate::daemon::repo_listing::render_text(&rows))
+}
+
 // ── Hook dispatch impls ───────────────────────────────────────────────────────
 // These return raw hook envelopes (hookSpecificOutput) rather than {text:...}.
 // Called from dispatch_call "hook.*" arms and from hook_client's no-daemon path.

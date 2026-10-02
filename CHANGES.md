@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- **`repos` MCP tool.** Lists the known repos with the rows `mdkb repos list`
+  prints (name, kind, counts, freshness, health), from the same listing and
+  renderer, so a client that carries MCP only (AI Chat over ACP) has the CLI's
+  answer. MCP tools: 12 to 13. Story 220-711b.
+
 ### Fixed
 
 - **`mdkb update` prunes the collection of a deleted directory.** An

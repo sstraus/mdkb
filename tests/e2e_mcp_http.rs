@@ -308,7 +308,7 @@ fn http_initialize_and_tools_list() {
     let mut advertised = mdkb::mcp::server::advertised_tool_names();
     advertised.sort_unstable();
     assert_eq!(names, advertised, "HTTP advertises the same tools as stdio");
-    assert_eq!(names.len(), 12);
+    assert_eq!(names.len(), 13);
 }
 
 /// The DNS-rebinding guard: a valid token does not help a request that

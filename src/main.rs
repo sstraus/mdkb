@@ -1481,6 +1481,7 @@ mdkb memory audit                                       # entries worth re-readi
 # Daemon (the daemon owns every write; the CLI routes mutations to it)
 mdkb daemon status                                      # is it running, and against which store
 mdkb daemon restart                                     # after upgrading the binary
+mdkb repos list                                         # every known repo: counts, freshness, health (MCP: `repos`)
 mdkb repos refresh --only outdated                      # migrate every store older than this binary, each after a verified backup copy
 MDKB_NO_DAEMON=1 mdkb <cmd>                             # run in-process instead, for debugging
 MDKB_NAMESPACE=<name> mdkb <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked

@@ -1459,16 +1459,17 @@ async fn an_unknown_scope_names_every_valid_scope() {
     assert!(msg.contains("duplicate'"), "and the value rejected: {msg}");
 }
 
-/// The whole point of the scope: no thirteenth tool schema on every turn.
+/// The whole point of the scope: no tool schema for the audit on every turn.
+/// The count rose from 12 to 13 for `repos` (story 220-711b), by decision.
 #[test]
 fn the_duplication_audit_added_no_mcp_tool() {
     let advertised = mdkb::mcp::server::advertised_tool_names();
     assert_eq!(
         advertised.len(),
-        12,
+        13,
         "the MCP tool count is a budget, not an accident: every schema is \
          charged on every turn of every conversation. Duplication rides \
-         `search` as a scope for that reason. If a thirteenth tool is genuinely \
+         `search` as a scope for that reason. If a fourteenth tool is genuinely \
          worth it, raise this number deliberately — do not let it drift: \
          {advertised:?}"
     );
@@ -1476,4 +1477,55 @@ fn the_duplication_audit_added_no_mcp_tool() {
         !advertised.iter().any(|t| t.contains("dup")),
         "and it must not be spelled as a tool: {advertised:?}"
     );
+}
+
+// ── `repos` (story 220-711b) ─────────────────────────────────────────────────
+
+/// Catches: the `repos` tool growing its own listing (another row builder, or
+/// another renderer) that drifts from `mdkb repos list`: a column the CLI
+/// shows missing from the tool, or a different set of repos, because the tool
+/// read another source than the map the CLI reads.
+#[tokio::test]
+async fn the_repos_tool_returns_the_rows_of_mdkb_repos_list() {
+    use rmcp::handler::server::wrapper::Parameters;
+    use rmcp::model::{ContentBlock, EmptyObject};
+
+    let home = tempfile::tempdir().expect("home");
+    let state = home.path().join(".mdkb");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let first = Repo::init("");
+    let second = Repo::init("");
+    let map = mdkb::daemon::repo_map::RepoMap::open(Some(state.join("repos.json")), &[]);
+    map.record(&first.root);
+    map.record(&second.root);
+
+    let cli = cli::command()
+        .args(["repos", "list"])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .current_dir(&first.root)
+        .output()
+        .expect("run mdkb repos list");
+    assert!(cli.status.success(), "{cli:?}");
+    let cli = text(&cli);
+
+    // The daemon's registry over the same map file, as `mdkb mcp --global` builds it.
+    let registry = Arc::new(mdkb::daemon::registry::RepoRegistry::new(
+        mdkb::DaemonConfig {
+            state_dir: Some(state),
+            ..mdkb::DaemonConfig::default()
+        },
+    ));
+    let server = mdkb::mcp::server::McpServer::global(registry);
+    let result = server
+        .repos(Parameters(EmptyObject {}))
+        .await
+        .expect("repos tool");
+    let mcp = match &result.content[0] {
+        ContentBlock::Text(t) => t.text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+
+    assert_eq!(cli.lines().count(), 2, "one row per repo:\n{cli}");
+    assert_eq!(mcp, cli, "the tool and the CLI must print the same rows");
 }
