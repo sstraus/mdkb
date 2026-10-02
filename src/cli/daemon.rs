@@ -113,6 +113,11 @@ mod platform {
             .map_err(|e| format!("bad 'roots': {e}"))
     }
 
+    /// The running daemon's repo list, `None` when no daemon runs.
+    pub async fn running_daemon_repos() -> std::result::Result<Option<Vec<PathBuf>>, String> {
+        query_repos(DaemonState::probe().running_pid().is_some()).await
+    }
+
     fn present(p: &Path) -> &'static str {
         if p.exists() { "(present)" } else { "(absent)" }
     }
@@ -138,8 +143,9 @@ mod platform {
         match query_repos(s.running_pid().is_some()).await {
             Ok(Some(known)) => {
                 println!("  repos:      {} known", known.len());
-                for root in &known {
-                    println!("    [known] {}", root.display());
+                let rows = crate::daemon::repo_listing::list_repos(&known);
+                for line in crate::daemon::repo_listing::render_text(&rows).lines() {
+                    println!("    {line}");
                 }
             }
             Ok(None) => println!("  repos:      unknown (daemon not running)"),
@@ -214,7 +220,14 @@ mod platform {
 }
 
 #[cfg(unix)]
-pub use platform::{handle_restart, handle_status, handle_stop};
+pub use platform::{handle_restart, handle_status, handle_stop, running_daemon_repos};
+
+/// No daemon on this platform: the caller falls back to the persisted map.
+#[cfg(not(unix))]
+pub async fn running_daemon_repos() -> std::result::Result<Option<Vec<std::path::PathBuf>>, String>
+{
+    Ok(None)
+}
 
 #[cfg(not(unix))]
 pub async fn handle_status() -> Result<()> {

@@ -403,6 +403,12 @@ pub enum DaemonCommand {
 /// `mdkb repos <cmd>` subcommands. See `cli::repos` for behavior.
 #[derive(Subcommand, Debug)]
 pub enum ReposCommand {
+    /// List the repository map, one row per repo, read live from the stores.
+    ///
+    /// Asks the running daemon for its repos; with no daemon, reads
+    /// `repos.json`. Never opens a store for writing and never walks the disk.
+    List,
+
     /// Migrate stores older than this binary to its schema, one at a time.
     ///
     /// Each store is copied to `index.sqlite.pre-migrate-v<N>-<time>` beside it

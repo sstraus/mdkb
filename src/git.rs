@@ -427,6 +427,21 @@ pub fn head_commit(root: &Path) -> Option<String> {
     (!head.is_empty()).then_some(head)
 }
 
+/// Commit time of `HEAD` in the repository containing `root`, in Unix seconds,
+/// or `None` for the same reasons as [`head_commit`].
+pub fn head_commit_time(root: &Path) -> Option<i64> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--format=%ct"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()?.trim().parse().ok()
+}
+
 /// Walk up from `start` (inclusive) looking for a git repository root — a
 /// directory containing `.git` (a directory for a normal repo, a file for a
 /// secondary worktree). Returns the nearest such directory, or `None`.
