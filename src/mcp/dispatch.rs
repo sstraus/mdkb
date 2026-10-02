@@ -9454,10 +9454,19 @@ mod tests {
     /// the plural, so the document the prompt names is dropped.
     #[test]
     fn a_prompt_naming_the_file_stem_admits_it_above_the_precision_floor() {
-        let hits = |cosine| vec![scored_hit("followups.md", "Verifiche dovute a Boss", cosine)];
+        let hits = |cosine| {
+            vec![scored_hit(
+                "followups.md",
+                "Verifiche dovute a Boss",
+                cosine,
+            )]
+        };
         let prompt = "cosa ho chiesto di verificare, ci sono follow-up aperti?";
         assert_eq!(admit_doc_hits(hits(Some(0.514)), prompt, 0.55).len(), 1);
-        assert_eq!(admit_doc_hits(hits(Some(0.41)), "i Followups aperti", 0.55).len(), 1);
+        assert_eq!(
+            admit_doc_hits(hits(Some(0.41)), "i Followups aperti", 0.55).len(),
+            1
+        );
     }
 
     /// Catches: the stem arm admitting on the word alone, so a document the
@@ -9465,7 +9474,13 @@ mod tests {
     /// name in passing (or the store has no embedding at all).
     #[test]
     fn naming_a_file_stem_needs_the_precision_floor_behind_it() {
-        let hits = |cosine| vec![scored_hit("followups.md", "Verifiche dovute a Boss", cosine)];
+        let hits = |cosine| {
+            vec![scored_hit(
+                "followups.md",
+                "Verifiche dovute a Boss",
+                cosine,
+            )]
+        };
         let prompt = "scrivi i follow-up della riunione";
         assert!(admit_doc_hits(hits(Some(0.39)), prompt, 0.55).is_empty());
         assert!(admit_doc_hits(hits(None), prompt, 0.55).is_empty());
@@ -9476,9 +9491,16 @@ mod tests {
     #[test]
     fn a_common_short_file_stem_is_not_evidence() {
         let prompt = "update the tools, the tracker, the plans and the notes";
-        for path in ["tools.md", "tracker.md", "plan.md", "notes.md", "docs/README.md"] {
+        for path in [
+            "tools.md",
+            "tracker.md",
+            "plan.md",
+            "notes.md",
+            "docs/README.md",
+        ] {
             assert!(
-                admit_doc_hits(vec![scored_hit(path, "Whatever", Some(0.5))], prompt, 0.55).is_empty(),
+                admit_doc_hits(vec![scored_hit(path, "Whatever", Some(0.5))], prompt, 0.55)
+                    .is_empty(),
                 "{path}"
             );
         }
@@ -17126,5 +17148,63 @@ mod tests {
                 Some(root.join("./da").join("w.md")),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod file_stem_admission_critic_tests {
+    use super::*;
+
+    fn hit(path: &str, cosine: Option<f64>) -> (crate::domain::SearchResult, Option<f64>) {
+        (
+            crate::domain::SearchResult {
+                id: 1,
+                collection: "default".into(),
+                path: path.into(),
+                title: Some("Verifiche dovute a Boss".into()),
+                score: 1.0,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+                repo_root: None,
+            },
+            cosine,
+        )
+    }
+
+    /// Catches: the corroboration comparison flipping from `>=` to `>` or
+    /// drifting by one f32 step. The cosines of the store are f32 widened to
+    /// f64, so the floor itself admits and the next f32 below it does not.
+    #[test]
+    fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
+        let floor = crate::config::MIN_RECALL_COSINE_DEFAULT;
+        let below = f32::from_bits(floor.to_bits() - 1);
+        let prompt = "i followups aperti";
+        let admit = |c: f32| {
+            admit_doc_hits(vec![hit("followups.md", Some(f64::from(c)))], prompt, 0.55).len()
+        };
+        assert_eq!(admit(floor), 1);
+        assert_eq!(admit(below), 0);
+    }
+
+    /// Catches: a NaN cosine (zero-norm vector) passing the corroboration.
+    #[test]
+    fn a_nan_cosine_does_not_corroborate_a_stem() {
+        let hits = vec![hit("followups.md", Some(f64::NAN))];
+        assert!(admit_doc_hits(hits, "i followups aperti", 0.55).is_empty());
+    }
+
+    /// Catches: the stem arm keying on any hit in the pool instead of the hit
+    /// that is named: a prompt naming `followups.md` admits only that file.
+    #[test]
+    fn the_stem_arm_admits_only_the_named_document() {
+        let hits = vec![
+            hit("decisions.md", Some(0.5)),
+            hit("followups.md", Some(0.5)),
+            hit("orchestration-lessons.md", Some(0.5)),
+        ];
+        let admitted = admit_doc_hits(hits, "i followups aperti", 0.55);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].path, "followups.md");
     }
 }

@@ -602,3 +602,59 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod file_stem_critic_tests {
+    use super::*;
+
+    /// Catches: the length floor counting bytes, not characters. "qualità" is
+    /// seven letters, like "tracker" — a word every prompt uses in passing —
+    /// but eight bytes, so it clears `STEM_NAME_MIN_LEN` and an Italian or
+    /// Cyrillic stem admits a document on any prompt that uses the word.
+    #[test]
+    fn a_short_accented_stem_is_not_evidence() {
+        assert!(!names_file_stem(
+            "controlla la qualità del codice",
+            "qualità.md"
+        ));
+        assert!(!names_file_stem("обнови заметки", "заметки.md"));
+    }
+
+    /// Control for the case above: a stem of eight characters with an accent
+    /// is long enough, so the fix for bytes-vs-characters must not over-shoot.
+    #[test]
+    fn an_eight_letter_accented_stem_is_evidence() {
+        assert!(names_file_stem("aggiorna attività", "attività.md"));
+    }
+
+    /// Catches: a hyphenated prompt word that is only a prefix or a superset
+    /// of the stem matching (`follow-up-tests` vs `followups`).
+    #[test]
+    fn only_the_whole_stem_names_the_file() {
+        assert!(!names_file_stem("follow-up-tests", "followups.md"));
+        assert!(!names_file_stem("followupsandmore", "followups.md"));
+        assert!(!names_file_stem("follow up", "followups.md"));
+        assert!(names_file_stem("(Follow-Up)", "docs/Followups.md"));
+    }
+
+    /// Catches: an empty or extension-only path, or a prompt made of
+    /// punctuation, folding to the empty string and matching it.
+    #[test]
+    fn empty_inputs_name_nothing() {
+        assert!(!names_file_stem("followups", ""));
+        assert!(!names_file_stem("--- ... !!!", ""));
+        assert!(!names_file_stem("", "followups.md"));
+        assert!(!names_file_stem("--- ...", "---.md"));
+    }
+
+    /// Catches: the stem arm leaking into the shared lexical gate that memory
+    /// recall uses. `strong_lexical_match` must keep seeing "follow-up" and
+    /// "followups" as unrelated words.
+    #[test]
+    fn strong_lexical_match_does_not_fold_hyphens_or_plurals() {
+        assert!(!strong_lexical_match(
+            "ci sono follow-up aperti?",
+            "followups.md Verifiche dovute a Boss"
+        ));
+    }
+}
