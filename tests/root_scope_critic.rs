@@ -210,7 +210,10 @@ fn a_blank_scope_in_repos_json_is_not_a_scope() {
     let tmp = TempDir::new().unwrap();
     let repo = dir(tmp.path(), "r");
     let map = tmp.path().join("repos.json");
-    write_map(&map, &[(&repo, Some("")), (&dir(tmp.path(), "s"), Some("   "))]);
+    write_map(
+        &map,
+        &[(&repo, Some("")), (&dir(tmp.path(), "s"), Some("   "))],
+    );
 
     let overrides = read_scope_overrides(&map);
 
@@ -256,7 +259,11 @@ fn recording_a_root_keeps_the_scope_written_through_a_symlink() {
     repo_map.record(&b);
 
     let overrides = read_scope_overrides(&map);
-    assert_eq!(overrides.get(&a).map(String::as_str), Some("work"), "{overrides:?}");
+    assert_eq!(
+        overrides.get(&a).map(String::as_str),
+        Some("work"),
+        "{overrides:?}"
+    );
 }
 
 /// Catches: the triage pass dropping an entry (no store, or a volume that is
@@ -299,9 +306,17 @@ async fn a_scope_nobody_has_says_so() {
     let registry = Arc::new(RepoRegistry::new(config(&state, &work, &home)));
     registry.get_or_open(&w).unwrap();
 
-    let (text, _) = answer(&registry, &search("scope:nope", "memory", "zonk_w"), &[work]).await;
+    let (text, _) = answer(
+        &registry,
+        &search("scope:nope", "memory", "zonk_w"),
+        &[work],
+    )
+    .await;
 
-    assert!(text.contains("nope"), "the answer must name the scope: {text}");
+    assert!(
+        text.contains("nope"),
+        "the answer must name the scope: {text}"
+    );
 }
 
 /// Catches: every known repo excluded by scope surfacing as "No repos
@@ -363,7 +378,10 @@ async fn sessions_stay_out_of_star_and_scope_but_come_with_star_all() {
     let caller = vec![work.clone()];
 
     let (text, all) = answer(&registry, &search("*:all", "docs", "zonk_session"), &caller).await;
-    assert!(all >= 1, "control: `*:all` must find the session chunk: {text}");
+    assert!(
+        all >= 1,
+        "control: `*:all` must find the session chunk: {text}"
+    );
 
     for root in ["*", "scope:work"] {
         let (text, count) = answer(&registry, &search(root, "docs", "zonk_session"), &caller).await;
@@ -377,7 +395,14 @@ async fn sessions_stay_out_of_star_and_scope_but_come_with_star_all() {
 
 fn git(cwd: &Path, args: &[&str]) {
     let out = Command::new("git")
-        .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -441,5 +466,8 @@ fn the_cli_scopes_a_linked_worktree_by_its_main_worktree() {
 
     let from_wt = star_search(&cli_home, &wt, "zonk_w");
     let err = String::from_utf8_lossy(&from_wt.stderr).into_owned();
-    assert!(err.contains("Excluded by scope: 1"), "from the linked worktree: {err}");
+    assert!(
+        err.contains("Excluded by scope: 1"),
+        "from the linked worktree: {err}"
+    );
 }
