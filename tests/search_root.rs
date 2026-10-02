@@ -216,3 +216,108 @@ fn several_repos_are_refused_where_no_merged_answer_exists() {
         stderr(&json)
     );
 }
+
+/// Catches: the CLI and MCP disagreeing on transcripts. `*` must not print a
+/// `claude_sessions` hit; `*:all` must.
+#[test]
+fn a_star_leaves_claude_sessions_out_and_star_all_includes_them() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "unrelated_thing");
+    {
+        let ctx = Context::open(&alpha).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        mdkb::store::collections::add_collection(
+            &ctx.conn,
+            &mdkb::domain::Collection {
+                name: "claude_sessions".to_string(),
+                path: "./no-such-dir".to_string(),
+                pattern: "**/*".to_string(),
+                source: mdkb::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        let content = "Transcript where we discussed ledger_sync at length.";
+        let doc = mdkb::domain::Document {
+            id: 0,
+            collection: "claude_sessions".to_string(),
+            relative_path: "sid-chunk-001".to_string(),
+            hash: mdkb::store::documents::compute_hash(content),
+            title: Some("Session about ledger_sync".to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+            status: Some("current".to_string()),
+        };
+        mdkb::store::documents::index_document(&ctx.conn, &doc, content).unwrap();
+    }
+    let home = home_knowing(tmp.path(), &[&alpha]);
+
+    let default = search(
+        &home,
+        &alpha,
+        &["ledger_sync", "--scope", "docs", "--root", "*"],
+    );
+    assert!(default.status.success(), "{default:?}");
+    assert!(
+        !stdout(&default).contains("sid-chunk-001"),
+        "{}",
+        stdout(&default)
+    );
+
+    let all = search(
+        &home,
+        &alpha,
+        &["ledger_sync", "--scope", "docs", "--root", "*:all"],
+    );
+    assert!(all.status.success(), "{all:?}");
+    assert!(stdout(&all).contains("sid-chunk-001"), "{}", stdout(&all));
+}
+
+/// Catches: the CLI skipping the scope rule the MCP side applies. `--root '*'`
+/// from a work directory must not print the home repo's hit and must say it left
+/// one out; `'*:all'` must print both.
+#[test]
+fn a_star_leaves_out_the_other_scope_and_says_so_while_star_all_mixes() {
+    let tmp = TempDir::new().unwrap();
+    let scoped = mdkb::domain::canonicalize_plain(tmp.path())
+        .unwrap()
+        .join("scoped");
+    let home_repo = store(&scoped.join("home"), "h", "zonk_harvest");
+    let work_repo = store(&scoped.join("work"), "w", "zonk_harvest");
+    let home = home_knowing(tmp.path(), &[&home_repo, &work_repo]);
+    std::fs::write(
+        home.join(".mdkb/daemon.toml"),
+        format!(
+            "[[scopes]]\nprefix = \"{}\"\nscope = \"home\"\n\n[[scopes]]\nprefix = \"{}\"\nscope = \"work\"\n",
+            scoped.join("home").display(),
+            scoped.join("work").display()
+        ),
+    )
+    .unwrap();
+
+    let own = search(
+        &home,
+        &work_repo,
+        &["zonk_harvest", "--scope", "memory", "--root", "*"],
+    );
+    assert!(own.status.success(), "{own:?}");
+    let text = stdout(&own);
+    assert!(text.contains("zonk_harvest"), "control: {text}");
+    assert!(!text.contains(&home_repo.display().to_string()), "{text}");
+    assert!(
+        stderr(&own).contains("Excluded by scope: 1"),
+        "{}",
+        stderr(&own)
+    );
+
+    let mixed = search(
+        &home,
+        &work_repo,
+        &["zonk_harvest", "--scope", "memory", "--root", "*:all"],
+    );
+    assert!(mixed.status.success(), "{mixed:?}");
+    assert!(stdout(&mixed).contains(&home_repo.display().to_string()));
+    assert!(!stderr(&mixed).contains("Excluded by scope"));
+}

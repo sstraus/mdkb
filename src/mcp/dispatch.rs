@@ -104,7 +104,7 @@ use super::tools::RelatesInput;
 use super::tools::{
     CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams,
     MemoryDeleteParams, MemoryListParams, MemoryWriteBatchEntry, RootSelector, RootTerm,
-    SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
+    ScopedRoots, SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
@@ -1965,6 +1965,10 @@ pub struct ResolvedRoots {
     pub roots: Vec<std::path::PathBuf>,
     pub known: usize,
     pub discovered: usize,
+    /// Roots `*` left out because their scope differs from the caller's.
+    pub excluded_by_scope: usize,
+    /// `*:all` also searches the `claude_sessions` collections.
+    pub include_sessions: bool,
 }
 
 pub fn resolve_root_selector(
@@ -2009,7 +2013,19 @@ pub fn resolve_root_selector(
     } else {
         open
     };
-    let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
+    // Only the selectors that filter by scope pay for reading it.
+    let policy = if selector.is_wildcard() {
+        registry.scope_policy()
+    } else {
+        crate::daemon::scope::ScopePolicy::default()
+    };
+    let ScopedRoots {
+        roots,
+        excluded,
+        include_sessions,
+    } = selector
+        .resolve_scoped(&known, &open, &policy, scope)
+        .map_err(mcp_error)?;
     let mapped: std::collections::BTreeSet<std::path::PathBuf> = registry
         .known_roots()
         .into_iter()
@@ -2021,6 +2037,8 @@ pub fn resolve_root_selector(
         roots,
         known: known.len() - discovered,
         discovered,
+        excluded_by_scope: excluded,
+        include_sessions,
     })
 }
 
@@ -2058,7 +2076,7 @@ pub fn single_root(
     let ResolvedRoots {
         selector, roots, ..
     } = resolution;
-    if selector == RootSelector::All {
+    if selector.is_wildcard() {
         return Err(mcp_error(RootSelector::wildcard_rejection()));
     }
     match roots.len() {
@@ -2200,10 +2218,10 @@ fn format_cross_repo_coverage(
         format!("{known} known, {discovered} discovered")
     };
     let headline = match resolution.selector {
-        RootSelector::All if discovered == 0 => {
+        RootSelector::All | RootSelector::AllScopes | RootSelector::Scope(_) if discovered == 0 => {
             format!("_Searched {searched} of {known} known repos._")
         }
-        RootSelector::All => {
+        RootSelector::All | RootSelector::AllScopes | RootSelector::Scope(_) => {
             format!(
                 "_Searched {searched} of {} repos ({counted})._",
                 known + discovered
@@ -2217,6 +2235,12 @@ fn format_cross_repo_coverage(
         }
     };
     let mut out = format!("\n{headline}\n");
+    if resolution.excluded_by_scope > 0 {
+        out.push_str(&format!(
+            "Excluded by scope: {} (root=\"*:all\" mixes scopes)\n",
+            resolution.excluded_by_scope
+        ));
+    }
     if !outdated.is_empty() {
         out.push_str(&format_outdated_line(outdated));
     }
@@ -2300,11 +2324,13 @@ fn rank_cross_repo_documents(
 /// Search one repo and say what happened, opening its store and closing it
 /// again. Synchronous on purpose: every call below is blocking SQLite work,
 /// and wrapping it in an `async` block bought nothing but a false name.
+#[allow(clippy::too_many_arguments)]
 fn search_one_repo(
     registry: &RepoRegistry,
     root: std::path::PathBuf,
     params: &SearchParams,
     scope: Option<crate::mcp::tools::SearchScope>,
+    include_sessions: bool,
     limit: usize,
     fts_query: &str,
     query_embedding: Option<&[f32]>,
@@ -2385,6 +2411,40 @@ fn search_one_repo(
                             results: Err(format!("document ranking failed: {e}").into()),
                             no_collections,
                         };
+                    }
+                    // `hybrid_search_fts` leaves `claude_sessions` out unless that
+                    // collection is named, so `*:all` names it in a second pass.
+                    if include_sessions && params.collection.is_none() {
+                        match hybrid_search_fts(
+                            &ctx,
+                            fts_query,
+                            query_embedding,
+                            limit,
+                            Some(crate::domain::COLLECTION_CLAUDE_SESSIONS),
+                            params.include_superseded,
+                        ) {
+                            Ok(mut sessions) => {
+                                if let Err(e) = rank_cross_repo_documents(
+                                    &ctx.conn,
+                                    &params.query,
+                                    &mut sessions,
+                                ) {
+                                    return RepoOutcome {
+                                        root,
+                                        results: Err(format!("session ranking failed: {e}").into()),
+                                        no_collections,
+                                    };
+                                }
+                                results.extend(sessions);
+                            }
+                            Err(e) => {
+                                return RepoOutcome {
+                                    root,
+                                    results: Err(format!("session search failed: {e}").into()),
+                                    no_collections,
+                                };
+                            }
+                        }
                     }
                     for r in &mut results {
                         r.repo_root = Some(repo_tag.clone());
@@ -2472,11 +2532,13 @@ fn search_one_repo(
 /// a comment claiming otherwise. Concurrency here is an optimisation that has
 /// to be measured (width 2/4/8, warm and cold) before it ships, not inferred
 /// from the fact that the disk is an SSD.
+#[allow(clippy::too_many_arguments)]
 fn search_roots_blocking(
     registry: &RepoRegistry,
     roots: &[std::path::PathBuf],
     params: &SearchParams,
     scope: Option<crate::mcp::tools::SearchScope>,
+    include_sessions: bool,
     limit: usize,
     fts_query: &str,
     query_embedding: Option<&[f32]>,
@@ -2489,6 +2551,7 @@ fn search_roots_blocking(
                 root.clone(),
                 params,
                 scope,
+                include_sessions,
                 limit,
                 fts_query,
                 query_embedding,
@@ -2563,6 +2626,7 @@ pub async fn cross_repo_search_impl(
     let outcomes = {
         let registry = Arc::clone(registry);
         let roots = resolution.roots.clone();
+        let include_sessions = resolution.include_sessions;
         let params = params.clone();
         tokio::task::spawn_blocking(move || {
             search_roots_blocking(
@@ -2570,6 +2634,7 @@ pub async fn cross_repo_search_impl(
                 &roots,
                 &params,
                 scope,
+                include_sessions,
                 limit,
                 &fts_query,
                 query_embedding.as_deref(),

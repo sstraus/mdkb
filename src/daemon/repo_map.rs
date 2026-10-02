@@ -16,7 +16,7 @@
 //! root another process has just recorded. That loss costs one re-record on the
 //! next `get_or_open` of the root, which is why no cross-process lock is taken.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -146,10 +146,33 @@ pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet
     found
 }
 
-/// Read the persisted roots without triage, normalization, or a write-back.
-/// Reporting commands use this path so inspecting coverage cannot change it.
+/// Read the persisted roots without normalization or a write-back, leaving out
+/// the ones that are gone from disk: an entry kept in the file only for its
+/// hand-written scope is not a repo. Reporting commands use this path so
+/// inspecting coverage cannot change it.
 pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
-    read_file(path).roots.into_iter().collect()
+    try_read_known_roots(path).unwrap_or_else(|why| {
+        tracing::warn!(path = %path.display(), "Reading the repo map failed: {why}");
+        Vec::new()
+    })
+}
+
+/// [`read_known_roots`] that says when it could not read: a file that is absent
+/// has no roots, one that is unreadable or not valid JSON is an error. Unlike
+/// the map's own load it never moves a file aside — only the writer may.
+pub fn try_read_known_roots(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let read = parse_file(path).map_err(|e| e.to_string())?;
+    Ok(triage(canonical_set(&read.roots))
+        .kept
+        .into_iter()
+        .collect())
+}
+
+/// The spelling every root is stored under (see [`canonical_key`]): one repo,
+/// one entry, however the file wrote it. Shared by the map's load and by the
+/// read-only reader so the two list the same roots.
+fn canonical_set(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    roots.iter().map(|r| canonical_key(r)).collect()
 }
 
 /// The outcome of one pass over the known roots.
@@ -174,7 +197,7 @@ struct Triage {
 /// A path that resolves to nothing is kept verbatim: it is about to be
 /// classified [`RootHealth::Gone`] and dropped, and the spelling the operator
 /// wrote is the one that belongs in that log line.
-fn canonical_key(root: &Path) -> PathBuf {
+pub(super) fn canonical_key(root: &Path) -> PathBuf {
     let resolved = crate::git::resolve_main_worktree(root);
     // `canonicalize` returns `\\?\C:\...` on Windows, which names the same file
     // and compares equal to nothing. Every key written that way would be a
@@ -199,6 +222,39 @@ fn triage(roots: BTreeSet<PathBuf>) -> Triage {
     out
 }
 
+/// The `scope` each repo carries in the persisted map, keyed by canonical root.
+/// Read without triage or a write-back, like [`read_known_roots`]; a file that
+/// cannot be read or parsed has none.
+pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
+    try_read_scope_overrides(path).unwrap_or_else(|why| {
+        tracing::warn!(path = %path.display(), "Reading scopes from the repo map failed: {why}");
+        BTreeMap::new()
+    })
+}
+
+/// [`read_scope_overrides`] that says when it could not read: a file that is
+/// absent has no scopes, one that is unreadable or not valid JSON (a hand edit
+/// in progress) is an error, so a caller can keep what it last knew.
+pub fn try_read_scope_overrides(path: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let file = serde_json::from_str::<RepoMapFile>(&content).map_err(|e| e.to_string())?;
+    Ok(file
+        .repos
+        .into_iter()
+        .filter_map(|r| Some((canonical_key(Path::new(&r.root)), clean_scope(&r.scope?)?)))
+        .collect())
+}
+
+/// A scope name as declared: trimmed, and blank means none was declared, so
+/// the prefix rule decides. `daemon.toml` rules are read the same way.
+pub(super) fn clean_scope(scope: &str) -> Option<String> {
+    Some(scope.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// The persisted set of known repository roots.
 pub struct RepoMap {
     /// Where the set is persisted. `None` for a config with no daemon home
@@ -213,6 +269,10 @@ pub struct RepoMap {
     /// cheap; a map replaced by an empty one because this binary could not
     /// parse it is a set of repos nobody can get back.
     replaceable: bool,
+    /// A persist was skipped or failed, so the file lags the set in memory.
+    /// `record` retries while this is set, even for a root already known: the
+    /// root that was recorded during a bad moment is otherwise never written.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RepoMap {
@@ -242,7 +302,7 @@ impl RepoMap {
         let loaded = read.roots;
         let before = loaded.len();
 
-        let mut union: BTreeSet<PathBuf> = loaded.iter().map(|r| canonical_key(r)).collect();
+        let mut union = canonical_set(&loaded);
         // A file whose entries do not survive normalization is rewritten below,
         // so two spellings of one repo collapse to one the first time a daemon
         // reads them.
@@ -267,15 +327,27 @@ impl RepoMap {
             );
         }
 
+        // A dropped entry that carries a hand-written scope stays in the file
+        // (see `write_atomic`), so dropping it is not a change to write.
+        let declared = path
+            .as_deref()
+            .and_then(|p| try_read_scope_overrides(p).ok())
+            .unwrap_or_default();
+        let dropped_for_good = triaged
+            .dropped
+            .iter()
+            .any(|(root, _)| !declared.contains_key(root));
+
         let map = Self {
             path,
             roots: Mutex::new(triaged.kept),
             replaceable: read.replaceable,
+            dirty: std::sync::atomic::AtomicBool::new(false),
         };
         // Persist only when the set on disk is not the set in hand: every CLI
         // hook builds a registry, and rewriting an unchanged map on each one
         // would rename a file per hook for nothing.
-        let changed = normalized || seeded != before || !triaged.dropped.is_empty();
+        let changed = normalized || seeded != before || dropped_for_good;
         if changed {
             let roots = map.roots.lock().unwrap_or_else(|e| e.into_inner());
             map.persist(&roots);
@@ -284,14 +356,16 @@ impl RepoMap {
     }
 
     /// Record a root the registry has just opened. Idempotent: a root already
-    /// on the map costs no write.
+    /// on the map costs no write, unless an earlier write was skipped or failed
+    /// and the file still lags the set.
     pub fn record(&self, root: &Path) {
         let key = canonical_key(root);
         let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-        if !roots.insert(key.clone()) {
+        if roots.insert(key.clone()) {
+            tracing::info!(root = %key.display(), "Recorded repo on the map");
+        } else if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        tracing::info!(root = %key.display(), "Recorded repo on the map");
         self.persist(&roots);
     }
 
@@ -327,12 +401,30 @@ impl RepoMap {
             );
             return;
         }
-        if let Err(e) = write_atomic(path, roots) {
+        // The scopes are written by hand, and this process never records one:
+        // read them back from the file so a rewrite for a new root cannot erase
+        // them. A file that cannot be read is a hand edit in progress: writing
+        // over it would destroy that edit and every scope in it, so the write
+        // waits for the next persist, which finds the file whole.
+        let scopes = match try_read_scope_overrides(path) {
+            Ok(scopes) => scopes,
+            Err(why) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Not persisting the repo map: it cannot be read right now ({why}); the set is correct in memory only"
+                );
+                self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+        let failed = write_atomic(path, roots, &scopes).map_err(|e| {
             tracing::warn!(
                 path = %path.display(),
                 "Could not persist the repo map: {e} — the set is still correct in memory"
             );
-        }
+        });
+        self.dirty
+            .store(failed.is_err(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -350,63 +442,88 @@ struct MapRead {
     replaceable: bool,
 }
 
-/// Read the persisted set. Any failure yields an empty set and a warning: a
-/// map that cannot be parsed must not take the daemon down with it.
+/// Why a map file could not be read.
+enum Unreadable {
+    Io(String),
+    Parse(String),
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "cannot be read: {e}"),
+            Self::Parse(e) => write!(f, "is not valid JSON: {e}"),
+        }
+    }
+}
+
+/// Parse the persisted set and touch nothing: no rename, no write. A file that
+/// is absent is an empty, replaceable map.
+fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MapRead {
+                roots: BTreeSet::new(),
+                replaceable: true,
+            });
+        }
+        Err(e) => return Err(Unreadable::Io(e.to_string())),
+    };
+    let file = serde_json::from_str::<RepoMapFile>(&content)
+        .map_err(|e| Unreadable::Parse(e.to_string()))?;
+    let roots = file
+        .repos
+        .into_iter()
+        .map(|r| PathBuf::from(r.root))
+        .collect();
+    if file.version > FORMAT_VERSION {
+        // Writing our own FORMAT_VERSION over this would silently downgrade a
+        // map a newer binary owns, dropping whatever that format carries which
+        // this one cannot represent.
+        tracing::warn!(
+            path = %path.display(),
+            found = file.version,
+            known = FORMAT_VERSION,
+            "Repo map was written by a newer mdkb; reading it, and leaving it alone"
+        );
+        return Ok(MapRead {
+            roots,
+            replaceable: false,
+        });
+    }
+    if file.version != FORMAT_VERSION {
+        tracing::warn!(
+            path = %path.display(),
+            found = file.version,
+            known = FORMAT_VERSION,
+            "Repo map written by an older format version; reading it anyway"
+        );
+    }
+    Ok(MapRead {
+        roots,
+        replaceable: true,
+    })
+}
+
+/// Read the persisted set for the map's own load. Any failure yields an empty
+/// set and a warning: a map that cannot be parsed must not take the daemon down
+/// with it. This is the only reader that moves a corrupt file aside.
 fn read_file(path: &Path) -> MapRead {
     let empty = |replaceable| MapRead {
         roots: BTreeSet::new(),
         replaceable,
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty(true),
-        Err(e) => {
+    match parse_file(path) {
+        Ok(read) => read,
+        Err(Unreadable::Io(e)) => {
             tracing::warn!(
                 path = %path.display(),
                 "Could not read the repo map: {e} — keeping the file, not replacing it"
             );
-            return empty(false);
+            empty(false)
         }
-    };
-    match serde_json::from_str::<RepoMapFile>(&content) {
-        Ok(file) => {
-            if file.version > FORMAT_VERSION {
-                // Writing our own FORMAT_VERSION over this would silently
-                // downgrade a map a newer binary owns, dropping whatever that
-                // format carries which this one cannot represent.
-                tracing::warn!(
-                    path = %path.display(),
-                    found = file.version,
-                    known = FORMAT_VERSION,
-                    "Repo map was written by a newer mdkb; reading it, and leaving it alone"
-                );
-                return MapRead {
-                    roots: file
-                        .repos
-                        .into_iter()
-                        .map(|r| PathBuf::from(r.root))
-                        .collect(),
-                    replaceable: false,
-                };
-            }
-            if file.version != FORMAT_VERSION {
-                tracing::warn!(
-                    path = %path.display(),
-                    found = file.version,
-                    known = FORMAT_VERSION,
-                    "Repo map written by an older format version; reading it anyway"
-                );
-            }
-            MapRead {
-                roots: file
-                    .repos
-                    .into_iter()
-                    .map(|r| PathBuf::from(r.root))
-                    .collect(),
-                replaceable: true,
-            }
-        }
-        Err(e) => {
+        Err(Unreadable::Parse(e)) => {
             // Quarantine rather than overwrite, and rather than refuse to
             // write. Overwriting loses the only copy of a set somebody may
             // need; refusing leaves the map broken for every later process,
@@ -445,16 +562,25 @@ fn read_file(path: &Path) -> MapRead {
 /// a complete file or not at all, so no crash can leave a truncated map behind.
 /// The temp file is fsynced first, so the rename cannot publish a name whose
 /// contents are still in the page cache.
-fn write_atomic(path: &Path, roots: &BTreeSet<PathBuf>) -> std::io::Result<()> {
+fn write_atomic(
+    path: &Path,
+    roots: &BTreeSet<PathBuf>,
+    scopes: &BTreeMap<PathBuf, String>,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // An entry with a hand-written scope stays even when its root is not in
+    // the set: a store that is missing (an unmounted volume, a directory that
+    // holds no `.mdkb`) is not a reason to erase what the operator declared.
+    let kept: BTreeSet<&PathBuf> = roots.iter().chain(scopes.keys()).collect();
     let file = RepoMapFile {
         version: FORMAT_VERSION,
-        repos: roots
-            .iter()
+        repos: kept
+            .into_iter()
             .map(|r| RepoEntry {
                 root: r.to_string_lossy().to_string(),
+                scope: scopes.get(r).cloned(),
             })
             .collect(),
     };
@@ -509,6 +635,7 @@ mod tests {
             .iter()
             .map(|r| RepoEntry {
                 root: r.to_string_lossy().to_string(),
+                scope: None,
             })
             .collect()
     }

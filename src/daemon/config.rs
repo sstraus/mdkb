@@ -116,6 +116,10 @@ pub struct DaemonConfig {
     /// like the rest of this file; `~/` is expanded.
     pub ignore: Vec<String>,
 
+    /// `[[scopes]]` prefix rules: which scope a path belongs to. `root="*"`
+    /// leaves out the repos whose scope differs from the caller's.
+    pub scopes: Vec<ScopeRule>,
+
     /// Global `[priors]` layer applied as the base for every repo. The distiller
     /// (program/args/model) is a machine-wide choice, so it belongs here — set it
     /// once instead of per-repo. A repo's `.mdkb/config.toml` `[priors]` overrides
@@ -141,6 +145,19 @@ pub struct DaemonConfig {
 pub struct RepoEntry {
     /// Absolute path to the repository root.
     pub root: String,
+    /// The scope this repo belongs to (`home`, `work`, ...). Overrides the
+    /// [`ScopeRule`] prefix that would otherwise decide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// A `[[scopes]]` block of `daemon.toml`: every repo at or below `prefix`
+/// belongs to `scope`, unless its own [`RepoEntry::scope`] says otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopeRule {
+    /// Absolute directory; `~/` is expanded.
+    pub prefix: String,
+    pub scope: String,
 }
 
 impl Default for DaemonConfig {
@@ -152,6 +169,7 @@ impl Default for DaemonConfig {
             repos: Vec::new(),
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
             ignore: Vec::new(),
+            scopes: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         }
@@ -201,19 +219,11 @@ impl DaemonConfig {
                 // nothing; leading whitespace makes the entry relative, which
                 // is dropped below.
                 let entry = entry.trim_end();
-                let expanded = match entry {
-                    "~" => home_dir().ok(),
-                    e if e.starts_with("~/") => home_dir().ok().map(|h| h.join(&e[2..])),
-                    e if e.trim().is_empty() => None,
-                    e => Some(PathBuf::from(e)),
-                };
-                match expanded.filter(|p| p.is_absolute()) {
-                    Some(path) => Some(crate::domain::canonicalize_plain(&path).unwrap_or(path)),
-                    None => {
-                        dropped.push(entry);
-                        None
-                    }
+                let path = absolute_entry(entry);
+                if path.is_none() {
+                    dropped.push(entry);
                 }
+                path
             })
             .collect();
         if !dropped.is_empty() {
@@ -222,6 +232,42 @@ impl DaemonConfig {
             );
         }
         paths
+    }
+
+    /// [`scopes`](Self::scopes) as `(canonical prefix, scope)` pairs. A rule
+    /// whose prefix is not an absolute path, or whose scope is empty, is
+    /// dropped with one warning, for the reasons [`ignored_paths`](Self::ignored_paths)
+    /// gives.
+    pub fn scope_rules(&self) -> Vec<(PathBuf, String)> {
+        let mut dropped = Vec::new();
+        let rules = self
+            .scopes
+            .iter()
+            .filter_map(|rule| {
+                let scope = rule.scope.trim();
+                let path = absolute_entry(rule.prefix.trim_end());
+                if path.is_none() || scope.is_empty() {
+                    // One warning per distinct rule for the life of the
+                    // process: rules are read on every wildcard search.
+                    static WARNED: std::sync::Mutex<Vec<(String, String)>> =
+                        std::sync::Mutex::new(Vec::new());
+                    let key = (rule.prefix.clone(), rule.scope.clone());
+                    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+                    if !warned.contains(&key) {
+                        warned.push(key);
+                        dropped.push(rule.prefix.as_str());
+                    }
+                    return None;
+                }
+                path.map(|p| (p, scope.to_string()))
+            })
+            .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "Ignoring daemon.toml [[scopes]] rules without an absolute prefix or a scope: {dropped:?}"
+            );
+        }
+        rules
     }
 
     /// Save config to a TOML file.
@@ -326,6 +372,20 @@ impl DaemonConfig {
     }
 }
 
+/// A `daemon.toml` path entry as the canonical absolute path it names, or
+/// `None` when it names none: empty, relative, or a `~` with no known home.
+fn absolute_entry(entry: &str) -> Option<PathBuf> {
+    let expanded = match entry {
+        "~" => home_dir().ok(),
+        e if e.starts_with("~/") => home_dir().ok().map(|h| h.join(&e[2..])),
+        e if e.trim().is_empty() => None,
+        e => Some(PathBuf::from(e)),
+    };
+    expanded
+        .filter(|p| p.is_absolute())
+        .map(|path| crate::domain::canonicalize_plain(&path).unwrap_or(path))
+}
+
 /// Expand ~ at the start of a path to the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if path == "~" {
@@ -404,13 +464,19 @@ mod tests {
             repos: vec![
                 RepoEntry {
                     root: "/Users/me/Gits/projectA".to_string(),
+                    scope: Some("work".to_string()),
                 },
                 RepoEntry {
                     root: "/Users/me/Gits/projectB".to_string(),
+                    scope: None,
                 },
             ],
             discovery_cache_secs: 90,
             ignore: Vec::new(),
+            scopes: vec![ScopeRule {
+                prefix: "~/Gits/home".to_string(),
+                scope: "home".to_string(),
+            }],
             priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
             state_dir: Some(PathBuf::from("/Users/me/.mdkb")),
         };
@@ -492,9 +558,11 @@ whitelist_dirs = ["~/Code"]
             whitelist_dirs: vec!["~/Gits".to_string()],
             repos: vec![RepoEntry {
                 root: "/foo/bar".to_string(),
+                scope: None,
             }],
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
             ignore: Vec::new(),
+            scopes: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         };

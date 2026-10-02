@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::scope::ScopePolicy;
+
 /// Where the `root` grammar is documented. Every error this module produces
 /// points here. The full grammar is not in the tool schemas or the server
 /// instructions, because both are charged on every request of every session
@@ -45,8 +47,13 @@ pub enum RootTerm {
 pub enum RootSelector {
     /// No `root` given: whatever the caller's default repo is.
     Default,
-    /// `*` — every known root.
+    /// `*` — every known root in the caller's scope, plus the roots with none.
     All,
+    /// `*:all` — every known root, whatever its scope, and the `claude_sessions`
+    /// collections `*` leaves out.
+    AllScopes,
+    /// `scope:NAME` — the known roots whose scope is `NAME`.
+    Scope(String),
     /// One or more explicit terms, in the order the caller wrote them.
     List(Vec<RootTerm>),
 }
@@ -66,6 +73,19 @@ impl RootSelector {
         if trimmed == "*" {
             return Ok(Self::All);
         }
+        if trimmed == "*:all" {
+            return Ok(Self::AllScopes);
+        }
+        if let Some(name) = trimmed.strip_prefix("scope:") {
+            let name = name.trim();
+            if name.is_empty() || name.contains(',') {
+                return Err(format!(
+                    "root=\"{trimmed}\" needs exactly one scope name: root=\"scope:home\". \
+                     {GRAMMAR_HINT}"
+                ));
+            }
+            return Ok(Self::Scope(name.to_string()));
+        }
 
         if trimmed.contains(',') && Path::new(trimmed).exists() {
             return Err(format!(
@@ -84,10 +104,10 @@ impl RootSelector {
                     "root=\"{trimmed}\" has an empty item. {GRAMMAR_HINT}"
                 ));
             }
-            if segment == "*" {
+            if segment == "*" || segment == "*:all" || segment.starts_with("scope:") {
                 return Err(format!(
-                    "root=\"*\" means every known repo and cannot be combined with other \
-                     items. {GRAMMAR_HINT}"
+                    "root=\"{segment}\" selects repos by itself and cannot be combined with \
+                     other items. {GRAMMAR_HINT}"
                 ));
             }
             terms.push(if Path::new(segment).is_absolute() {
@@ -110,7 +130,7 @@ impl RootSelector {
     pub fn resolve(&self, known: &[PathBuf], open: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         let resolved = match self {
             Self::Default => open.to_vec(),
-            Self::All => known.to_vec(),
+            Self::All | Self::AllScopes | Self::Scope(_) => known.to_vec(),
             Self::List(terms) => terms
                 .iter()
                 .map(|term| resolve_term(term, known))
@@ -122,6 +142,78 @@ impl RootSelector {
             .into_iter()
             .filter(|root| seen.insert(root.clone()))
             .collect())
+    }
+
+    /// [`resolve`](Self::resolve), then the scope rule: the ONE place scope
+    /// narrows a selector, so MCP `search` and the CLI cannot disagree.
+    ///
+    /// `*` leaves out the roots whose scope differs from the caller's and counts
+    /// them; a root with no scope is always kept, and a caller with no scope
+    /// excludes nothing. `*:all` keeps every root. `scope:NAME` keeps the roots
+    /// scoped `NAME`. Session transcripts stay out of every selector but `*:all`.
+    /// `caller` is where the caller works: its MCP roots, or its
+    /// working directory.
+    pub fn resolve_scoped(
+        &self,
+        known: &[PathBuf],
+        open: &[PathBuf],
+        policy: &ScopePolicy,
+        caller: &[PathBuf],
+    ) -> Result<ScopedRoots, String> {
+        let roots = self.resolve(known, open)?;
+        let (keep, excluded): (Vec<_>, Vec<_>) = match self {
+            Self::All => match policy.caller_scope(caller) {
+                Some(mine) => {
+                    let (keep, excluded): (Vec<_>, Vec<_>) = roots
+                        .into_iter()
+                        .partition(|r| policy.scope_of(r).is_none_or(|s| s == mine));
+                    if keep.is_empty() && !excluded.is_empty() {
+                        // Every answer is the same empty one; the reason is
+                        // the only useful thing to say.
+                        return Err(format!(
+                            "Excluded by scope: {n}. Every known repo has a scope other than \
+                             `{mine}`, the caller's; root=\"*:all\" mixes scopes.",
+                            n = excluded.len()
+                        ));
+                    }
+                    (keep, excluded)
+                }
+                None => (roots, Vec::new()),
+            },
+            Self::Scope(name) => {
+                let (keep, _): (Vec<_>, Vec<_>) = roots
+                    .into_iter()
+                    .partition(|r| policy.scope_of(r) == Some(name.as_str()));
+                if keep.is_empty() {
+                    let mut seen: Vec<&str> =
+                        known.iter().filter_map(|r| policy.scope_of(r)).collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    let seen = if seen.is_empty() {
+                        "none declared".to_string()
+                    } else {
+                        seen.join(", ")
+                    };
+                    return Err(format!(
+                        "No known repo has scope \"{name}\" (scopes in use: {seen}). \
+                         {GRAMMAR_HINT}"
+                    ));
+                }
+                (keep, Vec::new())
+            }
+            _ => (roots, Vec::new()),
+        };
+        Ok(ScopedRoots {
+            roots: keep,
+            excluded: excluded.len(),
+            include_sessions: matches!(self, Self::AllScopes),
+        })
+    }
+
+    /// Does this selector mean a set of repos rather than named ones? Only
+    /// `search` accepts one, and it always answers with a coverage footer.
+    pub fn is_wildcard(&self) -> bool {
+        matches!(self, Self::All | Self::AllScopes | Self::Scope(_))
     }
 
     /// Why a tool that reads one repo refuses `*`.
@@ -150,7 +242,7 @@ impl RootSelector {
     /// path, where it could not change the answer.
     pub fn needs_discovery(&self) -> bool {
         match self {
-            Self::Default | Self::All => true,
+            Self::Default | Self::All | Self::AllScopes | Self::Scope(_) => true,
             Self::List(terms) => terms.iter().any(|t| matches!(t, RootTerm::Name(_))),
         }
     }
@@ -167,6 +259,17 @@ impl RootSelector {
              repos. Pass one repo — a name or an absolute path. {GRAMMAR_HINT}"
         )
     }
+}
+
+/// What [`RootSelector::resolve_scoped`] picked, and how many roots the scope
+/// rule left out.
+#[derive(Debug)]
+pub struct ScopedRoots {
+    pub roots: Vec<PathBuf>,
+    pub excluded: usize,
+    /// Do the searches over `roots` include `claude_sessions` collections?
+    /// Only `*:all` says yes; every other selector keeps them out.
+    pub include_sessions: bool,
 }
 
 /// The repos a `root`-less call means, given the workspace the client declared.
@@ -999,6 +1102,34 @@ mod tests {
         let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.root.as_deref(), Some("/project"));
         assert!(params.symbol_id.is_none());
+    }
+
+    /// Catches: a scope selector that cannot name one scope being accepted and
+    /// then resolving to nothing (`scope:`, `scope:a,b`), or `*:all` being
+    /// split as a list item next to another repo.
+    #[test]
+    fn a_scope_selector_that_cannot_mean_one_thing_is_refused() {
+        for raw in [
+            "scope:",
+            "scope:  ",
+            "scope:a,b",
+            "*:all,x",
+            "x,*:all",
+            "x,scope:home",
+        ] {
+            assert!(
+                RootSelector::parse(Some(raw)).is_err(),
+                "{raw} was accepted"
+            );
+        }
+        assert_eq!(
+            RootSelector::parse(Some("scope: home ")).unwrap(),
+            RootSelector::Scope("home".to_string())
+        );
+        assert_eq!(
+            RootSelector::parse(Some("*:all")).unwrap(),
+            RootSelector::AllScopes
+        );
     }
 
     /// Resolve a property subschema of `RelatesInput`, following a `$ref` into

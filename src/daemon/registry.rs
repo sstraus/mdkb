@@ -310,6 +310,9 @@ pub struct RepoRegistry {
     /// `daemon_config.ignore`, validated once: a bad entry is reported when the
     /// registry is built, not on every discovery call.
     ignored: Vec<PathBuf>,
+    /// The last scope policy that read cleanly; what a bad `repos.json` falls
+    /// back to.
+    last_scope_policy: std::sync::Mutex<Option<super::scope::ScopePolicy>>,
     /// Every repo this daemon has ever opened, persisted across restarts.
     /// Deliberately not `handles`: that one is capped at `max_active` and
     /// starts empty in every process.
@@ -357,6 +360,7 @@ impl RepoRegistry {
             max_active,
             daemon_config: config,
             ignored,
+            last_scope_policy: std::sync::Mutex::new(None),
             repo_map,
             open_gate: std::sync::Mutex::new(()),
             discovery: std::sync::Mutex::new(None),
@@ -453,6 +457,30 @@ impl RepoRegistry {
     /// Number of currently active repo handles.
     pub fn active_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Which scope each path belongs to, for `root="*"`. Read from `daemon.toml`
+    /// and `repos.json` on every call, as the CLI does, so an edit made while
+    /// the daemon runs applies to the next search and both surfaces agree. A
+    /// `repos.json` that cannot be read right now (a hand edit in progress)
+    /// keeps the last policy that could.
+    pub fn scope_policy(&self) -> super::scope::ScopePolicy {
+        // Read first, lock after: the mutex guards the swap, not the file reads.
+        let loaded = super::scope::ScopePolicy::try_load(&self.daemon_config);
+        let mut last = self
+            .last_scope_policy
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match loaded {
+            Ok(policy) => {
+                *last = Some(policy.clone());
+                policy
+            }
+            Err((partial, why)) => {
+                tracing::warn!("repos.json unreadable, keeping the last good scopes: {why}");
+                last.clone().unwrap_or(partial)
+            }
+        }
     }
 
     /// Every repo this daemon knows, whether or not a handle is open for it.
