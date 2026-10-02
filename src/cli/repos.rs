@@ -7,7 +7,7 @@ use crate::cli::{OutputFormat, RefreshFilter};
 use crate::core::refresh::{RefreshReport, RefreshStatus, refresh_outdated};
 use crate::daemon::config::DaemonConfig;
 use crate::daemon::repo_listing::{list_repos, render_text};
-use crate::daemon::repo_map::{discover_nested_stores, read_known_roots};
+use crate::daemon::repo_map::{discover_nested_stores, try_read_known_roots};
 use crate::daemon::scope::ScopePolicy;
 use crate::error::{Error, Result};
 use crate::mcp::tools::{RootSelector, ScopedRoots};
@@ -23,9 +23,16 @@ fn nested_stores(known: &[PathBuf]) -> Result<Vec<PathBuf>> {
 /// them. Refreshing the same set is what makes the footer's outdated line go
 /// away.
 fn stores_in_scope() -> Result<Vec<PathBuf>> {
-    nested_stores(&read_known_roots(
-        &DaemonConfig::daemon_home().join("repos.json"),
-    ))
+    nested_stores(&persisted_roots()?)
+}
+
+/// The persisted map, read without touching it; a file that cannot be parsed
+/// is an error here, not an empty list that hides every scope in it.
+fn persisted_roots() -> Result<Vec<PathBuf>> {
+    let path = DaemonConfig::daemon_home().join("repos.json");
+    try_read_known_roots(&path).map_err(|why| {
+        Error::other(format!("{} cannot be read: {why}", path.display()))
+    })
 }
 
 /// The daemon's own list when one runs (the one source `daemon status` also
@@ -34,9 +41,7 @@ fn stores_in_scope() -> Result<Vec<PathBuf>> {
 async fn known_roots() -> Result<Vec<PathBuf>> {
     match crate::cli::daemon::running_daemon_repos().await {
         Ok(Some(roots)) => Ok(roots),
-        Ok(None) => Ok(read_known_roots(
-            &DaemonConfig::daemon_home().join("repos.json"),
-        )),
+        Ok(None) => persisted_roots(),
         Err(e) => Err(Error::other(format!(
             "the running daemon did not list its repos: {e}"
         ))),

@@ -151,7 +151,25 @@ pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet
 /// hand-written scope is not a repo. Reporting commands use this path so
 /// inspecting coverage cannot change it.
 pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
-    triage(read_file(path).roots).kept.into_iter().collect()
+    try_read_known_roots(path).unwrap_or_else(|why| {
+        tracing::warn!(path = %path.display(), "Reading the repo map failed: {why}");
+        Vec::new()
+    })
+}
+
+/// [`read_known_roots`] that says when it could not read: a file that is absent
+/// has no roots, one that is unreadable or not valid JSON is an error. Unlike
+/// the map's own load it never moves a file aside — only the writer may.
+pub fn try_read_known_roots(path: &Path) -> Result<Vec<PathBuf>, String> {
+    let read = parse_file(path).map_err(|e| e.to_string())?;
+    Ok(triage(canonical_set(&read.roots)).kept.into_iter().collect())
+}
+
+/// The spelling every root is stored under (see [`canonical_key`]): one repo,
+/// one entry, however the file wrote it. Shared by the map's load and by the
+/// read-only reader so the two list the same roots.
+fn canonical_set(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+    roots.iter().map(|r| canonical_key(r)).collect()
 }
 
 /// The outcome of one pass over the known roots.
@@ -281,7 +299,7 @@ impl RepoMap {
         let loaded = read.roots;
         let before = loaded.len();
 
-        let mut union: BTreeSet<PathBuf> = loaded.iter().map(|r| canonical_key(r)).collect();
+        let mut union = canonical_set(&loaded);
         // A file whose entries do not survive normalization is rewritten below,
         // so two spellings of one repo collapse to one the first time a daemon
         // reads them.
@@ -421,63 +439,88 @@ struct MapRead {
     replaceable: bool,
 }
 
-/// Read the persisted set. Any failure yields an empty set and a warning: a
-/// map that cannot be parsed must not take the daemon down with it.
+/// Why a map file could not be read.
+enum Unreadable {
+    Io(String),
+    Parse(String),
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "cannot be read: {e}"),
+            Self::Parse(e) => write!(f, "is not valid JSON: {e}"),
+        }
+    }
+}
+
+/// Parse the persisted set and touch nothing: no rename, no write. A file that
+/// is absent is an empty, replaceable map.
+fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MapRead {
+                roots: BTreeSet::new(),
+                replaceable: true,
+            });
+        }
+        Err(e) => return Err(Unreadable::Io(e.to_string())),
+    };
+    let file = serde_json::from_str::<RepoMapFile>(&content)
+        .map_err(|e| Unreadable::Parse(e.to_string()))?;
+    let roots = file
+        .repos
+        .into_iter()
+        .map(|r| PathBuf::from(r.root))
+        .collect();
+    if file.version > FORMAT_VERSION {
+        // Writing our own FORMAT_VERSION over this would silently downgrade a
+        // map a newer binary owns, dropping whatever that format carries which
+        // this one cannot represent.
+        tracing::warn!(
+            path = %path.display(),
+            found = file.version,
+            known = FORMAT_VERSION,
+            "Repo map was written by a newer mdkb; reading it, and leaving it alone"
+        );
+        return Ok(MapRead {
+            roots,
+            replaceable: false,
+        });
+    }
+    if file.version != FORMAT_VERSION {
+        tracing::warn!(
+            path = %path.display(),
+            found = file.version,
+            known = FORMAT_VERSION,
+            "Repo map written by an older format version; reading it anyway"
+        );
+    }
+    Ok(MapRead {
+        roots,
+        replaceable: true,
+    })
+}
+
+/// Read the persisted set for the map's own load. Any failure yields an empty
+/// set and a warning: a map that cannot be parsed must not take the daemon down
+/// with it. This is the only reader that moves a corrupt file aside.
 fn read_file(path: &Path) -> MapRead {
     let empty = |replaceable| MapRead {
         roots: BTreeSet::new(),
         replaceable,
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty(true),
-        Err(e) => {
+    match parse_file(path) {
+        Ok(read) => read,
+        Err(Unreadable::Io(e)) => {
             tracing::warn!(
                 path = %path.display(),
                 "Could not read the repo map: {e} — keeping the file, not replacing it"
             );
-            return empty(false);
+            empty(false)
         }
-    };
-    match serde_json::from_str::<RepoMapFile>(&content) {
-        Ok(file) => {
-            if file.version > FORMAT_VERSION {
-                // Writing our own FORMAT_VERSION over this would silently
-                // downgrade a map a newer binary owns, dropping whatever that
-                // format carries which this one cannot represent.
-                tracing::warn!(
-                    path = %path.display(),
-                    found = file.version,
-                    known = FORMAT_VERSION,
-                    "Repo map was written by a newer mdkb; reading it, and leaving it alone"
-                );
-                return MapRead {
-                    roots: file
-                        .repos
-                        .into_iter()
-                        .map(|r| PathBuf::from(r.root))
-                        .collect(),
-                    replaceable: false,
-                };
-            }
-            if file.version != FORMAT_VERSION {
-                tracing::warn!(
-                    path = %path.display(),
-                    found = file.version,
-                    known = FORMAT_VERSION,
-                    "Repo map written by an older format version; reading it anyway"
-                );
-            }
-            MapRead {
-                roots: file
-                    .repos
-                    .into_iter()
-                    .map(|r| PathBuf::from(r.root))
-                    .collect(),
-                replaceable: true,
-            }
-        }
-        Err(e) => {
+        Err(Unreadable::Parse(e)) => {
             // Quarantine rather than overwrite, and rather than refuse to
             // write. Overwriting loses the only copy of a set somebody may
             // need; refusing leaves the map broken for every later process,
