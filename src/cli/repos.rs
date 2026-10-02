@@ -30,9 +30,7 @@ fn stores_in_scope() -> Result<Vec<PathBuf>> {
 /// is an error here, not an empty list that hides every scope in it.
 fn persisted_roots() -> Result<Vec<PathBuf>> {
     let path = DaemonConfig::daemon_home().join("repos.json");
-    try_read_known_roots(&path).map_err(|why| {
-        Error::other(format!("{} cannot be read: {why}", path.display()))
-    })
+    try_read_known_roots(&path).map_err(|why| Error::other(format!("{} {why}", path.display())))
 }
 
 /// The daemon's own list when one runs (the one source `daemon status` also

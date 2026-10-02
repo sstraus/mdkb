@@ -162,7 +162,10 @@ pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
 /// the map's own load it never moves a file aside — only the writer may.
 pub fn try_read_known_roots(path: &Path) -> Result<Vec<PathBuf>, String> {
     let read = parse_file(path).map_err(|e| e.to_string())?;
-    Ok(triage(canonical_set(&read.roots)).kept.into_iter().collect())
+    Ok(triage(canonical_set(&read.roots))
+        .kept
+        .into_iter()
+        .collect())
 }
 
 /// The spelling every root is stored under (see [`canonical_key`]): one repo,

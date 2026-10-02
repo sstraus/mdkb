@@ -109,7 +109,10 @@ fn a_scoped_gone_root_that_returns_is_listed_again_with_its_scope() {
     std::fs::create_dir_all(g.join(".mdkb")).unwrap();
 
     assert!(read_known_roots(&map).contains(&g));
-    assert_eq!(read_scope_overrides(&map).get(&g).map(String::as_str), Some("home"));
+    assert_eq!(
+        read_scope_overrides(&map).get(&g).map(String::as_str),
+        Some("home")
+    );
 }
 
 /// Catches: the read path writing back (a prune on read): a map with gone
@@ -144,7 +147,12 @@ fn the_daemon_map_and_the_persisted_read_list_the_same_roots() {
     let map = tmp.path().join("repos.json");
     write_map(
         &map,
-        &[(&g, Some("home")), (&plain_dir, Some("work")), (&a, None), (&c, Some("home"))],
+        &[
+            (&g, Some("home")),
+            (&plain_dir, Some("work")),
+            (&a, None),
+            (&c, Some("home")),
+        ],
     );
 
     let from_file = read_known_roots(&map);
