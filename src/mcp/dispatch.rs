@@ -4551,14 +4551,41 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// question that really names follow-ups). Being in the BM25 result set is not
 /// evidence: recall OR-expands the prompt, so one common word puts a document
 /// there.
+///
+/// When the prompt names a directory of the pool (`tuicommander` against
+/// `reports/tuicommander/`), the cosine alone no longer admits a document from
+/// a sibling directory (`reports/cerebro/`); the quoting arms still do.
 fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
     prompt: &str,
     min_cosine: f32,
 ) -> Vec<crate::domain::SearchResult> {
+    let named_dirs: Vec<(String, String)> = hits
+        .iter()
+        .filter_map(|(hit, _)| crate::store::hybrid::project_dir(&hit.path))
+        .filter(|(_, dir)| crate::store::hybrid::names_dir(prompt, dir))
+        .map(|(parent, dir)| (parent.to_string(), dir.to_string()))
+        .collect();
+    // A sibling of the directory the prompt names is another project's
+    // document: it shares the generic vocabulary of the kind (report, status,
+    // analysis) and so scores a cosine above the floor, which says nothing
+    // about the prompt's project.
+    let is_foreign = |path: &str| {
+        crate::store::hybrid::project_dir(path).is_some_and(|(parent, dir)| {
+            named_dirs
+                .iter()
+                .any(|(named_parent, named)| named_parent == parent && named != dir)
+        })
+    };
     hits.into_iter()
         .filter(|(hit, cosine)| {
-            cosine.is_some_and(|c| c >= f64::from(min_cosine))
+            tracing::debug!(
+                path = %hit.path,
+                ?cosine,
+                foreign = is_foreign(&hit.path),
+                "recall doc candidate"
+            );
+            cosine.is_some_and(|c| c >= f64::from(min_cosine)) && !is_foreign(&hit.path)
                 || cosine
                     .is_some_and(|c| c >= f64::from(crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT))
                     && crate::store::hybrid::names_file_stem(prompt, &hit.path)
@@ -9587,6 +9614,54 @@ mod tests {
         assert!(admitted(0.716), "highest measured English match");
         assert!(!admitted(0.522), "highest measured Italian negative");
         assert!(!admitted(0.496), "unrelated hub document");
+    }
+
+    /// Catches: a report of another project riding the cosine floor into a
+    /// prompt about this one (#217-11bc). Paths and titles are the ones the
+    /// orchestrator store returned on 2026-10-02 for a prompt about the
+    /// tuicommander mail/wake state machine; the cosine is set at the floor
+    /// because the arm under test is "cosine >= floor", whatever the value.
+    #[test]
+    fn a_sibling_project_report_does_not_ride_the_cosine_into_a_named_project() {
+        let hits = || {
+            vec![
+                scored_hit(
+                    "reports/tuicommander/lib-audit-2026-10-01.md",
+                    "Audit tuicommander_lib: valore e over-engineering (digest per Boss)",
+                    Some(0.6),
+                ),
+                scored_hit(
+                    "reports/cerebro/2026-10-01.md",
+                    "Report cerebro — 2026-10-01",
+                    Some(0.6),
+                ),
+                scored_hit("followups.md", "Verifiche dovute a Boss", Some(0.6)),
+            ]
+        };
+        let paths = |prompt: &str| -> Vec<String> {
+            admit_doc_hits(hits(), prompt, 0.55)
+                .into_iter()
+                .map(|hit| hit.path)
+                .collect()
+        };
+        let named = "vorrei rifare la state machine di mail e wake di tuicommander";
+        assert_eq!(
+            paths(named),
+            [
+                "reports/tuicommander/lib-audit-2026-10-01.md",
+                "followups.md"
+            ]
+        );
+        // The prompt quotes the sibling's path: the quoting arm still admits it.
+        assert!(
+            paths("confronta tuicommander con reports/cerebro/2026-10-01.md")
+                .contains(&"reports/cerebro/2026-10-01.md".to_string())
+        );
+        // No project named: nothing to be foreign to, the cosine decides.
+        assert_eq!(
+            paths("vorrei rifare la state machine di mail e wake").len(),
+            3
+        );
     }
 
     #[test]

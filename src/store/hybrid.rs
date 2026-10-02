@@ -232,6 +232,25 @@ pub fn names_file_stem(query: &str, path: &str) -> bool {
             .any(|word| compact_word(word) == stem)
 }
 
+/// The directory a document lives in and that directory's parent, for a path
+/// at least two directories deep: `reports/cerebro/2026-10-01.md` is
+/// `("reports", "cerebro")`. A document one directory deep has no siblings
+/// worth naming (`docs/`, `plans/` are topics, not projects), so it has none.
+pub fn project_dir(path: &str) -> Option<(&str, &str)> {
+    let (dir_path, _file) = path.rsplit_once('/')?;
+    dir_path.rsplit_once('/')
+}
+
+/// True when a word of `query` is `dir`, ignoring case, punctuation and a
+/// plural `s`: a prompt about "tuicommander" names `reports/tuicommander/`.
+pub fn names_dir(query: &str, dir: &str) -> bool {
+    let dir = compact_word(dir);
+    !dir.is_empty()
+        && query
+            .split_whitespace()
+            .any(|word| compact_word(word) == dir)
+}
+
 /// The words of `query` that look like code rather than prose, lowercased.
 ///
 /// Split on whitespace, not on punctuation: `content_tokens` would turn
