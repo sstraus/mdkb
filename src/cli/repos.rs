@@ -58,7 +58,11 @@ pub async fn resolve_roots(raw: &str) -> Result<ScopedRoots> {
     }
     let config = DaemonConfig::load_or_default(&DaemonConfig::daemon_home().join("daemon.toml"))?;
     let caller: Vec<PathBuf> = std::env::current_dir()
-        .map(|cwd| crate::domain::canonicalize_plain(&cwd).unwrap_or(cwd))
+        .map(|cwd| {
+            let cwd = crate::domain::canonicalize_plain(&cwd).unwrap_or(cwd);
+            // As the MCP side does: a linked worktree has its main one's scope.
+            crate::git::resolve_main_worktree(&cwd)
+        })
         .into_iter()
         .collect();
     selector

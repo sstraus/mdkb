@@ -163,15 +163,42 @@ impl RootSelector {
         let roots = self.resolve(known, open)?;
         let (keep, excluded): (Vec<_>, Vec<_>) = match self {
             Self::All => match policy.caller_scope(caller) {
-                Some(mine) => roots
-                    .into_iter()
-                    .partition(|r| policy.scope_of(r).is_none_or(|s| s == mine)),
+                Some(mine) => {
+                    let (keep, excluded): (Vec<_>, Vec<_>) = roots
+                        .into_iter()
+                        .partition(|r| policy.scope_of(r).is_none_or(|s| s == mine));
+                    if keep.is_empty() && !excluded.is_empty() {
+                        // Every answer is the same empty one; the reason is
+                        // the only useful thing to say.
+                        return Err(format!(
+                            "Excluded by scope: {n}. Every known repo has a scope other than \
+                             `{mine}`, the caller's; root=\"*:all\" mixes scopes.",
+                            n = excluded.len()
+                        ));
+                    }
+                    (keep, excluded)
+                }
                 None => (roots, Vec::new()),
             },
             Self::Scope(name) => {
                 let (keep, _): (Vec<_>, Vec<_>) = roots
                     .into_iter()
                     .partition(|r| policy.scope_of(r) == Some(name.as_str()));
+                if keep.is_empty() {
+                    let mut seen: Vec<&str> =
+                        known.iter().filter_map(|r| policy.scope_of(r)).collect();
+                    seen.sort_unstable();
+                    seen.dedup();
+                    let seen = if seen.is_empty() {
+                        "none declared".to_string()
+                    } else {
+                        seen.join(", ")
+                    };
+                    return Err(format!(
+                        "No known repo has scope \"{name}\" (scopes in use: {seen}). \
+                         {GRAMMAR_HINT}"
+                    ));
+                }
                 (keep, Vec::new())
             }
             _ => (roots, Vec::new()),
@@ -1075,6 +1102,34 @@ mod tests {
         let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.root.as_deref(), Some("/project"));
         assert!(params.symbol_id.is_none());
+    }
+
+    /// Catches: a scope selector that cannot name one scope being accepted and
+    /// then resolving to nothing (`scope:`, `scope:a,b`), or `*:all` being
+    /// split as a list item next to another repo.
+    #[test]
+    fn a_scope_selector_that_cannot_mean_one_thing_is_refused() {
+        for raw in [
+            "scope:",
+            "scope:  ",
+            "scope:a,b",
+            "*:all,x",
+            "x,*:all",
+            "x,scope:home",
+        ] {
+            assert!(
+                RootSelector::parse(Some(raw)).is_err(),
+                "{raw} was accepted"
+            );
+        }
+        assert_eq!(
+            RootSelector::parse(Some("scope: home ")).unwrap(),
+            RootSelector::Scope("home".to_string())
+        );
+        assert_eq!(
+            RootSelector::parse(Some("*:all")).unwrap(),
+            RootSelector::AllScopes
+        );
     }
 
     /// Resolve a property subschema of `RelatesInput`, following a `$ref` into

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::config::DaemonConfig;
-use super::repo_map::{canonical_key, read_scope_overrides};
+use super::repo_map::{canonical_key, clean_scope, read_scope_overrides};
 
 #[derive(Debug, Clone, Default)]
 pub struct ScopePolicy {
@@ -31,7 +31,12 @@ impl ScopePolicy {
         let mut overrides: BTreeMap<PathBuf, String> = config
             .repos
             .iter()
-            .filter_map(|r| Some((canonical_key(Path::new(&r.root)), r.scope.clone()?)))
+            .filter_map(|r| {
+                Some((
+                    canonical_key(Path::new(&r.root)),
+                    clean_scope(r.scope.as_deref()?)?,
+                ))
+            })
             .collect();
         if let Some(map) = config.repo_map_path() {
             overrides.extend(read_scope_overrides(&map));

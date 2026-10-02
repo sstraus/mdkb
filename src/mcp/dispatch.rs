@@ -1952,7 +1952,7 @@ pub fn resolve_root_selector(
         excluded,
         include_sessions,
     } = selector
-        .resolve_scoped(&known, &open, registry.scope_policy(), scope)
+        .resolve_scoped(&known, &open, &registry.scope_policy(), scope)
         .map_err(mcp_error)?;
     let mapped: std::collections::BTreeSet<std::path::PathBuf> = registry
         .known_roots()

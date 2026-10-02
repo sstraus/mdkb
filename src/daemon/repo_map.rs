@@ -211,8 +211,14 @@ pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
     };
     file.repos
         .into_iter()
-        .filter_map(|r| Some((canonical_key(Path::new(&r.root)), r.scope?)))
+        .filter_map(|r| Some((canonical_key(Path::new(&r.root)), clean_scope(&r.scope?)?)))
         .collect()
+}
+
+/// A scope name as declared: trimmed, and blank means none was declared, so
+/// the prefix rule decides. `daemon.toml` rules are read the same way.
+pub(super) fn clean_scope(scope: &str) -> Option<String> {
+    Some(scope.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// The persisted set of known repository roots.
