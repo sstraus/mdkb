@@ -6758,4 +6758,328 @@ mod tests {
         .unwrap();
         assert!(found.is_none(), "{found:?}");
     }
+
+    // --- mutation survivors: ids, source types, embeddings, projection state,
+    //     due reminders, prune cutoff, hybrid access-recency fold ---
+
+    /// Catches: `id.len() > MAX_ID_LEN` turned `>=`, which refuses an id of
+    /// exactly the documented maximum.
+    #[test]
+    fn an_entry_id_of_exactly_the_maximum_length_is_valid() {
+        assert!(validate_entry_id(&"a".repeat(MAX_ID_LEN)).is_ok());
+        assert!(matches!(
+            validate_entry_id(&"a".repeat(MAX_ID_LEN + 1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidEntryId(_)
+        ));
+    }
+
+    /// Catches: a source type dropped from the parser, so a value the store
+    /// wrote (`official_docs`) is refused on the way back in.
+    #[test]
+    fn every_source_type_round_trips_through_its_wire_name() {
+        for source in SourceType::ALL {
+            assert_eq!(source.as_str().parse::<SourceType>(), Ok(source));
+        }
+        assert_eq!(
+            "official_docs".parse::<SourceType>(),
+            Ok(SourceType::OfficialDocs)
+        );
+        assert!("docs".parse::<SourceType>().is_err());
+    }
+
+    fn embedding_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memory_embeddings", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Catches: `store_entry_embedding` reporting success (or failure) without
+    /// writing the vector for the entry it was given.
+    #[test]
+    fn store_entry_embedding_stores_the_vector_and_reports_true_for_a_known_id() {
+        let conn = setup_db_with_vectors();
+        add_entry(&conn, &typed_entry("known", "Known", "c", EntryType::Topic)).unwrap();
+        let rowid = get_rowid(&conn, "known").unwrap().unwrap();
+
+        assert!(store_entry_embedding(&conn, "known", &offset_embedding(0.0)).unwrap());
+
+        let stored: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_rowid = ?1",
+                params![rowid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 1);
+    }
+
+    /// Catches: `store_entry_embedding` reporting success for an id that is not
+    /// in the store, which tells the import path a vector landed that did not.
+    #[test]
+    fn store_entry_embedding_reports_false_and_writes_nothing_for_an_unknown_id() {
+        let conn = setup_db_with_vectors();
+
+        assert!(!store_entry_embedding(&conn, "ghost", &offset_embedding(0.0)).unwrap());
+
+        assert_eq!(embedding_rows(&conn), 0);
+    }
+
+    /// Catches: `embed_entry` reporting an embedding for an entry that does not
+    /// exist (answered before the model is consulted, so no model is needed).
+    #[test]
+    fn embed_entry_reports_false_for_an_unknown_id() {
+        let conn = setup_db_with_vectors();
+
+        assert!(!embed_entry(&conn, "ghost", "Title", "content").unwrap());
+        assert_eq!(embedding_rows(&conn), 0);
+    }
+
+    /// Catches: a projection listing that returns nothing (every drift check in
+    /// memory sync then passes silently), or hides an archived entry or the
+    /// projection columns.
+    #[test]
+    fn list_projection_state_returns_every_entry_with_its_projection_columns() {
+        let conn = setup_db();
+        add_entry(&conn, &typed_entry("alpha", "Alpha", "c", EntryType::Topic)).unwrap();
+        let mut archived = typed_entry("beta", "Beta", "c", EntryType::Topic);
+        archived.status = EntryStatus::Archived;
+        add_entry(&conn, &archived).unwrap();
+        set_projection(&conn, "alpha", 500, "hash-a").unwrap();
+
+        let rows = list_projection_state(&conn).unwrap();
+
+        let seen: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.entry.id.as_str(),
+                    r.entry.status,
+                    r.projected_at,
+                    r.projected_hash.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("alpha", EntryStatus::Active, Some(500), Some("hash-a")),
+                ("beta", EntryStatus::Archived, None, None),
+            ]
+        );
+    }
+
+    /// Catches: a status change that writes nothing, or stamps `now` where the
+    /// caller passed the entry's own timestamp (a revived file would then look
+    /// stale against the DB).
+    #[test]
+    fn set_status_at_writes_the_status_and_the_given_updated_at() {
+        let conn = setup_db();
+        add_entry(&conn, &typed_entry("e", "E", "c", EntryType::Topic)).unwrap();
+
+        set_status_at(&conn, "e", EntryStatus::Archived, 4242).unwrap();
+
+        let entry = get_entry_without_tracking(&conn, "e").unwrap().unwrap();
+        assert_eq!(entry.status, EntryStatus::Archived);
+        assert_eq!(entry.updated_at, 4242);
+    }
+
+    /// Catches: `set_status` doing nothing, leaving an archived entry active.
+    #[test]
+    fn set_status_archives_the_entry_and_stamps_now() {
+        let conn = setup_db();
+        add_entry(&conn, &typed_entry("e", "E", "c", EntryType::Topic)).unwrap();
+        let before = Utc::now().timestamp();
+
+        set_status(&conn, "e", EntryStatus::Archived).unwrap();
+
+        let after = Utc::now().timestamp();
+        let entry = get_entry_without_tracking(&conn, "e").unwrap().unwrap();
+        assert_eq!(entry.status, EntryStatus::Archived);
+        assert!((before..=after).contains(&entry.updated_at));
+    }
+
+    fn due_reminders(conn: &Connection, count: usize, now: i64) {
+        for i in 0..count {
+            add_entry(
+                conn,
+                &make_reminder(
+                    &format!("rem-{i:02}"),
+                    &format!("Due {i}"),
+                    "body",
+                    Some(now - 1000 + i as i64),
+                    now,
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Catches: `due_total > DUE_REMINDER_CAP` turned `>=`, which appends an
+    /// "...and 0 more overdue" line when exactly the cap is due.
+    #[test]
+    fn exactly_the_cap_of_due_reminders_emits_no_overflow_line() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        due_reminders(&conn, DUE_REMINDER_CAP, now);
+
+        let lines = due_reminder_lines(&conn, now).unwrap();
+
+        assert_eq!(lines.len(), DUE_REMINDER_CAP);
+        assert!(
+            lines.iter().all(|l| !l.contains("more overdue")),
+            "{lines:?}"
+        );
+    }
+
+    /// Catches: the overflow count off by one at the first reminder past the cap.
+    #[test]
+    fn one_over_the_cap_of_due_reminders_reports_an_overflow_of_one() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        due_reminders(&conn, DUE_REMINDER_CAP + 1, now);
+
+        let lines = due_reminder_lines(&conn, now).unwrap();
+
+        assert_eq!(lines.len(), DUE_REMINDER_CAP + 1);
+        assert!(lines.last().unwrap().contains("...and 1 more overdue"));
+    }
+
+    /// Catches: the prune cutoff built with `+` where it multiplies, which
+    /// turns `days` into hours: a prior read 6 days ago would be archived on a
+    /// 7-day prune, and one read 2 hours ago on a 1-day prune.
+    #[test]
+    fn the_prune_cutoff_is_days_in_seconds() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let ago = |hours: i64| Some(now - hours * 3600);
+        for (id, hours) in [
+            ("two-hours", 2),
+            ("two-days", 48),
+            ("six-days", 144),
+            ("eight-days", 192),
+        ] {
+            seed_for_prune(
+                &conn,
+                id,
+                EntryType::Prior,
+                now - 400 * 3600,
+                ago(hours),
+                None,
+                None,
+            );
+        }
+        let prunable = |days: u32| {
+            let mut ids = prunable_entry_ids(&conn, days).unwrap();
+            ids.sort();
+            ids
+        };
+
+        assert_eq!(prunable(7), ["eight-days"]);
+        assert_eq!(prunable(1), ["eight-days", "six-days", "two-days"]);
+    }
+
+    /// Four entries no BM25 term reaches, so the vector leg alone ranks them:
+    /// `n`, `a`, `b`, `c` in that order. `counts` is each one's access count
+    /// (recently accessed when positive). Returns the final scores, in that
+    /// order, with the access-recency weight at 0.2.
+    fn fused_scores(counts: [u64; 4]) -> [f64; 4] {
+        let conn = setup_db_with_vectors();
+        let now = Utc::now().timestamp();
+        for (i, (id, count)) in ["n", "a", "b", "c"].into_iter().zip(counts).enumerate() {
+            let mut entry = typed_entry(id, id, "unrelated words only", EntryType::Topic);
+            entry.access_count = count;
+            entry.last_accessed = (count > 0).then_some(now - 10);
+            add_with_embedding(&conn, &entry, &offset_embedding(0.1 * (i + 1) as f32));
+        }
+        let query = offset_embedding(0.0);
+
+        let results =
+            search_entries_recall(&conn, "alpha", Some(&query), 10, None, &ungated(0.2)).unwrap();
+
+        assert_eq!(results.len(), 4);
+        let mut scores = [0.0; 4];
+        for (slot, id) in scores.iter_mut().zip(["n", "a", "b", "c"]) {
+            *slot = results.iter().find(|r| r.id == id).unwrap().score;
+        }
+        scores
+    }
+
+    /// The final score of each entry given its raw RRF value: normalised by the
+    /// largest, then blended with confidence (equal for these four).
+    fn blended(raw: [f64; 4]) -> [f64; 4] {
+        let max = raw.into_iter().fold(0.0, f64::max);
+        let entry = typed_entry("x", "x", "c", EntryType::Topic);
+        raw.map(|r| final_hybrid_score(r / max, &entry))
+    }
+
+    /// The vector-leg RRF value at 0-based `rank`.
+    fn vector_rrf(rank: usize) -> f64 {
+        let cfg = crate::store::hybrid::HybridConfig::default();
+        cfg.vector_weight / (cfg.rrf_k + rank as f64 + 1.0)
+    }
+
+    /// The third-signal bonus at 0-based access `rank`, weight 0.2.
+    fn recency_bonus(rank: usize) -> f64 {
+        0.2 / (crate::store::hybrid::HybridConfig::default().rrf_k + rank as f64 + 1.0)
+    }
+
+    fn assert_scores(got: [f64; 4], raw: [f64; 4]) {
+        for (g, e) in got.iter().zip(blended(raw)) {
+            assert!((g - e).abs() < 1e-9, "{got:?} != {:?}", blended(raw));
+        }
+    }
+
+    /// Catches: the reciprocal-rank bonus computed with the wrong operator
+    /// (`/` as `%` or `*`, `+` as `-` or `*` in `k + rank + 1`) or applied with
+    /// `-=` / `*=`: two accessed entries must gain `w/(k+1)` and `w/(k+2)`.
+    #[test]
+    fn hybrid_fused_path_ranks_by_access_recency_bonus() {
+        let scores = fused_scores([0, 0, 5, 25]);
+
+        assert_scores(
+            scores,
+            [
+                vector_rrf(0),
+                vector_rrf(1),
+                vector_rrf(2) + recency_bonus(1),
+                vector_rrf(3) + recency_bonus(0),
+            ],
+        );
+    }
+
+    /// Catches: `score > 0.0` turned `>=`, `==` or `<`: an entry nobody ever
+    /// accessed would be ranked and handed a bonus, displacing the accessed one
+    /// from rank 0 (or the accessed one would be skipped).
+    #[test]
+    fn hybrid_fused_path_skips_zero_access_signal_entries() {
+        let scores = fused_scores([0, 0, 0, 25]);
+
+        assert_scores(
+            scores,
+            [
+                vector_rrf(0),
+                vector_rrf(1),
+                vector_rrf(2),
+                vector_rrf(3) + recency_bonus(0),
+            ],
+        );
+    }
+
+    /// Catches: `id == rowid` turned `!=` when the bonus is folded back: the
+    /// bonus would land on the first other entry instead of the accessed one.
+    #[test]
+    fn hybrid_fused_path_bonus_lands_on_the_ranked_entry() {
+        let scores = fused_scores([0, 5, 0, 0]);
+
+        assert_scores(
+            scores,
+            [
+                vector_rrf(0),
+                vector_rrf(1) + recency_bonus(0),
+                vector_rrf(2),
+                vector_rrf(3),
+            ],
+        );
+    }
 }

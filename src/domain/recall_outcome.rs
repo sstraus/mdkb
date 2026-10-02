@@ -594,4 +594,146 @@ mod tests {
             ]
         );
     }
+
+    const T0: i64 = 1_790_676_000; // 2026-09-29T10:00:00Z
+
+    fn assistant_tool_use(second: u32, id: &str, name: &str, input: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"2026-09-29T10:00:{second:02}Z","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}}}}"#
+        )
+    }
+
+    fn user_record(second: u32, content: &str) -> String {
+        format!(
+            r#"{{"type":"user","timestamp":"2026-09-29T10:00:{second:02}Z","message":{{"content":{content}}}}}"#
+        )
+    }
+
+    fn verdicts(jsonl: &str) -> Vec<(String, bool)> {
+        parse_events(jsonl)
+            .into_iter()
+            .filter_map(|e| match e {
+                RecallEvent::Verdict { id, confirmed, .. } => Some((id, confirmed)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Catches: the outcome word read from the wrong place (`--outcome` kept as
+    /// a positional, its position compared with `!=`, the value index
+    /// multiplied), which turns every CLI verdict into "refuted".
+    #[test]
+    fn parse_events_reads_cli_confirm_with_outcome_confirmed() {
+        let confirmed = |command: &str| {
+            let jsonl =
+                assistant_tool_use(0, "t1", "Bash", &format!(r#"{{"command":"{command}"}}"#));
+            verdicts(&jsonl)
+        };
+
+        assert_eq!(
+            confirmed("mdkb memory confirm wal --outcome confirmed"),
+            [("wal".to_string(), true)]
+        );
+        assert_eq!(
+            confirmed("mdkb memory confirm wal --quiet --outcome confirmed"),
+            [("wal".to_string(), true)]
+        );
+        assert_eq!(
+            confirmed("mdkb memory confirm wal --outcome refuted"),
+            [("wal".to_string(), false)]
+        );
+    }
+
+    /// Catches: the MCP `memory_confirm` tool not recognised, or its outcome
+    /// compared with `!=`, which labels a confirmation refuted and vice versa.
+    #[test]
+    fn parse_events_reads_mcp_confirm_tool_both_outcomes() {
+        let call = |outcome: &str| {
+            verdicts(&assistant_tool_use(
+                0,
+                "t1",
+                "mcp__mdkb__memory_confirm",
+                &format!(r#"{{"id":"wal","outcome":"{outcome}"}}"#),
+            ))
+        };
+
+        assert_eq!(call("confirmed"), [("wal".to_string(), true)]);
+        assert_eq!(call("refuted"), [("wal".to_string(), false)]);
+    }
+
+    /// Catches: the CLI `search` arm missing, so a search run from a shell never
+    /// produces a `Found` event and an uninjected hit is never labelled missed.
+    #[test]
+    fn parse_events_reads_cli_search_result_as_found() {
+        let jsonl = [
+            assistant_tool_use(0, "t1", "Bash", r#"{"command":"mdkb search wal"}"#),
+            user_record(
+                1,
+                r#"[{"type":"tool_result","tool_use_id":"t1","content":"[wal] SQLite WAL"}]"#,
+            ),
+        ]
+        .join("\n");
+
+        assert_eq!(
+            parse_events(&jsonl),
+            vec![RecallEvent::Found {
+                text: "[wal] SQLite WAL".into(),
+                at: T0 + 1
+            }]
+        );
+    }
+
+    /// Catches: the `text` block arm of a user record dropped, which loses every
+    /// correction the harness delivers as a content block.
+    #[test]
+    fn parse_events_emits_correction_for_user_text_block() {
+        let jsonl = user_record(
+            0,
+            r#"[{"type":"text","text":"no, the checkpoint starvation note is wrong"}]"#,
+        );
+
+        assert_eq!(
+            parse_events(&jsonl),
+            vec![RecallEvent::Correction {
+                text: "no, the checkpoint starvation note is wrong".into(),
+                at: T0
+            }]
+        );
+    }
+
+    /// Catches: `!hook && correction` turned `||`: a neutral message, or a hook
+    /// message that happens to contain a correction word, becomes a correction.
+    #[test]
+    fn parse_events_ignores_plain_and_hook_generated_user_text() {
+        let neutral = "please run the tests";
+        let hook = "Stop hook feedback: no, you should have run the tests";
+        for text in [neutral, hook] {
+            let as_string = user_record(0, &format!("{text:?}"));
+            let as_block = user_record(0, &format!(r#"[{{"type":"text","text":{text:?}}}]"#));
+
+            assert!(parse_events(&as_string).is_empty(), "string: {text}");
+            assert!(parse_events(&as_block).is_empty(), "block: {text}");
+        }
+    }
+
+    /// Catches: `injected && prompt_at == latest` turned `||`: a correction
+    /// would also credit an earlier prompt's candidate and any candidate recall
+    /// never injected, labelling a false negative as corrected.
+    #[test]
+    fn a_correction_credits_only_injected_candidates_of_the_latest_prompt() {
+        let c = [
+            cand(2, 200, "latest-injected", true),
+            cand(1, 100, "earlier-injected", true),
+            cand(2, 200, "latest-not-injected", false),
+        ];
+        let e = [RecallEvent::Correction {
+            text: "no, the checkpoint starvation note is outdated".into(),
+            at: 250,
+        }];
+
+        assert_eq!(
+            outcomes(&c, &e),
+            vec![(2, "latest-injected".into(), "corrected")]
+        );
+    }
 }
