@@ -1498,6 +1498,7 @@ root=\"name,/abs/path\"                                   # several repos, comma
 root=\"*\"                                                # every known repo in the caller's scope, plus repos with no scope; the footer counts the rest (Excluded by scope: N)
 root=\"*:all\"                                            # every known repo, scopes mixed, and the claude_sessions collections `*` leaves out
 root=\"scope:home\"                                       # the known repos whose scope is home
+# A caller with no scope (no MCP roots, or a directory under no prefix) is not filtered: `*` returns every scope's repos.
 # Scope: `[[scopes]] prefix = \"~/Gits/home\"` / `scope = \"home\"` in daemon.toml, or `\"scope\"` on a repos.json entry (wins over the prefix).
 # Only `search` fans out; every other tool needs a selector naming one repo —
 # with `root` omitted that is the declared workspace itself, when it is a store.

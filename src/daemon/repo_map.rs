@@ -304,6 +304,17 @@ impl RepoMap {
             );
         }
 
+        // A dropped entry that carries a hand-written scope stays in the file
+        // (see `write_atomic`), so dropping it is not a change to write.
+        let declared = path
+            .as_deref()
+            .and_then(|p| try_read_scope_overrides(p).ok())
+            .unwrap_or_default();
+        let dropped_for_good = triaged
+            .dropped
+            .iter()
+            .any(|(root, _)| !declared.contains_key(root));
+
         let map = Self {
             path,
             roots: Mutex::new(triaged.kept),
@@ -313,7 +324,7 @@ impl RepoMap {
         // Persist only when the set on disk is not the set in hand: every CLI
         // hook builds a registry, and rewriting an unchanged map on each one
         // would rename a file per hook for nothing.
-        let changed = normalized || seeded != before || !triaged.dropped.is_empty();
+        let changed = normalized || seeded != before || dropped_for_good;
         if changed {
             let roots = map.roots.lock().unwrap_or_else(|e| e.into_inner());
             map.persist(&roots);
@@ -511,10 +522,14 @@ fn write_atomic(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    // An entry with a hand-written scope stays even when its root is not in
+    // the set: a store that is missing (an unmounted volume, a directory that
+    // holds no `.mdkb`) is not a reason to erase what the operator declared.
+    let kept: BTreeSet<&PathBuf> = roots.iter().chain(scopes.keys()).collect();
     let file = RepoMapFile {
         version: FORMAT_VERSION,
-        repos: roots
-            .iter()
+        repos: kept
+            .into_iter()
             .map(|r| RepoEntry {
                 root: r.to_string_lossy().to_string(),
                 scope: scopes.get(r).cloned(),
