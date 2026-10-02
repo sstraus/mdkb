@@ -4560,10 +4560,11 @@ fn admit_doc_hits(
     prompt: &str,
     min_cosine: f32,
 ) -> Vec<crate::domain::SearchResult> {
-    let named_dirs: std::collections::HashSet<(&str, &str)> = hits
+    let named_dirs: Vec<(String, String)> = hits
         .iter()
         .filter_map(|(hit, _)| crate::store::hybrid::project_dir(&hit.path))
         .filter(|(_, dir)| crate::store::hybrid::names_dir(prompt, dir))
+        .map(|(parent, dir)| (parent.to_string(), dir.to_string()))
         .collect();
     // A sibling of the directory the prompt names is another project's
     // document: it shares the generic vocabulary of the kind (report, status,
@@ -4573,7 +4574,7 @@ fn admit_doc_hits(
         crate::store::hybrid::project_dir(path).is_some_and(|(parent, dir)| {
             named_dirs
                 .iter()
-                .any(|&(named_parent, named)| named_parent == parent && named != dir)
+                .any(|(named_parent, named)| named_parent == parent && named != dir)
         })
     };
     hits.into_iter()
