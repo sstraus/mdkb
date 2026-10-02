@@ -2455,23 +2455,25 @@ mod tests {
         );
     }
 
-    /// Criterion 9 (story 126-5dab). The `root` grammar is charged on every
-    /// request when it lives in a tool schema and on every session when it
-    /// lives in the instructions. It lives in `mdkb cheatsheet` instead, which
-    /// costs nothing until an operator asks for it.
+    /// Criterion 9 (story 126-5dab), narrowed by story 218-78c8. The `root`
+    /// grammar is charged on every request when it lives in a tool schema and
+    /// on every session when it lives in the instructions. It lives in
+    /// `mdkb cheatsheet`; the one exception is `search`, whose `root` carries a
+    /// single sentence, because a model that never ran the cheatsheet cannot
+    /// guess that `root` takes a repo name.
     ///
-    /// Narrow on purpose: the `root` PROPERTY must carry no description, and no
-    /// description anywhere may teach the selector syntax. "Relative file path
-    /// from repo root" describes `path`, not `root`, and stays.
+    /// Narrow on purpose: no other `root` PROPERTY may carry a description, and
+    /// no description anywhere may teach the `root=` selector syntax. "Relative
+    /// file path from repo root" describes `path`, not `root`, and stays.
     #[test]
-    fn no_tool_schema_and_no_instruction_describes_root() {
+    fn only_search_describes_root_and_no_schema_teaches_the_selector_syntax() {
         let tools = McpServer::tool_router().list_all();
         let mut documented = Vec::new();
         let mut grammar = Vec::new();
 
         for tool in &tools {
             let schema = serde_json::to_value(&tool.input_schema).expect("schema serializes");
-            if schema.pointer("/properties/root/description").is_some() {
+            if tool.name != "search" && schema.pointer("/properties/root/description").is_some() {
                 documented.push(tool.name.to_string());
             }
             if serde_json::to_string(&schema)
@@ -2497,6 +2499,35 @@ mod tests {
             !instructions.contains("root="),
             "the server instructions teach the root selector syntax; \
              it belongs in `mdkb cheatsheet`:\n{instructions}"
+        );
+    }
+
+    /// Catches: `search.root` shipping undocumented (a model that never ran the
+    /// cheatsheet does not know `root` takes a name), and a description that
+    /// grows into a paragraph charged on every request.
+    #[test]
+    fn search_root_has_a_one_sentence_description_naming_the_three_forms() {
+        let tools = McpServer::tool_router().list_all();
+        let search = tools.iter().find(|t| t.name == "search").expect("search");
+        let schema = serde_json::to_value(&search.input_schema).expect("schema serializes");
+        let description = schema
+            .pointer("/properties/root/description")
+            .and_then(|d| d.as_str())
+            .expect("search.root has a description");
+
+        assert!(
+            description.len() < 160,
+            "{} chars: {description}",
+            description.len()
+        );
+        assert!(description.contains("name"), "{description}");
+        assert!(description.contains("absolute path"), "{description}");
+        assert!(description.contains("\"*\""), "{description}");
+        // One sentence: the only full stop is the last character.
+        let body = description.trim_end_matches('.');
+        assert!(
+            !body.contains(". "),
+            "more than one sentence: {description}"
         );
     }
 

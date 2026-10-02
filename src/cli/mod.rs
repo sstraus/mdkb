@@ -164,6 +164,10 @@ pub enum Command {
         /// Filter by entry type - used with memory scope
         #[arg(long = "entry-type", alias = "type", value_parser = entry_type_values())]
         entry_type: Option<String>,
+
+        /// Repo to search: a name, an absolute path, a comma list of either, or "*" for every known repo. Omit for this directory's repo
+        #[arg(long)]
+        root: Option<String>,
     },
 
     /// Retrieve a document by ID, path, memory slug, glob pattern, or comma-separated list
