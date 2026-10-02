@@ -195,7 +195,7 @@ pub fn strong_lexical_match(query: &str, entry_text: &str) -> bool {
 /// the kind of word nobody writes without meaning that document. Length is the
 /// proxy for the same reason as [`RARE_TERM_LEN`]: no index lookup on the
 /// `UserPromptSubmit` path.
-const STEM_NAME_MIN_LEN: usize = 8;
+const STEM_NAME_MIN_LEN: usize = 8; // characters, not bytes
 
 /// Lowercased letters and digits of `word`, one trailing plural `s` dropped:
 /// `follow-up,` and `followups` both become `followup`.
@@ -205,7 +205,7 @@ fn compact_word(word: &str) -> String {
         .filter(|c| c.is_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect();
-    if compact.len() > 3 && compact.ends_with('s') {
+    if compact.chars().count() > 3 && compact.ends_with('s') {
         compact.pop();
     }
     compact
@@ -226,7 +226,7 @@ pub fn names_file_stem(query: &str, path: &str) -> bool {
     else {
         return false;
     };
-    stem.len() >= STEM_NAME_MIN_LEN
+    stem.chars().count() >= STEM_NAME_MIN_LEN
         && query
             .split_whitespace()
             .any(|word| compact_word(word) == stem)

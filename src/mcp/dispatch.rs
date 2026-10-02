@@ -4395,8 +4395,12 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// store without embeddings, or an identifier-shaped query, from losing the
 /// leg. A prompt word that is the document's file stem
 /// ([`crate::store::hybrid::names_file_stem`]) also counts, but only with the
-/// precision floor's cosine behind it. Being in the BM25 result set is not evidence: recall OR-expands the
-/// prompt, so one common word puts a document there.
+/// automatic-recall cosine floor behind it (`RECALL_AUTO_MIN_COSINE_DEFAULT`:
+/// measured 2026-10-02 on the orchestrator store, `followups.md` scored 0.245 –
+/// 0.437 on test-method prompts that say "follow-up" and 0.514 on the Italian
+/// question that really names follow-ups). Being in the BM25 result set is not
+/// evidence: recall OR-expands the prompt, so one common word puts a document
+/// there.
 fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
     prompt: &str,
@@ -4405,7 +4409,8 @@ fn admit_doc_hits(
     hits.into_iter()
         .filter(|(hit, cosine)| {
             cosine.is_some_and(|c| c >= f64::from(min_cosine))
-                || cosine.is_some_and(|c| c >= f64::from(crate::config::MIN_RECALL_COSINE_DEFAULT))
+                || cosine
+                    .is_some_and(|c| c >= f64::from(crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT))
                     && crate::store::hybrid::names_file_stem(prompt, &hit.path)
                 || crate::store::hybrid::strong_lexical_match(
                     prompt,
@@ -9464,7 +9469,7 @@ mod tests {
         let prompt = "cosa ho chiesto di verificare, ci sono follow-up aperti?";
         assert_eq!(admit_doc_hits(hits(Some(0.514)), prompt, 0.55).len(), 1);
         assert_eq!(
-            admit_doc_hits(hits(Some(0.41)), "i Followups aperti", 0.55).len(),
+            admit_doc_hits(hits(Some(0.51)), "i Followups aperti", 0.55).len(),
             1
         );
     }
@@ -9482,8 +9487,28 @@ mod tests {
             )]
         };
         let prompt = "scrivi i follow-up della riunione";
-        assert!(admit_doc_hits(hits(Some(0.39)), prompt, 0.55).is_empty());
+        assert!(admit_doc_hits(hits(Some(0.45)), prompt, 0.55).is_empty());
         assert!(admit_doc_hits(hits(None), prompt, 0.55).is_empty());
+    }
+
+    /// Story 197 (critic): the stem arm's floor must sit above what an unrelated
+    /// prompt scores. The orchestrator `followups.md` scored 0.437 on a
+    /// test-method prompt that also says "follow-up"; admitting it brings back
+    /// the original symptom (a doc about something else injected on one word).
+    /// Catches: lowering the stem arm's floor to the 0.40 memory floor.
+    #[test]
+    fn a_test_method_prompt_that_says_follow_up_does_not_admit_followups() {
+        let prompt = "Verifica il metodo di test (TDD, RED/GREEN, mutation, adversarial) \
+                      e riassumi i follow-up per Boss";
+        let hits = |c| {
+            vec![scored_hit(
+                "followups.md",
+                "Verifiche dovute a Boss",
+                Some(c),
+            )]
+        };
+        assert!(admit_doc_hits(hits(0.437), prompt, 0.55).is_empty());
+        assert_eq!(admit_doc_hits(hits(0.514), prompt, 0.55).len(), 1);
     }
 
     /// Catches: a short, common stem (`tools.md`, `tracker.md`, `plan.md`,
@@ -17177,7 +17202,7 @@ mod file_stem_admission_critic_tests {
     /// f64, so the floor itself admits and the next f32 below it does not.
     #[test]
     fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
-        let floor = crate::config::MIN_RECALL_COSINE_DEFAULT;
+        let floor = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
         let below = f32::from_bits(floor.to_bits() - 1);
         let prompt = "i followups aperti";
         let admit = |c: f32| {
