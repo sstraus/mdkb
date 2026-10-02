@@ -4579,6 +4579,12 @@ fn admit_doc_hits(
     };
     hits.into_iter()
         .filter(|(hit, cosine)| {
+            tracing::debug!(
+                path = %hit.path,
+                ?cosine,
+                foreign = is_foreign(&hit.path),
+                "recall doc candidate"
+            );
             cosine.is_some_and(|c| c >= f64::from(min_cosine)) && !is_foreign(&hit.path)
                 || cosine
                     .is_some_and(|c| c >= f64::from(crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT))
