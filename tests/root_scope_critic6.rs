@@ -6,9 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
+use mdkb::core::Context;
 use mdkb::daemon::repo_map::{RepoMap, read_known_roots, read_scope_overrides};
 use mdkb::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
-use mdkb::core::Context;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -60,7 +60,6 @@ fn store(parent: &Path, name: &str, needle: &str) -> PathBuf {
     root
 }
 
-
 /// A directory that was a repo and is deleted now.
 fn gone(parent: &Path, name: &str) -> PathBuf {
     let p = dir(parent, name);
@@ -90,7 +89,8 @@ fn write_map(path: &Path, entries: &[(&Path, Option<&str>)]) {
 }
 
 fn file_roots(path: &Path) -> Vec<(String, Option<String>)> {
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     v["repos"]
         .as_array()
         .unwrap()
@@ -115,15 +115,27 @@ fn a_gone_root_without_scope_is_pruned_beside_a_gone_root_with_one() {
     let plain_gone = gone(&base, "plain");
     let a = live(&base, "a");
     let map = tmp.path().join("repos.json");
-    write_map(&map, &[(&scoped, Some("home")), (&plain_gone, None), (&a, None)]);
+    write_map(
+        &map,
+        &[(&scoped, Some("home")), (&plain_gone, None), (&a, None)],
+    );
 
     let _m = RepoMap::open(Some(map.clone()), &[]);
 
     let roots = file_roots(&map);
     let names: Vec<_> = roots.iter().map(|(r, _)| r.clone()).collect();
-    assert!(names.contains(&scoped.to_string_lossy().to_string()), "{roots:?}");
-    assert!(!names.contains(&plain_gone.to_string_lossy().to_string()), "{roots:?}");
-    assert!(names.contains(&a.to_string_lossy().to_string()), "{roots:?}");
+    assert!(
+        names.contains(&scoped.to_string_lossy().to_string()),
+        "{roots:?}"
+    );
+    assert!(
+        !names.contains(&plain_gone.to_string_lossy().to_string()),
+        "{roots:?}"
+    );
+    assert!(
+        names.contains(&a.to_string_lossy().to_string()),
+        "{roots:?}"
+    );
 }
 
 /// Catches: a rewrite on every open. Only a gone entry with a scope is in the
@@ -166,7 +178,10 @@ fn a_gone_root_whose_scope_was_removed_by_hand_is_pruned() {
     let _m = RepoMap::open(Some(map.clone()), &[]);
 
     let names: Vec<_> = file_roots(&map).into_iter().map(|(r, _)| r).collect();
-    assert!(!names.contains(&g.to_string_lossy().to_string()), "{names:?}");
+    assert!(
+        !names.contains(&g.to_string_lossy().to_string()),
+        "{names:?}"
+    );
 }
 
 /// Catches: a blank scope ("  ") counted as declared by the change detector,
@@ -183,7 +198,10 @@ fn a_gone_root_with_a_blank_scope_is_pruned() {
     let _m = RepoMap::open(Some(map.clone()), &[]);
 
     let names: Vec<_> = file_roots(&map).into_iter().map(|(r, _)| r).collect();
-    assert!(!names.contains(&g.to_string_lossy().to_string()), "{names:?}");
+    assert!(
+        !names.contains(&g.to_string_lossy().to_string()),
+        "{names:?}"
+    );
 }
 
 /// Catches: a duplicate entry (one with the scope, one without) when the same
@@ -228,7 +246,10 @@ fn a_scoped_gone_root_that_comes_back_keeps_its_scope_once() {
     m.record(&g);
 
     let roots = file_roots(&map);
-    let g_entries: Vec<_> = roots.iter().filter(|(r, _)| r == &g.to_string_lossy()).collect();
+    let g_entries: Vec<_> = roots
+        .iter()
+        .filter(|(r, _)| r == &g.to_string_lossy())
+        .collect();
     assert_eq!(g_entries.len(), 1, "{roots:?}");
     assert_eq!(g_entries[0].1.as_deref(), Some("work"), "{roots:?}");
     assert!(m.contains(&g));
@@ -249,7 +270,10 @@ fn a_gone_seed_with_a_scope_in_the_file_is_neither_known_nor_rewritten() {
         a.display()
     );
     std::fs::write(&map, &compact).unwrap();
-    let seed = mdkb::daemon::config::RepoEntry { root: g.to_string_lossy().to_string(), scope: None };
+    let seed = mdkb::daemon::config::RepoEntry {
+        root: g.to_string_lossy().to_string(),
+        scope: None,
+    };
 
     let m = RepoMap::open(Some(map.clone()), &[seed]);
 
@@ -284,7 +308,10 @@ fn star_search_without_a_daemon_ignores_a_scoped_gone_entry() {
     let a = store(&base, "a", "zonk_a");
     let home = dir(tmp.path(), "cli-home");
     std::fs::create_dir_all(home.join(".mdkb")).unwrap();
-    write_map(&home.join(".mdkb/repos.json"), &[(&g, Some("home")), (&a, None)]);
+    write_map(
+        &home.join(".mdkb/repos.json"),
+        &[(&g, Some("home")), (&a, None)],
+    );
 
     let out = cli::command()
         .env("HOME", &home)
