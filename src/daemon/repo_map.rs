@@ -146,10 +146,12 @@ pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet
     found
 }
 
-/// Read the persisted roots without triage, normalization, or a write-back.
-/// Reporting commands use this path so inspecting coverage cannot change it.
+/// Read the persisted roots without normalization or a write-back, leaving out
+/// the ones that are gone from disk: an entry kept in the file only for its
+/// hand-written scope is not a repo. Reporting commands use this path so
+/// inspecting coverage cannot change it.
 pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
-    read_file(path).roots.into_iter().collect()
+    triage(read_file(path).roots).kept.into_iter().collect()
 }
 
 /// The outcome of one pass over the known roots.
