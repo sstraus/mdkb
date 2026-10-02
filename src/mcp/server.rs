@@ -1405,6 +1405,25 @@ const CTX_WAIT_SECS: u64 = 60;
 /// watcher and that the daemon spawns exactly one per registered repo.
 pub static WATCHER_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 
+/// Per-root watcher spawn counts, lib tests only. The process-global
+/// `WATCHER_SPAWN_COUNT` is shared by every test that opens a repo under tokio,
+/// so a delta of it is only valid when nothing else spawns; a test with its own
+/// tempdir root reads this instead and is isolated from parallel spawners.
+#[cfg(test)]
+static WATCHER_SPAWNS_BY_ROOT: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Times `run_file_watcher_inner` was entered for exactly `root` (lib tests only).
+#[cfg(test)]
+pub(crate) fn watcher_spawns_for_root(root: &Path) -> u64 {
+    WATCHER_SPAWNS_BY_ROOT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(root).copied())
+        .unwrap_or(0)
+}
+
 /// Number of completed doc reindex flushes (observable by integration tests).
 pub static DOC_REINDEX_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -1457,6 +1476,15 @@ pub async fn run_file_watcher_inner(
     mut reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     WATCHER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    {
+        *WATCHER_SPAWNS_BY_ROOT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .entry(root.clone())
+            .or_insert(0) += 1;
+    }
     let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms })?;
 
     // Wait for context initialization (driven by first client request via

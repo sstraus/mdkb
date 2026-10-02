@@ -1124,7 +1124,7 @@ mod tests {
     /// AC#2 — concurrent get_or_open never exceeds max_active.
     ///
     /// Runs outside a tokio runtime so spawn_watcher_for_handle bails early
-    /// (try_current().is_err()) and WATCHER_SPAWN_COUNT stays unaffected.
+    /// (try_current().is_err()) and no watcher is spawned.
     #[test]
     fn test_concurrent_get_or_open_respects_max_active() {
         use std::sync::{Arc, Barrier};
@@ -1163,9 +1163,26 @@ mod tests {
         );
     }
 
-    /// Serializes every test that reads `WATCHER_SPAWN_COUNT` — it's a
-    /// process-global counter and parallel tests would race on deltas.
-    static WATCHER_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Polls until `root` has been spawned `want` times, for at most 10 s. The
+    /// watcher runs on a spawned task, so a fixed sleep fails when the runtime
+    /// is slow to schedule it.
+    async fn wait_for_spawns(root: &Path, want: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::mcp::server::watcher_spawns_for_root(root) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "watcher for {} not spawned {want} time(s) within 10 s",
+                root.display()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Time given to a spawn that must NOT happen (or happen twice) to show up.
+    /// A late spawn can only make the test fail, never pass wrongly-by-flake.
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 
     /// Story 017-91cb: both halves of the contract.
     ///
@@ -1173,42 +1190,40 @@ mod tests {
     /// 2. `RepoRegistry::get_or_open` spawns exactly ONE watcher even when
     ///    called twice with the same root — cache hits must not re-spawn.
     ///
-    /// Both halves share the global `WATCHER_SPAWN_COUNT`, so they live in
-    /// one test behind a serializing mutex.
+    /// Spawns are counted per canonical root (stories 231-bd88, 234-a394), so
+    /// watchers started by other tests in the same process cannot disturb the
+    /// count. Bug caught: a global-counter delta that includes foreign spawns.
     #[tokio::test(flavor = "current_thread")]
     async fn watcher_spawn_gated_to_daemon_registry() {
-        use crate::mcp::server::{McpServer, WATCHER_SPAWN_COUNT};
-        use std::sync::atomic::Ordering;
-
-        let _guard = WATCHER_COUNTER_LOCK.lock().await;
+        use crate::mcp::server::{McpServer, watcher_spawns_for_root};
 
         // --- Half 1: standalone must not spawn a watcher. ---
         let tmp_standalone = TempDir::new().unwrap();
         let root_standalone = make_repo(&tmp_standalone);
-        let before_standalone = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+        let key_standalone = canonicalize_root(&root_standalone).unwrap();
 
         let _server = McpServer::new(root_standalone);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        settle().await;
 
-        let after_standalone = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
         assert_eq!(
-            after_standalone, before_standalone,
+            watcher_spawns_for_root(&key_standalone),
+            0,
             "McpServer::new must not spawn a file watcher (standalone path)"
         );
 
         // --- Half 2: registry.get_or_open x2 on same root spawns 1 watcher. ---
         let tmp_daemon = TempDir::new().unwrap();
         let root_daemon = make_repo(&tmp_daemon);
+        let key_daemon = canonicalize_root(&root_daemon).unwrap();
         let registry = RepoRegistry::new(allow_temp_config());
-        let before_daemon = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
 
         let _h1 = registry.get_or_open(&root_daemon).unwrap();
         let _h2 = registry.get_or_open(&root_daemon).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_spawns(&key_daemon, 1).await;
+        settle().await;
 
-        let after_daemon = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
         assert_eq!(
-            after_daemon - before_daemon,
+            watcher_spawns_for_root(&key_daemon),
             1,
             "two get_or_open calls for the same root must produce exactly one watcher"
         );
@@ -1216,12 +1231,13 @@ mod tests {
 
     /// LRU eviction must abort the watcher task so notify-rs threads are cleaned up.
     /// Regression test for orphaned watcher threads causing 600%+ CPU.
+    ///
+    /// Bug caught: the spawn assertions raced the scheduler (fixed 50 ms sleep)
+    /// and parallel spawners (global counter).
     #[tokio::test(flavor = "current_thread")]
     async fn watcher_aborted_on_lru_eviction() {
-        use crate::mcp::server::WATCHER_SPAWN_COUNT;
+        use crate::mcp::server::watcher_spawns_for_root;
         use std::sync::atomic::Ordering;
-
-        let _guard = WATCHER_COUNTER_LOCK.lock().await;
 
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();
@@ -1229,6 +1245,10 @@ mod tests {
         let root1 = make_repo(&tmp1);
         let root2 = make_repo(&tmp2);
         let root3 = make_repo(&tmp3);
+        let keys: Vec<PathBuf> = [&root1, &root2, &root3]
+            .iter()
+            .map(|r| canonicalize_root(r).unwrap())
+            .collect();
 
         let config = DaemonConfig {
             max_active_repos: 2,
@@ -1236,13 +1256,11 @@ mod tests {
         };
         let registry = RepoRegistry::new(config);
 
-        let before = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
-
         // Fill to capacity
         let h1 = registry.get_or_open(&root1).unwrap();
         let _h2 = registry.get_or_open(&root2).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(WATCHER_SPAWN_COUNT.load(Ordering::Relaxed) - before, 2);
+        wait_for_spawns(&keys[0], 1).await;
+        wait_for_spawns(&keys[1], 1).await;
 
         // Make h1 the LRU candidate
         h1.last_access.store(100, Ordering::Relaxed);
@@ -1250,10 +1268,11 @@ mod tests {
 
         // Opening root3 evicts root1; root1's watcher_handle should be aborted
         let _h3 = registry.get_or_open(&root3).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        wait_for_spawns(&keys[2], 1).await;
 
-        // 3 watchers spawned total, but root1's should have been aborted on eviction
-        assert_eq!(WATCHER_SPAWN_COUNT.load(Ordering::Relaxed) - before, 3);
+        // 3 watchers spawned total (one per root), root1's aborted on eviction
+        let total: u64 = keys.iter().map(|k| watcher_spawns_for_root(k)).sum();
+        assert_eq!(total, 3);
         assert_eq!(registry.active_count(), 2);
 
         // The critical invariant: root1's handle was evicted and dropped,
