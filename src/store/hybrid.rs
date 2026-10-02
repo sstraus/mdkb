@@ -189,6 +189,49 @@ pub fn strong_lexical_match(query: &str, entry_text: &str) -> bool {
     shared.len() >= STRONG_LEXICAL_RARE_TERMS
 }
 
+/// Shortest document file stem a prompt word can name on its own, after
+/// [`compact_word`]. "tools", "notes", "plan" and "tracker" are words every
+/// prompt in a repository that has such a file uses in passing; "followup" is
+/// the kind of word nobody writes without meaning that document. Length is the
+/// proxy for the same reason as [`RARE_TERM_LEN`]: no index lookup on the
+/// `UserPromptSubmit` path.
+const STEM_NAME_MIN_LEN: usize = 8; // characters, not bytes
+
+/// Lowercased letters and digits of `word`, one trailing plural `s` dropped:
+/// `follow-up,` and `followups` both become `followup`.
+fn compact_word(word: &str) -> String {
+    let mut compact: String = word
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    if compact.chars().count() > 3 && compact.ends_with('s') {
+        compact.pop();
+    }
+    compact
+}
+
+/// True when a word of `query` is the file stem of `path`, ignoring hyphens,
+/// case and a plural `s` — an Italian prompt asking about "follow-up" names
+/// `followups.md` although [`strong_lexical_match`] sees two unrelated words.
+///
+/// A stem shorter than [`STEM_NAME_MIN_LEN`] never counts. The caller must
+/// still pair this with a cosine: naming a file is evidence the prompt is
+/// about it only when the embedding does not say otherwise.
+pub fn names_file_stem(query: &str, path: &str) -> bool {
+    let Some(stem) = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(compact_word)
+    else {
+        return false;
+    };
+    stem.chars().count() >= STEM_NAME_MIN_LEN
+        && query
+            .split_whitespace()
+            .any(|word| compact_word(word) == stem)
+}
+
 /// The words of `query` that look like code rather than prose, lowercased.
 ///
 /// Split on whitespace, not on punctuation: `content_tokens` would turn
@@ -557,5 +600,61 @@ mod tests {
                 "length must be preserved for len={len}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod file_stem_critic_tests {
+    use super::*;
+
+    /// Catches: the length floor counting bytes, not characters. "qualità" is
+    /// seven letters, like "tracker" — a word every prompt uses in passing —
+    /// but eight bytes, so it clears `STEM_NAME_MIN_LEN` and an Italian or
+    /// Cyrillic stem admits a document on any prompt that uses the word.
+    #[test]
+    fn a_short_accented_stem_is_not_evidence() {
+        assert!(!names_file_stem(
+            "controlla la qualità del codice",
+            "qualità.md"
+        ));
+        assert!(!names_file_stem("обнови заметки", "заметки.md"));
+    }
+
+    /// Control for the case above: a stem of eight characters with an accent
+    /// is long enough, so the fix for bytes-vs-characters must not over-shoot.
+    #[test]
+    fn an_eight_letter_accented_stem_is_evidence() {
+        assert!(names_file_stem("aggiorna attività", "attività.md"));
+    }
+
+    /// Catches: a hyphenated prompt word that is only a prefix or a superset
+    /// of the stem matching (`follow-up-tests` vs `followups`).
+    #[test]
+    fn only_the_whole_stem_names_the_file() {
+        assert!(!names_file_stem("follow-up-tests", "followups.md"));
+        assert!(!names_file_stem("followupsandmore", "followups.md"));
+        assert!(!names_file_stem("follow up", "followups.md"));
+        assert!(names_file_stem("(Follow-Up)", "docs/Followups.md"));
+    }
+
+    /// Catches: an empty or extension-only path, or a prompt made of
+    /// punctuation, folding to the empty string and matching it.
+    #[test]
+    fn empty_inputs_name_nothing() {
+        assert!(!names_file_stem("followups", ""));
+        assert!(!names_file_stem("--- ... !!!", ""));
+        assert!(!names_file_stem("", "followups.md"));
+        assert!(!names_file_stem("--- ...", "---.md"));
+    }
+
+    /// Catches: the stem arm leaking into the shared lexical gate that memory
+    /// recall uses. `strong_lexical_match` must keep seeing "follow-up" and
+    /// "followups" as unrelated words.
+    #[test]
+    fn strong_lexical_match_does_not_fold_hyphens_or_plurals() {
+        assert!(!strong_lexical_match(
+            "ci sono follow-up aperti?",
+            "followups.md Verifiche dovute a Boss"
+        ));
     }
 }
