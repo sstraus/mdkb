@@ -1,11 +1,12 @@
-//! `mdkb repos` subcommands: `refresh`.
+//! `mdkb repos` subcommands: `list`, `refresh`.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use crate::cli::RefreshFilter;
+use crate::cli::{OutputFormat, RefreshFilter};
 use crate::core::refresh::{RefreshReport, RefreshStatus, refresh_outdated};
 use crate::daemon::config::DaemonConfig;
+use crate::daemon::repo_listing::{list_repos, render_text};
 use crate::daemon::repo_map::{discover_nested_stores, read_known_roots};
 use crate::error::{Error, Result};
 
@@ -19,6 +20,30 @@ fn stores_in_scope() -> Result<Vec<PathBuf>> {
     Ok(discover_nested_stores(&known, &ignore)
         .into_iter()
         .collect())
+}
+
+/// The daemon's own list when one runs (the one source `daemon status` also
+/// reads), otherwise the persisted map. Neither walks the disk, and a daemon
+/// that is running but does not answer is an error, not a reason to guess.
+async fn known_roots() -> Result<Vec<PathBuf>> {
+    match crate::cli::daemon::running_daemon_repos().await {
+        Ok(Some(roots)) => Ok(roots),
+        Ok(None) => Ok(read_known_roots(
+            &DaemonConfig::daemon_home().join("repos.json"),
+        )),
+        Err(e) => Err(Error::other(format!(
+            "the running daemon did not list its repos: {e}"
+        ))),
+    }
+}
+
+pub async fn handle_list(format: OutputFormat) -> Result<()> {
+    let rows = list_repos(&known_roots().await?);
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
+        _ => print!("{}", render_text(&rows)),
+    }
+    Ok(())
 }
 
 pub fn handle_refresh(only: RefreshFilter) -> Result<()> {

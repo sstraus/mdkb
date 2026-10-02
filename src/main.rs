@@ -1894,6 +1894,7 @@ root=\"*\"                                                # every known repo (`m
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
         Command::Repos(cmd) => match cmd {
+            ReposCommand::List => mdkb::cli::repos::handle_list(cli.format).await?,
             ReposCommand::Refresh { only } => mdkb::cli::repos::handle_refresh(only)?,
         },
         Command::Hook(hook_cmd) => match hook_cmd {
