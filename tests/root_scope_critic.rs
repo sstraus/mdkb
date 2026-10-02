@@ -564,3 +564,34 @@ async fn an_unparsable_daemon_toml_keeps_the_startup_rules() {
     .await;
     assert_eq!(count, 0, "startup rules lost: {text}");
 }
+
+// ---------------------------------------------------------------------------
+// Round 4
+// ---------------------------------------------------------------------------
+
+/// Catches: a root recorded while `repos.json` was unreadable never reaching
+/// the file. `record` is idempotent, so once the file is whole again opening
+/// the same root costs no write, and only a DIFFERENT new root triggers a
+/// persist. After a restart the root is gone from the map and the only trace
+/// was one warning in a log.
+#[test]
+fn a_root_recorded_during_a_broken_repos_json_is_persisted_once_it_is_whole() {
+    let tmp = TempDir::new().unwrap();
+    let a = store(tmp.path(), "a", "zonk_a");
+    let b = store(tmp.path(), "b", "zonk_b");
+    let map = tmp.path().join("repos.json");
+    write_map(&map, &[(&a, None)]);
+    let repo_map = RepoMap::open(Some(map.clone()), &[]);
+
+    std::fs::write(&map, "{ \"version\": 1, \"repos\": [ {").unwrap();
+    repo_map.record(&b); // not persisted: the file is mid-edit
+    write_map(&map, &[(&a, None)]); // the edit is finished
+    repo_map.record(&b); // the daemon opens the same repo again
+
+    let reopened = RepoMap::open(Some(map), &[]);
+    assert!(
+        reopened.roots().contains(&b),
+        "the root opened during the broken window is lost: {:?}",
+        reopened.roots()
+    );
+}
