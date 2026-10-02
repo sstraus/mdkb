@@ -246,6 +246,10 @@ pub struct RepoMap {
     /// cheap; a map replaced by an empty one because this binary could not
     /// parse it is a set of repos nobody can get back.
     replaceable: bool,
+    /// A persist was skipped or failed, so the file lags the set in memory.
+    /// `record` retries while this is set, even for a root already known: the
+    /// root that was recorded during a bad moment is otherwise never written.
+    dirty: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for RepoMap {
@@ -304,6 +308,7 @@ impl RepoMap {
             path,
             roots: Mutex::new(triaged.kept),
             replaceable: read.replaceable,
+            dirty: std::sync::atomic::AtomicBool::new(false),
         };
         // Persist only when the set on disk is not the set in hand: every CLI
         // hook builds a registry, and rewriting an unchanged map on each one
@@ -317,14 +322,16 @@ impl RepoMap {
     }
 
     /// Record a root the registry has just opened. Idempotent: a root already
-    /// on the map costs no write.
+    /// on the map costs no write, unless an earlier write was skipped or failed
+    /// and the file still lags the set.
     pub fn record(&self, root: &Path) {
         let key = canonical_key(root);
         let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-        if !roots.insert(key.clone()) {
+        if roots.insert(key.clone()) {
+            tracing::info!(root = %key.display(), "Recorded repo on the map");
+        } else if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        tracing::info!(root = %key.display(), "Recorded repo on the map");
         self.persist(&roots);
     }
 
@@ -372,15 +379,18 @@ impl RepoMap {
                     path = %path.display(),
                     "Not persisting the repo map: it cannot be read right now ({why}); the set is correct in memory only"
                 );
+                self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
                 return;
             }
         };
-        if let Err(e) = write_atomic(path, roots, &scopes) {
+        let failed = write_atomic(path, roots, &scopes).map_err(|e| {
             tracing::warn!(
                 path = %path.display(),
                 "Could not persist the repo map: {e} — the set is still correct in memory"
             );
-        }
+        });
+        self.dirty
+            .store(failed.is_err(), std::sync::atomic::Ordering::Relaxed);
     }
 }
 
