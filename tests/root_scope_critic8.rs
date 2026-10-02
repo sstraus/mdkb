@@ -236,5 +236,9 @@ fn repos_list_succeeds_with_no_repos_json() {
         .output()
         .unwrap();
 
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
