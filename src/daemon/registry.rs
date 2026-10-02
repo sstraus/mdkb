@@ -464,6 +464,15 @@ impl RepoRegistry {
         self.repo_map.roots()
     }
 
+    /// The roots a listing shows: [`known_roots`](Self::known_roots) minus what
+    /// `daemon.toml` ignores, sorted. The one list `daemon status`, `repos list`
+    /// and the `repos` tool all read.
+    pub fn listed_roots(&self) -> Vec<PathBuf> {
+        let mut roots: std::collections::BTreeSet<_> = self.known_roots().into_iter().collect();
+        self.retain_unignored(&mut roots);
+        roots.into_iter().collect()
+    }
+
     /// Known roots plus stores nested below them, found by a read-only
     /// filesystem walk. Discovery does not add handles or persist map entries.
     pub fn discoverable_roots(&self) -> Vec<PathBuf> {

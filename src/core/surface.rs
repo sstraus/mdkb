@@ -105,6 +105,11 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
         cli_command: Some("metrics show"),
         note: "",
     },
+    SurfaceEntry {
+        mcp_tool: "repos",
+        cli_command: Some("repos list"),
+        note: "Same rows, same renderer; `--format json` is CLI only.",
+    },
 ];
 
 /// The CLI command for an MCP tool name.

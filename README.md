@@ -124,7 +124,7 @@ commands, run on this repository. See [Retrieval eval](#retrieval-eval),
 [Stats](#stats) and [Developer Telemetry Profile](#developer-telemetry-profile).
 
 Also included: two knowledge graphs (frontmatter and wikilink relations for
-docs, typed relations for memory), 12 annotated MCP tools with a CLI twin for
+docs, typed relations for memory), 13 annotated MCP tools with a CLI twin for
 each (`mdkb surface`), self-maintaining indexes with integrity checks and
 repair, and store namespaces so a consumer's test suite cannot pollute its own
 memory.
@@ -342,6 +342,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `memory_confirm` | Atomic Bayesian signal without rewriting content — `outcome="confirmed"` bumps `confirmations` and `last_confirmed_at`; `"refuted"` bumps `corrections`, stamps `last_refuted_at`, and stops the entry being injected unasked until it is reconfirmed |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
+| `repos` | Known repos, one row each: name, kind, doc/memory/symbol counts, index freshness, health. Same rows as `mdkb repos list` |
 | `usage` | Session and lifetime token ledger (per-tool call counts, token totals, truncation stats) |
 
 Every advertised tool includes MCP annotations for read-only, destructive,

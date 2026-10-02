@@ -974,6 +974,27 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
     }
+
+    /// List the repos mdkb knows, with counts, freshness and health.
+    #[tool(
+        description = "List known repos: name, kind, doc/memory/symbol counts, index freshness, health.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn repos(
+        &self,
+        Parameters(_): Parameters<EmptyObject>,
+    ) -> Result<CallToolResult, McpError> {
+        let output = super::dispatch::repos_impl(self.registry.as_deref()).await?;
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("repos", tokens, 1, false).await;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(output)]))
+    }
 }
 
 /// Convert a `file://` URI to a local filesystem path.
@@ -2569,10 +2590,12 @@ mod tests {
     /// Measured 2026-09-20: 3880 tokens over 12 tools, then 3680 once story
     /// 126-5dab moved the `root` grammar out of 13 field descriptions and into
     /// `mdkb cheatsheet`. A richer grammar must not cost more on every request,
-    /// so the ceiling came DOWN with the payload.
+    /// so the ceiling came DOWN with the payload. Story 220-711b added the 13th
+    /// tool, `repos` (Boss decision 2026-10-02: AI Chat reaches mdkb over MCP
+    /// only), and the ceiling rose by that one schema.
     #[test]
     fn tools_list_payload_token_budget() {
-        const BUDGET: usize = 3700;
+        const BUDGET: usize = 3820;
 
         let tools = McpServer::tool_router().list_all();
         let payload = serde_json::to_string(&tools).expect("tools serialize");
@@ -2590,7 +2613,7 @@ mod tests {
         let tools = McpServer::tool_router().list_all();
         assert_eq!(
             tools.len(),
-            12,
+            13,
             "the annotation audit must cover every tool"
         );
         let read_only = [
@@ -2601,6 +2624,7 @@ mod tests {
             "code_graph",
             "graph",
             "usage",
+            "repos",
         ];
 
         for tool in &tools {
