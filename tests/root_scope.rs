@@ -318,3 +318,54 @@ async fn star_leaves_claude_sessions_out_and_star_all_includes_them() {
         .expect("search");
     assert!(count >= 1 && all.contains("sid-chunk-001"), "{all}");
 }
+
+/// Catches: a `repos.json` that is mid-edit (or unreadable) silently dropping
+/// every override for that call. A repo moved into work flips back to its home
+/// prefix and `*` answers a work question from home. The last good scopes stay.
+#[test]
+fn a_repos_json_that_cannot_be_read_keeps_the_last_good_scopes() {
+    let world = world();
+    let moved = store(&world.home_dir, "moved", "moved_needle");
+    let map = world.state.join("repos.json");
+    std::fs::write(
+        &map,
+        json!({"version": 1, "repos": [{"root": moved, "scope": "work"}]}).to_string(),
+    )
+    .expect("write repos.json");
+    let registry = registry(&world);
+    assert_eq!(
+        registry.scope_policy().scope_of(&moved),
+        Some("work"),
+        "control"
+    );
+
+    std::fs::write(&map, "{ \"version\": 1, \"repos\": [ {").expect("half-written edit");
+
+    assert_eq!(
+        registry.scope_policy().scope_of(&moved),
+        Some("work"),
+        "a half-written repos.json dropped the override"
+    );
+}
+
+/// Catches: the CLI matching prefix rules against the main worktree as the
+/// linked worktree's `.git` file spells it. When that path goes through a
+/// symlink it is not the canonical spelling the rules use, so the caller has no
+/// scope and `*` excludes nothing.
+#[test]
+fn the_cli_caller_root_is_canonical_after_following_a_worktree_to_its_main() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let base = mdkb::domain::canonicalize_plain(tmp.path()).expect("canonicalize");
+    let main = base.join("real/w");
+    std::fs::create_dir_all(main.join(".git/worktrees/x")).expect("main .git");
+    std::os::unix::fs::symlink(base.join("real"), base.join("link")).expect("symlink");
+    let wt = base.join("elsewhere/wt");
+    std::fs::create_dir_all(&wt).expect("worktree dir");
+    std::fs::write(
+        wt.join(".git"),
+        format!("gitdir: {}/link/w/.git/worktrees/x\n", base.display()),
+    )
+    .expect(".git file");
+
+    assert_eq!(mdkb::cli::repos::caller_root(&wt), main);
+}

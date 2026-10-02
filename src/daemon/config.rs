@@ -247,7 +247,16 @@ impl DaemonConfig {
                 let scope = rule.scope.trim();
                 let path = absolute_entry(rule.prefix.trim_end());
                 if path.is_none() || scope.is_empty() {
-                    dropped.push(rule.prefix.as_str());
+                    // One warning per distinct rule for the life of the
+                    // process: rules are read on every wildcard search.
+                    static WARNED: std::sync::Mutex<Vec<(String, String)>> =
+                        std::sync::Mutex::new(Vec::new());
+                    let key = (rule.prefix.clone(), rule.scope.clone());
+                    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+                    if !warned.contains(&key) {
+                        warned.push(key);
+                        dropped.push(rule.prefix.as_str());
+                    }
                     return None;
                 }
                 path.map(|p| (p, scope.to_string()))

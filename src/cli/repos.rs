@@ -1,7 +1,7 @@
 //! `mdkb repos` subcommands: `list`, `refresh`.
 
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::cli::{OutputFormat, RefreshFilter};
 use crate::core::refresh::{RefreshReport, RefreshStatus, refresh_outdated};
@@ -58,16 +58,22 @@ pub async fn resolve_roots(raw: &str) -> Result<ScopedRoots> {
     }
     let config = DaemonConfig::load_or_default(&DaemonConfig::daemon_home().join("daemon.toml"))?;
     let caller: Vec<PathBuf> = std::env::current_dir()
-        .map(|cwd| {
-            let cwd = crate::domain::canonicalize_plain(&cwd).unwrap_or(cwd);
-            // As the MCP side does: a linked worktree has its main one's scope.
-            crate::git::resolve_main_worktree(&cwd)
-        })
+        .map(|cwd| caller_root(&cwd))
         .into_iter()
         .collect();
     selector
         .resolve_scoped(&known, &[], &ScopePolicy::load(&config), &caller)
         .map_err(Error::other)
+}
+
+/// Where a caller working in `cwd` is, as a scope is looked up: canonical, and
+/// a linked worktree is its main one — canonical again, because the main path is
+/// as the worktree's `.git` file wrote it, which a symlink can make differ from
+/// the spelling the prefix rules were canonicalized to.
+pub fn caller_root(cwd: &Path) -> PathBuf {
+    let canonical =
+        |p: &Path| crate::domain::canonicalize_plain(p).unwrap_or_else(|_| p.to_path_buf());
+    canonical(&crate::git::resolve_main_worktree(&canonical(cwd)))
 }
 
 pub async fn handle_list(format: OutputFormat) -> Result<()> {

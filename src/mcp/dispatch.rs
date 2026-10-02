@@ -1947,12 +1947,18 @@ pub fn resolve_root_selector(
     } else {
         open
     };
+    // Only the selectors that filter by scope pay for reading it.
+    let policy = if selector.is_wildcard() {
+        registry.scope_policy()
+    } else {
+        crate::daemon::scope::ScopePolicy::default()
+    };
     let ScopedRoots {
         roots,
         excluded,
         include_sessions,
     } = selector
-        .resolve_scoped(&known, &open, &registry.scope_policy(), scope)
+        .resolve_scoped(&known, &open, &policy, scope)
         .map_err(mcp_error)?;
     let mapped: std::collections::BTreeSet<std::path::PathBuf> = registry
         .known_roots()

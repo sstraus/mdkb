@@ -203,16 +203,27 @@ fn triage(roots: BTreeSet<PathBuf>) -> Triage {
 /// Read without triage or a write-back, like [`read_known_roots`]; a file that
 /// cannot be read or parsed has none.
 pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return BTreeMap::new();
+    try_read_scope_overrides(path).unwrap_or_else(|why| {
+        tracing::warn!(path = %path.display(), "Reading scopes from the repo map failed: {why}");
+        BTreeMap::new()
+    })
+}
+
+/// [`read_scope_overrides`] that says when it could not read: a file that is
+/// absent has no scopes, one that is unreadable or not valid JSON (a hand edit
+/// in progress) is an error, so a caller can keep what it last knew.
+pub fn try_read_scope_overrides(path: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(e.to_string()),
     };
-    let Ok(file) = serde_json::from_str::<RepoMapFile>(&content) else {
-        return BTreeMap::new();
-    };
-    file.repos
+    let file = serde_json::from_str::<RepoMapFile>(&content).map_err(|e| e.to_string())?;
+    Ok(file
+        .repos
         .into_iter()
         .filter_map(|r| Some((canonical_key(Path::new(&r.root)), clean_scope(&r.scope?)?)))
-        .collect()
+        .collect())
 }
 
 /// A scope name as declared: trimmed, and blank means none was declared, so
