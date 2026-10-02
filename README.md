@@ -701,7 +701,8 @@ out and states its coverage.
 One daemon answers about every repository it knows. The map of known roots
 lives in `repos.json`, is seeded from `[[repos]]` in `daemon.toml`, is extended
 by every store the daemon opens, and survives a restart. `mdkb daemon status`
-lists the known and the discoverable roots separately.
+asks the running daemon for that list over its socket, so it answers at once
+and never walks the disk; with no daemon running it says so and lists nothing.
 
 The MCP `root` parameter says which repositories a call means:
 

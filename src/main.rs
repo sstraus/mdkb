@@ -1889,7 +1889,7 @@ root=\"*\"                                                # every known repo (`m
             }
         },
         Command::Daemon(cmd) => match cmd {
-            DaemonCommand::Status => daemon_cli::handle_status()?,
+            DaemonCommand::Status => daemon_cli::handle_status().await?,
             DaemonCommand::Stop => daemon_cli::handle_stop().await?,
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },

@@ -336,23 +336,17 @@ fn daemon_status_still_reports_when_daemon_toml_does_not_parse() {
     );
 }
 
-/// Catches: the CLI listing (`daemon status`) not honouring `ignore` or the
-/// `.tmp` skip while the MCP path does: two answers to "which repos exist".
+/// Catches: `daemon status` going back to reading `repos.json` and walking the
+/// disk (story 210-b83b): with no daemon running it must list no repo at all,
+/// not the known roots or the stores nested under them.
 #[cfg(unix)]
 #[test]
-fn daemon_status_lists_neither_ignored_stores_nor_tmp_copies() {
+fn daemon_status_without_a_daemon_lists_no_repos_from_disk() {
     let home = tempfile::tempdir().unwrap();
     let repos = tempfile::tempdir().unwrap();
     let parent = plant(&repos.path().join("parent"));
-    let kept = plant(&parent.join("kept"));
-    let silenced = plant(&parent.join("silenced"));
-    let copy = plant(&parent.join(".tmp/cov-audit/kept"));
+    let nested = plant(&parent.join("kept"));
     std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
-    std::fs::write(
-        home.path().join(".mdkb/daemon.toml"),
-        format!("ignore = [{:?}]\n", silenced.to_string_lossy()),
-    )
-    .unwrap();
     std::fs::write(
         home.path().join(".mdkb/repos.json"),
         format!(
@@ -372,12 +366,9 @@ fn daemon_status_lists_neither_ignored_stores_nor_tmp_copies() {
         .unwrap();
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains(&kept.display().to_string()), "{stdout}");
-    assert!(
-        !stdout.contains(&silenced.display().to_string()),
-        "{stdout}"
-    );
-    assert!(!stdout.contains(&copy.display().to_string()), "{stdout}");
+    assert!(stdout.contains("not running"), "{stdout}");
+    assert!(!stdout.contains(&parent.display().to_string()), "{stdout}");
+    assert!(!stdout.contains(&nested.display().to_string()), "{stdout}");
 }
 
 // ── critic round 2 ──────────────────────────────────────────────────────────

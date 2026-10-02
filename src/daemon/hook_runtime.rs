@@ -83,6 +83,11 @@ pub(crate) async fn drain_in_flight_work(
 /// for a refusal — silently changes when the CLI is allowed to write.
 pub const DISPATCHED_ERROR_CODE: i32 = -32603;
 
+/// Method `mdkb daemon status` uses to ask the running daemon which repos it
+/// knows. Like `ping` it names no repository, so it is answered before the
+/// `params.root` requirement and never opens a store.
+pub const REPOS_METHOD: &str = "daemon.repos";
+
 /// Parse a JSON-RPC request and route it through the shared dispatch layer.
 ///
 /// `params.root` is the absolute target repository path for every method except
@@ -115,6 +120,17 @@ pub(crate) async fn dispatch_hook_message(
 
     if method.is_empty() {
         return rpc_error(id, -32600, "missing 'method'");
+    }
+
+    if method == REPOS_METHOD {
+        let mut roots: std::collections::BTreeSet<_> = registry.known_roots().into_iter().collect();
+        registry.retain_unignored(&mut roots);
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "roots": roots },
+        })
+        .to_string();
     }
 
     let Some(root) = params.get("root").and_then(Value::as_str) else {

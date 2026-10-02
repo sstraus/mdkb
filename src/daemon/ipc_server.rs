@@ -712,6 +712,61 @@ mod tests {
         assert!(resp.contains(env!("CARGO_PKG_VERSION")));
     }
 
+    async fn repos_reply(registry: &Arc<RepoRegistry>) -> Value {
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"{}","params":{{}}}}"#,
+            crate::daemon::hook_runtime::REPOS_METHOD
+        );
+        let resp = dispatch_hook_message(body.as_bytes(), registry, &make_dctx()).await;
+        serde_json::from_str(&resp).unwrap()
+    }
+
+    /// Catches: `daemon status` listing stores the daemon never registered. The
+    /// answer is the daemon's map; a store merely lying below a known root is
+    /// found only by a disk walk, which is what this method replaced. Also
+    /// catches the method demanding `params.root` like a repo call does.
+    #[tokio::test]
+    async fn repos_method_answers_from_the_map_without_a_root_or_a_walk() {
+        let tmp = TempDir::new().unwrap();
+        let outer = tmp.path().join("outer");
+        let nested = outer.join("nested");
+        std::fs::create_dir_all(outer.join(".mdkb")).unwrap();
+        std::fs::create_dir_all(nested.join(".mdkb")).unwrap();
+        std::fs::write(nested.join(".mdkb/index.sqlite"), b"").unwrap();
+        let registry = make_registry();
+        registry.get_or_open(&outer).unwrap();
+
+        let reply = repos_reply(&registry).await;
+
+        let canonical = outer.canonicalize().unwrap();
+        assert_eq!(reply["result"]["roots"], serde_json::json!([canonical]));
+    }
+
+    /// Catches: a root `daemon.toml` ignores still showing up in status, while
+    /// every other listing of the daemon hides it.
+    #[tokio::test]
+    async fn repos_method_omits_ignored_roots() {
+        let tmp = TempDir::new().unwrap();
+        let silenced = tmp.path().join("silenced");
+        std::fs::create_dir_all(silenced.join(".mdkb")).unwrap();
+        let registry = Arc::new(RepoRegistry::new(DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            ignore: vec![
+                silenced
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+            ..DaemonConfig::default()
+        }));
+        registry.get_or_open(&silenced).unwrap();
+
+        let reply = repos_reply(&registry).await;
+
+        assert_eq!(reply["result"]["roots"], serde_json::json!([]));
+    }
+
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
         let tmp = TempDir::new().unwrap();

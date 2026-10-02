@@ -622,6 +622,31 @@ async fn call_daemon_phased(
     ensure_daemon_running(socket_path)
         .await
         .map_err(|e| Unstarted(format!("daemon unavailable: {e}")))?;
+    call_connected(socket_path, method, params, timeout).await
+}
+
+/// Ask the daemon that is already running one question, without ever starting
+/// one. `daemon status` is the command run when the daemon is suspect, so it
+/// must report an absent daemon rather than spawn it.
+#[cfg(unix)]
+pub async fn call_running_daemon(
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> std::result::Result<Value, String> {
+    call_connected(&hook_socket_path(), method, params, timeout)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(unix)]
+async fn call_connected(
+    socket_path: &Path,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> std::result::Result<Value, MutationFailure> {
+    use MutationFailure::{Undetermined, Unstarted};
 
     let mut stream = UnixStream::connect(socket_path)
         .await
