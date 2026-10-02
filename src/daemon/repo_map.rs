@@ -362,8 +362,20 @@ impl RepoMap {
         }
         // The scopes are written by hand, and this process never records one:
         // read them back from the file so a rewrite for a new root cannot erase
-        // them.
-        if let Err(e) = write_atomic(path, roots, &read_scope_overrides(path)) {
+        // them. A file that cannot be read is a hand edit in progress: writing
+        // over it would destroy that edit and every scope in it, so the write
+        // waits for the next persist, which finds the file whole.
+        let scopes = match try_read_scope_overrides(path) {
+            Ok(scopes) => scopes,
+            Err(why) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Not persisting the repo map: it cannot be read right now ({why}); the set is correct in memory only"
+                );
+                return;
+            }
+        };
+        if let Err(e) = write_atomic(path, roots, &scopes) {
             tracing::warn!(
                 path = %path.display(),
                 "Could not persist the repo map: {e} — the set is still correct in memory"

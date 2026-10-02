@@ -465,11 +465,13 @@ impl RepoRegistry {
     /// `repos.json` that cannot be read right now (a hand edit in progress)
     /// keeps the last policy that could.
     pub fn scope_policy(&self) -> super::scope::ScopePolicy {
+        // Read first, lock after: the mutex guards the swap, not the file reads.
+        let loaded = super::scope::ScopePolicy::try_load(&self.daemon_config);
         let mut last = self
             .last_scope_policy
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        match super::scope::ScopePolicy::try_load(&self.daemon_config) {
+        match loaded {
             Ok(policy) => {
                 *last = Some(policy.clone());
                 policy
