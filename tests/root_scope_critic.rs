@@ -471,3 +471,96 @@ fn the_cli_scopes_a_linked_worktree_by_its_main_worktree() {
         "from the linked worktree: {err}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 3
+// ---------------------------------------------------------------------------
+
+/// Catches: the daemon's own rewrite (recording a new root) replacing a
+/// `repos.json` that fails to parse right now. Its owner is mid-edit; the
+/// rewrite reads no scopes from it and writes a file without any, so the
+/// edit and every hand-written scope are gone. Opening a corrupt map moves it
+/// aside instead; a rewrite must not do worse.
+#[test]
+fn recording_a_root_does_not_destroy_a_repos_json_that_is_mid_edit() {
+    let tmp = TempDir::new().unwrap();
+    let a = store(tmp.path(), "a", "zonk_a");
+    let b = store(tmp.path(), "b", "zonk_b");
+    let map = tmp.path().join("repos.json");
+    write_map(&map, &[(&a, Some("work"))]);
+    let repo_map = RepoMap::open(Some(map.clone()), &[]);
+
+    std::fs::write(
+        &map,
+        format!(
+            "{{\"version\":1,\"repos\":[{{\"root\":\"{}\",\"scope\":\"work\"",
+            a.display()
+        ),
+    )
+    .unwrap();
+    repo_map.record(&b);
+
+    let survivors: String = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+    assert!(
+        survivors.contains("\"scope\":\"work\""),
+        "the half-written edit and its scope are gone: {survivors}"
+    );
+}
+
+/// Catches: a `[[scopes]]` rule added to `daemon.toml` while the daemon runs
+/// not applying (only `repos.json` was re-read). A HOME repo then stays in
+/// WORK answers until a restart.
+#[tokio::test]
+async fn a_rule_added_to_daemon_toml_after_startup_applies() {
+    let tmp = TempDir::new().unwrap();
+    let state = dir(tmp.path(), "state");
+    let work = dir(tmp.path(), "work");
+    let home = dir(tmp.path(), "homes");
+    let h = store(&home, "h", "zonk_h");
+    let mut cfg = config(&state, &work, &home);
+    cfg.scopes.clear();
+    let registry = Arc::new(RepoRegistry::new(cfg));
+    registry.get_or_open(&h).unwrap();
+    let caller = vec![work.clone()];
+
+    std::fs::write(
+        state.join("daemon.toml"),
+        format!(
+            "[[scopes]]\nprefix = \"{}\"\nscope = \"work\"\n\n[[scopes]]\nprefix = \"{}\"\nscope = \"home\"\n",
+            work.display(),
+            home.display()
+        ),
+    )
+    .unwrap();
+
+    let (text, count) = answer(&registry, &search("*", "memory", "zonk_h"), &caller).await;
+    assert_eq!(count, 0, "the rule added at runtime was ignored: {text}");
+}
+
+/// Catches: an unparsable `daemon.toml` (hand edit in progress) making the
+/// fresh read fall back to NO rules instead of the rules the daemon started
+/// with: every HOME repo then answers a WORK question.
+#[tokio::test]
+async fn an_unparsable_daemon_toml_keeps_the_startup_rules() {
+    let tmp = TempDir::new().unwrap();
+    let state = dir(tmp.path(), "state");
+    let work = dir(tmp.path(), "work");
+    let home = dir(tmp.path(), "homes");
+    let h = store(&home, "h", "zonk_h");
+    let registry = Arc::new(RepoRegistry::new(config(&state, &work, &home)));
+    registry.get_or_open(&h).unwrap();
+    std::fs::write(state.join("daemon.toml"), "[[scopes]\nprefix = ").unwrap();
+
+    let (text, count) = answer(
+        &registry,
+        &search("*", "memory", "zonk_h"),
+        std::slice::from_ref(&work),
+    )
+    .await;
+    assert_eq!(count, 0, "startup rules lost: {text}");
+}
