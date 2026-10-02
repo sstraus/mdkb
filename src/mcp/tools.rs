@@ -49,7 +49,8 @@ pub enum RootSelector {
     Default,
     /// `*` — every known root in the caller's scope, plus the roots with none.
     All,
-    /// `*:all` — every known root, whatever its scope.
+    /// `*:all` — every known root, whatever its scope, and the `claude_sessions`
+    /// collections `*` leaves out.
     AllScopes,
     /// `scope:NAME` — the known roots whose scope is `NAME`.
     Scope(String),
@@ -149,7 +150,8 @@ impl RootSelector {
     /// `*` leaves out the roots whose scope differs from the caller's and counts
     /// them; a root with no scope is always kept, and a caller with no scope
     /// excludes nothing. `*:all` keeps every root. `scope:NAME` keeps the roots
-    /// scoped `NAME`. `caller` is where the caller works: its MCP roots, or its
+    /// scoped `NAME`. Session transcripts stay out of every selector but `*:all`.
+    /// `caller` is where the caller works: its MCP roots, or its
     /// working directory.
     pub fn resolve_scoped(
         &self,
@@ -177,6 +179,7 @@ impl RootSelector {
         Ok(ScopedRoots {
             roots: keep,
             excluded: excluded.len(),
+            include_sessions: matches!(self, Self::AllScopes),
         })
     }
 
@@ -237,6 +240,9 @@ impl RootSelector {
 pub struct ScopedRoots {
     pub roots: Vec<PathBuf>,
     pub excluded: usize,
+    /// Do the searches over `roots` include `claude_sessions` collections?
+    /// Only `*:all` says yes; every other selector keeps them out.
+    pub include_sessions: bool,
 }
 
 /// The repos a `root`-less call means, given the workspace the client declared.

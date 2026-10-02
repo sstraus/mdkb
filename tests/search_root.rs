@@ -217,6 +217,64 @@ fn several_repos_are_refused_where_no_merged_answer_exists() {
     );
 }
 
+/// Catches: the CLI and MCP disagreeing on transcripts. `*` must not print a
+/// `claude_sessions` hit; `*:all` must.
+#[test]
+fn a_star_leaves_claude_sessions_out_and_star_all_includes_them() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "unrelated_thing");
+    {
+        let ctx = Context::open(&alpha).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        mdkb::store::collections::add_collection(
+            &ctx.conn,
+            &mdkb::domain::Collection {
+                name: "claude_sessions".to_string(),
+                path: "./no-such-dir".to_string(),
+                pattern: "**/*".to_string(),
+                source: mdkb::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
+        let content = "Transcript where we discussed ledger_sync at length.";
+        let doc = mdkb::domain::Document {
+            id: 0,
+            collection: "claude_sessions".to_string(),
+            relative_path: "sid-chunk-001".to_string(),
+            hash: mdkb::store::documents::compute_hash(content),
+            title: Some("Session about ledger_sync".to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+            status: Some("current".to_string()),
+        };
+        mdkb::store::documents::index_document(&ctx.conn, &doc, content).unwrap();
+    }
+    let home = home_knowing(tmp.path(), &[&alpha]);
+
+    let default = search(
+        &home,
+        &alpha,
+        &["ledger_sync", "--scope", "docs", "--root", "*"],
+    );
+    assert!(default.status.success(), "{default:?}");
+    assert!(
+        !stdout(&default).contains("sid-chunk-001"),
+        "{}",
+        stdout(&default)
+    );
+
+    let all = search(
+        &home,
+        &alpha,
+        &["ledger_sync", "--scope", "docs", "--root", "*:all"],
+    );
+    assert!(all.status.success(), "{all:?}");
+    assert!(stdout(&all).contains("sid-chunk-001"), "{}", stdout(&all));
+}
+
 /// Catches: the CLI skipping the scope rule the MCP side applies. `--root '*'`
 /// from a work directory must not print the home repo's hit and must say it left
 /// one out; `'*:all'` must print both.

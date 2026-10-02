@@ -1496,7 +1496,7 @@ root=\"name\"                                             # one repo by name, th
 root=\"parent/name\"                                     # the same, by trailing path components: how a name several repos share is told apart
 root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
 root=\"*\"                                                # every known repo in the caller's scope, plus repos with no scope; the footer counts the rest (Excluded by scope: N)
-root=\"*:all\"                                            # every known repo, scopes mixed
+root=\"*:all\"                                            # every known repo, scopes mixed, and the claude_sessions collections `*` leaves out
 root=\"scope:home\"                                       # the known repos whose scope is home
 # Scope: `[[scopes]] prefix = \"~/Gits/home\"` / `scope = \"home\"` in daemon.toml, or `\"scope\"` on a repos.json entry (wins over the prefix).
 # Only `search` fans out; every other tool needs a selector naming one repo —
@@ -2133,8 +2133,21 @@ async fn run_search_roots(
 ) -> mdkb::error::Result<()> {
     use mdkb::mcp::tools::SearchScope;
 
-    let mdkb::mcp::tools::ScopedRoots { roots, excluded } =
-        mdkb::cli::repos::resolve_roots(raw_root).await?;
+    let mdkb::mcp::tools::ScopedRoots {
+        roots,
+        excluded,
+        include_sessions,
+    } = mdkb::cli::repos::resolve_roots(raw_root).await?;
+    // Session transcripts are a second table in the answer, which only the
+    // human formats can carry.
+    let sessions_pass = include_sessions
+        && req.collection.is_none()
+        && matches!(req.scope.as_deref(), None | Some("docs"));
+    if sessions_pass && !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        return Err(mdkb::Error::other(format!(
+            "--root {raw_root} includes claude_sessions as a second table; use --format text or markdown."
+        )));
+    }
     let several = roots.len() > 1;
     if several {
         let single_store_scope = req.scope.as_deref().is_some_and(|s| {
@@ -2163,6 +2176,14 @@ async fn run_search_roots(
         let ctx = open_reader(root)?;
         announce_no_collections(&ctx)?;
         run_search(root, &ctx, req.clone(), format)?;
+        if sessions_pass {
+            let sessions = SearchRequest {
+                collection: Some(mdkb::domain::COLLECTION_CLAUDE_SESSIONS.to_string()),
+                scope: Some("docs".to_string()),
+                ..req.clone()
+            };
+            run_search(root, &ctx, sessions, format)?;
+        }
     }
     if excluded > 0 {
         eprintln!("Excluded by scope: {excluded} (--root '*:all' mixes scopes)");

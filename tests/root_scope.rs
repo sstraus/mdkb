@@ -52,6 +52,37 @@ fn store(parent: &Path, name: &str, needle: &str) -> PathBuf {
     root
 }
 
+/// Index one `claude_sessions` document about `needle` into the store at `root`.
+fn seed_session(root: &Path, needle: &str) {
+    let ctx = Context::open(root).expect("open store");
+    let now = chrono::Utc::now().timestamp();
+    mdkb::store::collections::add_collection(
+        &ctx.conn,
+        &mdkb::domain::Collection {
+            name: "claude_sessions".to_string(),
+            path: "./no-such-dir".to_string(),
+            pattern: "**/*".to_string(),
+            source: mdkb::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+            created_at: now,
+            updated_at: now,
+        },
+    )
+    .expect("add collection");
+    let content = format!("Transcript where we discussed {needle} at length.");
+    let doc = mdkb::domain::Document {
+        id: 0,
+        collection: "claude_sessions".to_string(),
+        relative_path: "sid-chunk-001".to_string(),
+        hash: mdkb::store::documents::compute_hash(&content),
+        title: Some(format!("Session about {needle}")),
+        metadata: None,
+        file_modified_at: now,
+        indexed_at: now,
+        status: Some("current".to_string()),
+    };
+    mdkb::store::documents::index_document(&ctx.conn, &doc, &content).expect("index session");
+}
+
 /// `home/` and `work/` prefixes, one store under each, and one under `free/`
 /// that no rule covers.
 struct World {
@@ -262,4 +293,28 @@ fn a_repos_json_scope_survives_the_map_being_rewritten() {
         .find(|r| r["root"] == json!(moved))
         .unwrap_or_else(|| panic!("moved entry missing: {text}"));
     assert_eq!(entry["scope"], "work", "{text}");
+}
+
+fn docs_search(query: &str, root: &str) -> SearchParams {
+    serde_json::from_value(json!({"query": query, "root": root, "scope": "docs", "limit": 10}))
+        .expect("search params")
+}
+
+/// Catches: Claude transcripts leaking into `*` (they are not documentation),
+/// and `*:all` having no way to reach them.
+#[tokio::test]
+async fn star_leaves_claude_sessions_out_and_star_all_includes_them() {
+    let world = world();
+    seed_session(&world.free_store, "ledger_sync");
+    let registry = registry(&world);
+
+    let (default, _) = cross_repo_search_impl(&registry, &docs_search("ledger_sync", "*"), &[])
+        .await
+        .expect("search");
+    assert!(!default.contains("sid-chunk-001"), "{default}");
+
+    let (all, count) = cross_repo_search_impl(&registry, &docs_search("ledger_sync", "*:all"), &[])
+        .await
+        .expect("search");
+    assert!(count >= 1 && all.contains("sid-chunk-001"), "{all}");
 }
