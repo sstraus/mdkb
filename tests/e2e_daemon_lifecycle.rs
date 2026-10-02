@@ -106,6 +106,62 @@ fn detach_survives_parent_exit() {
     let _ = wait_until(Duration::from_secs(5), || !pid_alive(pid));
 }
 
+/// Catches: `daemon status` guessing a repo list from the disk, or spawning a
+/// daemon, when none runs. With no daemon it must say so, list no repos and
+/// leave no socket or pid behind.
+#[test]
+fn status_without_a_daemon_says_so_and_starts_nothing() {
+    let home = prepare_home();
+
+    let out = mdkb(&home)
+        .arg("daemon")
+        .arg("status")
+        .output()
+        .expect("daemon status");
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    assert!(out.status.success(), "status must exit 0: {text}");
+    assert!(text.contains("not running"), "{text}");
+    assert!(text.contains("repos:      unknown"), "{text}");
+    assert!(
+        !text.contains("[known]") && !text.contains("[discovered]"),
+        "{text}"
+    );
+    assert!(!hook_socket(home.path()).exists(), "status must not spawn");
+    assert!(read_pid(home.path()).is_none(), "status must not spawn");
+}
+
+/// Catches: `daemon status` skipping the daemon query against a running
+/// daemon: the socket answer must be reported, not "unknown" or an error.
+#[test]
+fn status_lists_the_repos_the_running_daemon_holds() {
+    let home = prepare_home();
+    let start = mdkb(&home)
+        .args(["serve", "--daemon", "--detach"])
+        .output()
+        .expect("spawn daemon");
+    assert!(start.status.success());
+    assert!(wait_until(Duration::from_secs(5), || {
+        hook_socket(home.path()).exists()
+    }));
+
+    let out = mdkb(&home).args(["daemon", "status"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let pid = read_pid(home.path()).expect("pid file");
+    // SAFETY: kill is safe; SIGTERM is well-defined.
+    unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let _ = wait_until(Duration::from_secs(5), || !pid_alive(pid));
+
+    assert!(text.contains("running (pid"), "{text}");
+    assert!(text.contains("repos:      "), "{text}");
+    assert!(
+        !text.contains("unavailable"),
+        "the query must succeed: {text}"
+    );
+    assert!(!text.contains("unknown"), "{text}");
+}
+
 /// `mdkb daemon status` → `stop` → ensure sockets and pid file are gone.
 /// Then `restart` brings the daemon back.
 #[test]

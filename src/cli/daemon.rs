@@ -14,6 +14,11 @@ use crate::error::{Error, Result};
 #[cfg(unix)]
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Maximum time `status` waits for the daemon to list its repos. The answer is
+/// an in-memory read, so a daemon that misses this is wedged, and status says so.
+#[cfg(unix)]
+const STATUS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Maximum time `restart` waits for the fresh daemon's sockets to appear.
 #[cfg(unix)]
 const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -39,7 +44,10 @@ mod platform {
     use crate::daemon::singleton::{default_lock_path, read_pid};
     use crate::error::{Error, Result};
 
-    use super::{RESTART_READY_TIMEOUT, STOP_TIMEOUT, format_duration, process_alive, signal_term};
+    use super::{
+        RESTART_READY_TIMEOUT, STATUS_QUERY_TIMEOUT, STOP_TIMEOUT, format_duration, process_alive,
+        signal_term,
+    };
 
     struct DaemonState {
         lock_path: PathBuf,
@@ -84,11 +92,32 @@ mod platform {
         }
     }
 
+    /// The daemon's own repo list, over the hook socket. `None` when no daemon
+    /// runs: status never walks the disk to guess, and never starts a daemon.
+    async fn query_repos(running: bool) -> std::result::Result<Option<Vec<PathBuf>>, String> {
+        if !running {
+            return Ok(None);
+        }
+        let result = crate::cli::hook_client::call_running_daemon(
+            crate::daemon::hook_runtime::REPOS_METHOD,
+            &serde_json::json!({}),
+            STATUS_QUERY_TIMEOUT,
+        )
+        .await?;
+        let roots = result
+            .get("roots")
+            .cloned()
+            .ok_or_else(|| "response missing 'roots'".to_string())?;
+        serde_json::from_value(roots)
+            .map(Some)
+            .map_err(|e| format!("bad 'roots': {e}"))
+    }
+
     fn present(p: &Path) -> &'static str {
         if p.exists() { "(present)" } else { "(absent)" }
     }
 
-    pub fn handle_status() -> Result<()> {
+    pub async fn handle_status() -> Result<()> {
         let s = DaemonState::probe();
         if let Some(pid) = s.running_pid() {
             println!("mdkb daemon: running (pid {pid})");
@@ -103,28 +132,18 @@ mod platform {
         println!("  base:       {}", s.base_dir.display());
         // Status is the command run when something is wrong: an unparsable
         // daemon.toml is reported, never a reason to print nothing.
-        let ignore = match crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml")) {
-            Ok(config) => config.ignored_paths(),
-            Err(e) => {
-                println!("  warning:    daemon.toml not applied, ignore list empty: {e}");
-                Vec::new()
+        if let Err(e) = crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml")) {
+            println!("  warning:    daemon.toml does not parse, the daemon cannot apply it: {e}");
+        }
+        match query_repos(s.running_pid().is_some()).await {
+            Ok(Some(known)) => {
+                println!("  repos:      {} known", known.len());
+                for root in &known {
+                    println!("    [known] {}", root.display());
+                }
             }
-        };
-        let mut known = crate::daemon::repo_map::read_known_roots(&s.base_dir.join("repos.json"));
-        known.retain(|root| !crate::daemon::repo_map::is_ignored(root, &ignore));
-        let discoverable = crate::daemon::repo_map::discover_nested_stores(&known, &ignore);
-        println!(
-            "  repos:      {} known, {} discoverable",
-            known.len(),
-            discoverable.len()
-        );
-        for root in &discoverable {
-            let status = if known.contains(root) {
-                "known"
-            } else {
-                "discovered"
-            };
-            println!("    [{status}] {}", root.display());
+            Ok(None) => println!("  repos:      unknown (daemon not running)"),
+            Err(e) => println!("  repos:      unavailable: {e}"),
         }
         println!(
             "  mcp  sock:  {} {}",
@@ -198,7 +217,7 @@ mod platform {
 pub use platform::{handle_restart, handle_status, handle_stop};
 
 #[cfg(not(unix))]
-pub fn handle_status() -> Result<()> {
+pub async fn handle_status() -> Result<()> {
     Err(Error::other("Daemon commands require Unix"))
 }
 
