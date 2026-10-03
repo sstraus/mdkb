@@ -2053,6 +2053,7 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-typescript",
  "walkdir",
+ "winapi-util",
  "zerocopy 0.7.35",
 ]
 

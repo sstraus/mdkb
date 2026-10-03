@@ -87,9 +87,10 @@ struct ProbeRecord {
 /// [`ensure_sound_locked`].
 static PROCESS_VERIFIED: Mutex<Option<HashMap<PathBuf, ProbeRecord>>> = Mutex::new(None);
 
-/// Device and inode of `path`: the file itself, not its name, so a torn file
-/// renamed over the store never inherits the verdict of the one it replaced.
-/// `None` where the platform offers no such identity; nothing is then trusted.
+/// Device and inode of `path` (volume serial and file index on Windows): the
+/// file itself, not its name, so a torn file renamed over the store never
+/// inherits the verdict of the one it replaced. `None` where the platform
+/// offers no such identity; nothing is then trusted.
 #[cfg(unix)]
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -97,7 +98,13 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let info = winapi_util::file::information(std::fs::File::open(path).ok()?).ok()?;
+    Some((info.volume_serial_number(), info.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn file_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -2860,6 +2867,8 @@ mod critic_201b_r4 {
 
     /// Catches: a probe verdict for the OLD file recorded after the store was
     /// replaced (quarantine + rebuild) while the probe ran.
+    // Unix only: Windows refuses to rename a database file SQLite holds open.
+    #[cfg(unix)]
     #[test]
     fn a_replaced_database_gets_no_verdict_from_the_old_file_probe() {
         let dir = tempfile::tempdir().unwrap();

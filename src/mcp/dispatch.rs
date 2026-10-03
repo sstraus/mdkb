@@ -17608,6 +17608,8 @@ mod tests {
 
     /// Catches: admitting each row separately rewrites and fsyncs writer-lock
     /// metadata for every row, making a queued batch exceed its drain budget.
+    // Unix only: Windows locks the writer sidecar mandatorily, so the rows cannot read it.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_batch_preserves_one_writer_admission_between_rows() {
         let tmp = TempDir::new().unwrap();
@@ -17640,6 +17642,8 @@ mod tests {
 
     /// Catches: an unlimited admitted batch holds off foreign CLI writers for
     /// its entire backlog instead of releasing admission after 64 rows.
+    // Unix only: Windows locks the writer sidecar mandatorily, so the rows cannot read it.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_bursts_release_writer_admission_after_sixty_four_rows() {
         let tmp = TempDir::new().unwrap();
@@ -19088,6 +19092,8 @@ mod tests {
     /// into two batches, 65 rows still one batch), or a batch boundary that
     /// reorders, drops or duplicates rows. Rows are queued while the slot is
     /// held, so the drain sees the whole backlog at once.
+    // Unix only: Windows locks the writer sidecar mandatorily, so the rows cannot read it.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn critic_r7_batches_split_exactly_at_the_cap_and_keep_row_order() {
         let cases: [(usize, &[usize]); 7] = [

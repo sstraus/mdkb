@@ -520,14 +520,19 @@ whitelist_dirs = ["~/Code"]
     /// never reaches discovery; and a bare `~` left unexpanded.
     #[test]
     fn ignore_in_toml_text_reaches_the_config_and_expands_a_bare_tilde() {
-        let config: DaemonConfig =
-            toml::from_str("ignore = [\"/a/.tmp\", \"~\", \"~/x\"]").unwrap();
-        assert_eq!(config.ignore, vec!["/a/.tmp", "~", "~/x"]);
         let home = home_dir().unwrap();
+        // Absolute on every platform: "/a/.tmp" has no drive on Windows and is dropped.
+        let abs = home.join("a").join(".tmp");
+        let config: DaemonConfig =
+            toml::from_str(&format!("ignore = ['{}', \"~\", \"~/x\"]", abs.display())).unwrap();
+        assert_eq!(
+            config.ignore,
+            vec![abs.display().to_string(), "~".into(), "~/x".into()]
+        );
         assert_eq!(
             config.ignored_paths(),
             vec![
-                PathBuf::from("/a/.tmp"),
+                abs,
                 crate::domain::canonicalize_plain(&home).unwrap_or(home.clone()),
                 home.join("x"),
             ]
