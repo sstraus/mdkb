@@ -98,7 +98,7 @@ jobs:
 
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v6
 
@@ -112,7 +112,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-glibc2.35-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Test GLIBC compatibility check
+        run: python3 scripts/tests/test_check_glibc.py
 
       - name: Build release
         run: cargo build --release
+
+      - name: Check Linux GLIBC compatibility
+        run: scripts/check-glibc.sh target/release/mdkb 2.35

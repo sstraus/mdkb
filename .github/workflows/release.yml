@@ -39,13 +39,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux builds use Ubuntu 22.04 to keep the GLIBC floor at 2.35.
           # Linux x64
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: linux-x64
           # Linux ARM64 (native ARM64 runner)
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             name: linux-arm64
           # macOS x64 (cross-compiled from ARM64 runner)
           - target: x86_64-apple-darwin
@@ -74,6 +75,10 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
+
+      - name: Check Linux GLIBC compatibility
+        if: startsWith(matrix.os, 'ubuntu')
+        run: scripts/check-glibc.sh target/${{ matrix.target }}/release/mdkb 2.35
 
       # Package binary
       - name: Package binary (Linux)
