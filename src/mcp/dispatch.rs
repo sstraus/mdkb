@@ -16918,6 +16918,95 @@ mod tests {
         );
     }
 
+    /// Waits for a queued write to run or not, on a paused clock: yields and
+    /// lets the blocking pool finish without moving virtual time.
+    async fn settle_blocking() {
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Catches (#209-bc4b): a queued write that polls the startup reindex past
+    /// its cap and then opens the store under the flag (a second context over a
+    /// store being rebuilt), or wedges holding the slot lock. At the cap the
+    /// write is given up: it never runs, the slot stays empty and unlocked.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_write_is_given_up_at_the_reindex_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "cap test", move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
+        settle_blocking().await;
+
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the write ran under the flag"
+        );
+        let guard = handle.ctx.try_lock().expect("the slot lock was left held");
+        assert!(guard.is_none(), "the store was opened under the flag");
+    }
+
+    /// Catches (#209-bc4b): the wait for the reindex being a fixed delay or the
+    /// cap, so a reindex that ends after minutes still loses its queued write
+    /// or delays it to the cap. Released at 300 s, the write lands at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_write_lands_when_the_reindex_ends_before_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "release test", move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        settle_blocking().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "ran during the reindex");
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        settle_blocking().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the write was lost");
+        assert!(
+            handle.ctx.lock().await.is_some(),
+            "the write did not open the slot"
+        );
+    }
+
+    /// Catches (#209-bc4b): the hook's recall leg waiting for the reindex that
+    /// its ledger write waits for. `record_recall` returns without advancing
+    /// the clock.
+    #[tokio::test(start_paused = true)]
+    async fn record_recall_does_not_wait_for_the_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()),
+        )
+        .await;
+        assert!(done.is_ok(), "the hook waited for the reindex");
+    }
+
     /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
     /// so a hook arriving while the startup reindex owns the store (slot taken
     /// out, flag set) opens a second context over it; and the opposite, a flag

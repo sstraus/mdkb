@@ -278,7 +278,30 @@ fn parallel_listing_keeps_the_order_of_the_roots() {
         if i % 3 == 0 {
             assert_eq!(row.health, Health::Gone, "row {i}");
         } else {
-            assert_eq!(row.docs, Some((60 - i) as i64), "row {i} carries another store");
+            assert_eq!(
+                row.docs,
+                Some((60 - i) as i64),
+                "row {i} carries another store"
+            );
+        }
+    }
+}
+
+/// Catches (#210-b83b): an off-by-one in the worker count or the index hand-out
+/// of the threaded listing — an empty list panicking or a single root missing.
+#[test]
+fn threaded_listing_handles_no_roots_one_root_and_one_more_than_the_width() {
+    assert!(list_repos(&[]).is_empty());
+
+    let dir = TempDir::new().unwrap();
+    for count in [1usize, 9] {
+        let roots: Vec<PathBuf> = (0..count)
+            .map(|i| store(dir.path(), &format!("n{count}-{i}"), i + 1, 1))
+            .collect();
+        let rows = list_repos(&roots);
+        assert_eq!(rows.len(), count);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.docs, Some(i as i64 + 1), "{count} roots, row {i}");
         }
     }
 }
