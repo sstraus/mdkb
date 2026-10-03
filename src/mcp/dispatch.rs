@@ -17115,6 +17115,164 @@ mod tests {
         assert!(drained.is_ok(), "the waiter left its queue behind");
     }
 
+    fn counting_write(
+        ran: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static {
+        let ran = Arc::clone(ran);
+        move |_| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out: {what}");
+    }
+
+    /// Catches (#209-bc4b): the waiter dropping its queue entry in a step apart
+    /// from the check that the queue is empty, so a write pushed while the
+    /// waiter exits (or while a batch runs) joins a queue nobody drains and is
+    /// lost. 8 tasks push 50 writes each against a free slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_pushed_while_the_waiter_drains_and_exits_are_all_run() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let pushers: Vec<_> = (0..8)
+            .map(|_| {
+                let (handle, ran) = (Arc::clone(&handle), Arc::clone(&ran));
+                tokio::spawn(async move {
+                    for _ in 0..50 {
+                        write_behind_slot(SlotOpener::of(&handle), "stress", counting_write(&ran));
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        for pusher in pushers {
+            pusher.await.unwrap();
+        }
+        wait_until("every pushed write ran", || {
+            ran.load(Ordering::SeqCst) >= 400
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            400,
+            "a write ran twice or was lost"
+        );
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue entry is removed", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+    }
+
+    /// Catches (#209-bc4b): writes of one slot running out of the order they
+    /// were queued in (a batch drained from the back, or each hook racing its
+    /// own task for the lock). The ledger keeps rows in insertion order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_writes_run_in_the_order_they_were_queued() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..20usize {
+            let order = Arc::clone(&order);
+            write_behind_slot(SlotOpener::of(&handle), "order", move |_| {
+                order.lock().unwrap().push(i);
+                Ok(())
+            });
+        }
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        wait_until("all 20 ran", || order.lock().unwrap().len() == 20).await;
+        assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
+    }
+
+    /// Catches (#209-bc4b): the cap path leaving its queue entry marked as
+    /// owned by a waiter that is gone, so every later write joins a queue
+    /// nobody drains; or replaying the writes it gave up on once the reindex is
+    /// over. Three writes are given up at the cap; one queued afterwards runs
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_cap_the_queue_is_clear_and_later_writes_run_alone() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..3 {
+            write_behind_slot(SlotOpener::of(&handle), "capped", counting_write(&ran));
+        }
+        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
+        settle_blocking().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        assert!(
+            !deferred_writes().contains_key(&key),
+            "the cap left a queue entry behind"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        write_behind_slot(SlotOpener::of(&handle), "after", counting_write(&ran));
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        settle_blocking().await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "lost, or the capped writes came back"
+        );
+    }
+
+    /// Catches (#209-bc4b): a waiter cancelled with its runtime (shutdown, or
+    /// an aborted task) leaving `waiting` set under the slot's address, so a
+    /// later write on that slot, or on a new slot allocated at the same
+    /// address, joins a queue nobody drains and is never run.
+    #[test]
+    fn a_waiter_cancelled_with_its_runtime_does_not_swallow_later_writes() {
+        let build = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let tmp = TempDir::new().unwrap();
+        let first = build();
+        let handle = first.block_on(async {
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            *handle.ctx.lock().await = None;
+            handle.doc_reindex_active.store(true, Ordering::Relaxed);
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            write_behind_slot(SlotOpener::of(&handle), "doomed", counting_write(&ran));
+            handle
+        });
+        drop(first);
+
+        let second = build();
+        second.block_on(async {
+            handle.doc_reindex_active.store(false, Ordering::Relaxed);
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            write_behind_slot(SlotOpener::of(&handle), "later", counting_write(&ran));
+            wait_until("a write queued after a cancelled waiter ran", || {
+                ran.load(Ordering::SeqCst) == 1
+            })
+            .await;
+        });
+    }
+
     /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
     /// so a hook arriving while the startup reindex owns the store (slot taken
     /// out, flag set) opens a second context over it; and the opposite, a flag
