@@ -8,9 +8,10 @@
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
@@ -56,14 +57,37 @@ pub struct RepoRow {
     pub detail: Option<String>,
 }
 
+/// How many rows are read at once.
+const LISTING_WIDTH: usize = 8;
+
 /// The rows for `roots`, in the order given.
 ///
 /// Each row opens two stores, scans their tables and runs up to three `git`
 /// processes, so a sequential walk over ~30 repos took 0.5 s idle and 7 s under
-/// load (#210-b83b). The rows are independent, so they are read in parallel;
-/// the order of the result does not depend on which finishes first.
+/// load (#210-b83b). The rows are independent, so a few threads read them at
+/// once; each row lands at the index of its root. Plain threads, not rayon:
+/// the global rayon pool is capped to one worker once an embedder starts, and
+/// a daemon listing would then queue behind embedding batches.
 pub fn list_repos(roots: &[PathBuf]) -> Vec<RepoRow> {
-    roots.par_iter().map(|root| repo_row(root)).collect()
+    let next = AtomicUsize::new(0);
+    let rows: Mutex<Vec<Option<RepoRow>>> = Mutex::new(vec![None; roots.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..LISTING_WIDTH.min(roots.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(root) = roots.get(i) else { break };
+                    let row = repo_row(root);
+                    rows.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(row);
+                }
+            });
+        }
+    });
+    rows.into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn repo_row(root: &Path) -> RepoRow {

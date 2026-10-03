@@ -711,31 +711,43 @@ fn open_handle_context(
     ctx_guard: &mut Option<Context>,
     handle: &RepoHandle,
 ) -> Result<(), McpError> {
-    open_slot(
-        ctx_guard,
-        &handle.root,
-        &handle.doc_reindex_active,
-        &handle.reindex_tx,
-    )
+    if ctx_guard.is_none() {
+        SlotOpener::of(handle).open(ctx_guard)?;
+    }
+    Ok(())
 }
 
-/// [`open_handle_context`] on the parts of the handle it reads, so a task that
-/// outlives the call can open the slot too ([`warm_slot_in_background`]).
-fn open_slot(
-    ctx_guard: &mut Option<Context>,
-    root: &std::path::Path,
-    doc_reindex_active: &AtomicBool,
-    reindex_tx: &tokio::sync::mpsc::Sender<std::path::PathBuf>,
-) -> Result<(), McpError> {
-    if ctx_guard.is_none() {
-        if doc_reindex_active.load(Ordering::Relaxed) {
+/// What opening a repo's slot reads from its handle, owned, so a task that
+/// outlives the hook can open the slot too ([`warm_slot_in_background`],
+/// [`write_behind_slot`]).
+struct SlotOpener {
+    ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
+    root: std::path::PathBuf,
+    doc_reindex_active: Arc<AtomicBool>,
+    reindex_tx: tokio::sync::mpsc::Sender<std::path::PathBuf>,
+}
+
+impl SlotOpener {
+    fn of(handle: &RepoHandle) -> Self {
+        Self {
+            ctx: Arc::clone(&handle.ctx),
+            root: handle.root.clone(),
+            doc_reindex_active: Arc::clone(&handle.doc_reindex_active),
+            reindex_tx: handle.reindex_tx.clone(),
+        }
+    }
+
+    /// Open the context into the locked, empty slot: initializes a store that is
+    /// not there, and heals one that is damaged.
+    fn open(&self, ctx_guard: &mut Option<Context>) -> Result<(), McpError> {
+        if self.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open_reusing_process_probe(root) {
+        let ctx = match Context::open_reusing_process_probe(&self.root) {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
-                tracing::info!("Auto-initializing mdkb at {}", root.display());
-                Context::init(root)
+                tracing::info!("Auto-initializing mdkb at {}", self.root.display());
+                Context::init(&self.root)
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -746,13 +758,13 @@ fn open_slot(
         // file paths post_tool_use injects. Best-effort: a full channel means a
         // rebuild is already queued, which is exactly what we want.
         if ctx.rebuilt_from_corruption {
-            if let Err(e) = reindex_tx.try_send(root.to_path_buf()) {
+            if let Err(e) = self.reindex_tx.try_send(self.root.clone()) {
                 tracing::warn!("failed to schedule post-heal reindex: {e}");
             }
         }
         *ctx_guard = Some(ctx);
+        Ok(())
     }
-    Ok(())
 }
 
 /// Open an empty slot off the hook's path. The first open of a store in this
@@ -760,19 +772,22 @@ fn open_slot(
 /// a copy of cerebro, 2026-10-03), and a hook that opened inline paid it as its
 /// context phase (#209-bc4b). The task holds the slot while it opens, so a hook
 /// arriving meanwhile finds it busy and reads through its own read-only context.
+///
+/// Nothing is spawned while the startup document reindex owns the store: the
+/// slot is empty then by design, and comes back when the reindex finishes.
 fn warm_slot_in_background(handle: &RepoHandle) {
-    let ctx = Arc::clone(&handle.ctx);
-    let root = handle.root.clone();
-    let doc_reindex_active = Arc::clone(&handle.doc_reindex_active);
-    let reindex_tx = handle.reindex_tx.clone();
+    if handle.doc_reindex_active.load(Ordering::Relaxed) {
+        return;
+    }
+    let opener = SlotOpener::of(handle);
     tokio::spawn(async move {
-        let mut guard = ctx.lock_owned().await;
+        let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
         if guard.is_some() {
             return;
         }
         let opened = tokio::task::spawn_blocking(move || {
             let _hold = crate::core::SlotHold::start("warm open");
-            open_slot(&mut guard, &root, &doc_reindex_active, &reindex_tx)
+            opener.open(&mut guard)
         })
         .await;
         match opened {
@@ -957,7 +972,7 @@ impl HookStore {
     /// Callable from a blocking thread.
     fn write_or_defer(
         &mut self,
-        ctx: &Arc<tokio::sync::Mutex<Option<Context>>>,
+        opener: SlotOpener,
         what: &'static str,
         f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
     ) {
@@ -965,7 +980,7 @@ impl HookStore {
             Self::Slot(guard, _) => {
                 log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
             }
-            Self::Bypass(_) => write_behind_slot(Arc::clone(ctx), what, f),
+            Self::Bypass(_) => write_behind_slot(opener, what, f),
         }
     }
 }
@@ -980,20 +995,39 @@ fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
     }
 }
 
+/// Longest a queued write waits for the startup document reindex to hand the
+/// store back before it is given up on.
+const WRITE_BEHIND_REINDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// Queue a small write behind whatever holds the slot, off the caller's path.
+///
+/// The write is never lost to an empty slot: it waits out the startup document
+/// reindex (which owns the store, flag set, and gives it back), and opens the
+/// slot itself when it is still empty once it holds it, so it does not depend
+/// on the order against a background open.
 fn write_behind_slot(
-    ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
+    opener: SlotOpener,
     what: &'static str,
     f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
 ) {
     tokio::spawn(async move {
-        let mut guard = ctx.lock_owned().await;
+        let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
+        while opener.doc_reindex_active.load(Ordering::Relaxed)
+            && tokio::time::Instant::now() < give_up
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
         let written = tokio::task::spawn_blocking(move || {
-            crate::core::run_guarded_write(&mut guard, what, f)
+            if guard.is_none() {
+                opener.open(&mut guard)?;
+            }
+            Ok::<_, McpError>(crate::core::run_guarded_write(&mut guard, what, f))
         })
         .await;
         match written {
-            Ok(outcome) => log_slot_write(what, outcome),
+            Ok(Ok(outcome)) => log_slot_write(what, outcome),
+            Ok(Err(error)) => tracing::warn!("{what} dropped: {}", error.message),
             Err(error) => tracing::warn!("{what} task failed: {error}"),
         }
     });
@@ -4709,8 +4743,8 @@ async fn record_recall(
             "recall ledger",
             crate::core::run_guarded_write(&mut guard, "recall ledger", record),
         ),
-        // Busy, or still empty while the background open runs.
-        _ => write_behind_slot(Arc::clone(&handle.ctx), "recall ledger", record),
+        // Busy, or empty: the queued write opens the slot itself if need be.
+        _ => write_behind_slot(SlotOpener::of(handle), "recall ledger", record),
     }
 }
 
@@ -5898,7 +5932,7 @@ async fn hook_user_prompt_submit_impl_timed(
         // await. It runs on the blocking pool instead, owning the store guard,
         // so the deadline can drop the wait. A cut search still finishes there
         // and releases the store; it has no side effect the deadline must undo.
-        let ctx_arc = Arc::clone(&handle.ctx);
+        let opener = SlotOpener::of(handle);
         let (q, prompt_owned, embedding) = (q.clone(), prompt.to_string(), query_embedding.clone());
         let root = handle.root.clone();
         let telemetry = handle.config.telemetry.clone();
@@ -5997,7 +6031,7 @@ async fn hook_user_prompt_submit_impl_timed(
                 };
                 if !ev.query_hash.is_empty() {
                     let retention_days = telemetry.retention_days;
-                    store.write_or_defer(&ctx_arc, "query event telemetry", move |ctx| {
+                    store.write_or_defer(opener, "query event telemetry", move |ctx| {
                         stats::record_query_event(&ctx.conn, &ev, retention_days).map(|_| ())
                     });
                 }
@@ -16842,6 +16876,46 @@ mod tests {
                 "attempt {attempt}: the recall row of a prompt on an empty slot was lost"
             );
         }
+    }
+
+    /// Catches (#209-bc4b): a recall row queued while the startup document
+    /// reindex owns the store (slot empty, flag set) being dropped with "the
+    /// store was closed", and no warm task being spawned per hook meanwhile.
+    /// No warm open exists in this test: the queued write opens the slot itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_row_queued_during_the_startup_reindex_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            handle.ctx.lock().await.is_none(),
+            "the store was opened while the reindex owned it"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let kept = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let guard = handle.ctx.lock().await;
+                    if let Some(ctx) = guard.as_ref() {
+                        if crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap() == 1 {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            kept.is_ok(),
+            "the recall row queued during the reindex was lost"
+        );
     }
 
     /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
