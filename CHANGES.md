@@ -4,6 +4,9 @@
 
 ### Fixed
 
+- **Recall-options evaluation example builds on Windows.** Same platform guard
+  for its Unix resource usage; CPU/RSS fields are JSON null elsewhere. Found by
+  `Test Windows` CI (run 37159661208). Story 267-36db.
 - **Multilingual evaluation example builds on Windows.** Keep Unix resource
   usage behind a platform guard and report unavailable CPU/RSS fields as JSON
   null on other platforms. Found by `Test Windows` CI (run 37149269328), which
