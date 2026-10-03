@@ -3133,7 +3133,11 @@ mod critic_268_file_identity {
         assert_ne!(old, new, "two files share one identity");
         assert_eq!(file_identity(&db), Some(old), "identity is not stable");
         std::fs::rename(&other, &db).unwrap();
-        assert_eq!(file_identity(&db), Some(new), "the path kept the replaced file's identity");
+        assert_eq!(
+            file_identity(&db),
+            Some(new),
+            "the path kept the replaced file's identity"
+        );
     }
 
     /// Catches: a missing file reported with an identity, which would let a
