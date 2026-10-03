@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Multilingual evaluation example builds on Windows.** Keep Unix resource
+  usage behind a platform guard and report unavailable CPU/RSS fields as JSON
+  null on other platforms. Found by `Test Windows` CI (run 37149269328), which
+  failed to compile the Unix-only libc calls before running tests. Story 267-36db.
+
 ## 3.11.2 (2026-10-03)
 
 ### Added

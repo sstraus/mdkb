@@ -9,6 +9,7 @@
 //!
 //! `<data-dir>` holds `corpus.json`, `it_set.json` and `sample.json`. They stay out
 //! of the repository: they quote private prompts and internal documents.
+//! CPU and RSS fields are null on platforms without Unix resource usage.
 
 use std::time::Instant;
 
@@ -44,12 +45,21 @@ fn spec(key: &str) -> Spec {
     }
 }
 
-fn rusage() -> (f64, u64) {
+#[cfg(unix)]
+fn rusage() -> (Option<f64>, Option<u64>) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     // macOS reports ru_maxrss in bytes.
-    (tv(ru.ru_utime) + tv(ru.ru_stime), ru.ru_maxrss as u64)
+    (
+        Some(tv(ru.ru_utime) + tv(ru.ru_stime)),
+        Some(ru.ru_maxrss as u64),
+    )
+}
+
+#[cfg(not(unix))]
+fn rusage() -> (Option<f64>, Option<u64>) {
+    (None, None)
 }
 
 fn pct(sorted: &[f64], p: f64) -> f64 {
@@ -176,9 +186,10 @@ fn main() {
         model.embed(texts.to_vec(), Some(32)).unwrap();
         let wall = t.elapsed().as_secs_f64();
         let (cpu1, _) = rusage();
-        json!({"texts": texts.len(), "wall_s": wall, "cpu_s": cpu1 - cpu0,
+        let cpu = cpu1.zip(cpu0).map(|(end, start)| end - start);
+        json!({"texts": texts.len(), "wall_s": wall, "cpu_s": cpu,
                "wall_ms_per_text": wall * 1e3 / texts.len() as f64,
-               "cpu_ms_per_text": (cpu1 - cpu0) * 1e3 / texts.len() as f64})
+               "cpu_ms_per_text": cpu.map(|s| s * 1e3 / texts.len() as f64)})
     };
     let chunk_batch = batch(&chunk_texts);
     let mem_batch = batch(&mem_texts);
