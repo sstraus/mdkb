@@ -18914,64 +18914,6 @@ mod tests {
             .expect("the row was dropped instead of waiting for the foreign writer")
             .unwrap();
     }
-}
-
-#[cfg(test)]
-mod file_stem_admission_critic_tests {
-    use super::*;
-
-    fn hit(path: &str, cosine: Option<f64>) -> (crate::domain::SearchResult, Option<f64>) {
-        (
-            crate::domain::SearchResult {
-                id: 1,
-                collection: "default".into(),
-                path: path.into(),
-                title: Some("Verifiche dovute a Boss".into()),
-                score: 1.0,
-                snippets: vec![],
-                status: None,
-                superseded_by: None,
-                repo_root: None,
-            },
-            cosine,
-        )
-    }
-
-    /// Catches: the corroboration comparison flipping from `>=` to `>` or
-    /// drifting by one f32 step. The cosines of the store are f32 widened to
-    /// f64, so the floor itself admits and the next f32 below it does not.
-    #[test]
-    fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
-        let floor = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
-        let below = f32::from_bits(floor.to_bits() - 1);
-        let prompt = "i followups aperti";
-        let admit = |c: f32| {
-            admit_doc_hits(vec![hit("followups.md", Some(f64::from(c)))], prompt, 0.55).len()
-        };
-        assert_eq!(admit(floor), 1);
-        assert_eq!(admit(below), 0);
-    }
-
-    /// Catches: a NaN cosine (zero-norm vector) passing the corroboration.
-    #[test]
-    fn a_nan_cosine_does_not_corroborate_a_stem() {
-        let hits = vec![hit("followups.md", Some(f64::NAN))];
-        assert!(admit_doc_hits(hits, "i followups aperti", 0.55).is_empty());
-    }
-
-    /// Catches: the stem arm keying on any hit in the pool instead of the hit
-    /// that is named: a prompt naming `followups.md` admits only that file.
-    #[test]
-    fn the_stem_arm_admits_only_the_named_document() {
-        let hits = vec![
-            hit("decisions.md", Some(0.5)),
-            hit("followups.md", Some(0.5)),
-            hit("orchestration-lessons.md", Some(0.5)),
-        ];
-        let admitted = admit_doc_hits(hits, "i followups aperti", 0.55);
-        assert_eq!(admitted.len(), 1);
-        assert_eq!(admitted[0].path, "followups.md");
-    }
 
     /// Catches (critic r7): an off-by-one in the admission cap (63/64 rows split
     /// into two batches, 65 rows still one batch), or a batch boundary that
@@ -19141,5 +19083,63 @@ mod file_stem_admission_critic_tests {
             !deferred_writes().contains_key(&key)
         })
         .await;
+    }
+}
+
+#[cfg(test)]
+mod file_stem_admission_critic_tests {
+    use super::*;
+
+    fn hit(path: &str, cosine: Option<f64>) -> (crate::domain::SearchResult, Option<f64>) {
+        (
+            crate::domain::SearchResult {
+                id: 1,
+                collection: "default".into(),
+                path: path.into(),
+                title: Some("Verifiche dovute a Boss".into()),
+                score: 1.0,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+                repo_root: None,
+            },
+            cosine,
+        )
+    }
+
+    /// Catches: the corroboration comparison flipping from `>=` to `>` or
+    /// drifting by one f32 step. The cosines of the store are f32 widened to
+    /// f64, so the floor itself admits and the next f32 below it does not.
+    #[test]
+    fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
+        let floor = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
+        let below = f32::from_bits(floor.to_bits() - 1);
+        let prompt = "i followups aperti";
+        let admit = |c: f32| {
+            admit_doc_hits(vec![hit("followups.md", Some(f64::from(c)))], prompt, 0.55).len()
+        };
+        assert_eq!(admit(floor), 1);
+        assert_eq!(admit(below), 0);
+    }
+
+    /// Catches: a NaN cosine (zero-norm vector) passing the corroboration.
+    #[test]
+    fn a_nan_cosine_does_not_corroborate_a_stem() {
+        let hits = vec![hit("followups.md", Some(f64::NAN))];
+        assert!(admit_doc_hits(hits, "i followups aperti", 0.55).is_empty());
+    }
+
+    /// Catches: the stem arm keying on any hit in the pool instead of the hit
+    /// that is named: a prompt naming `followups.md` admits only that file.
+    #[test]
+    fn the_stem_arm_admits_only_the_named_document() {
+        let hits = vec![
+            hit("decisions.md", Some(0.5)),
+            hit("followups.md", Some(0.5)),
+            hit("orchestration-lessons.md", Some(0.5)),
+        ];
+        let admitted = admit_doc_hits(hits, "i followups aperti", 0.55);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].path, "followups.md");
     }
 }
