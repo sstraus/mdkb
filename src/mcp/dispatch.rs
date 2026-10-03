@@ -8356,6 +8356,202 @@ mod tests {
         assert!(!entry_in_scope(&entry, "lattice"));
     }
 
+    // Read actual telemetry rows: cancellation must not strand or reorder them.
+    fn critic_r4_sessions(handle: &RepoHandle) -> Vec<String> {
+        let guard = handle.ctx.try_lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        let sessions = ctx
+            .conn
+            .prepare("SELECT session FROM recall_prompts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        sessions
+    }
+
+    async fn critic_r4_wait_for_sessions(handle: &RepoHandle, count: usize) -> Vec<String> {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(guard) = handle.ctx.try_lock() {
+                    let ctx = guard.as_ref().unwrap();
+                    let rows: i64 = ctx
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM recall_prompts", [], |r| r.get(0))
+                        .unwrap();
+                    if rows == count as i64 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        // A failed case must not leave address-keyed state for another test.
+        if result.is_err() {
+            deferred_writes().remove(&(Arc::as_ptr(&handle.ctx) as usize));
+        }
+        critic_r4_sessions(handle)
+    }
+
+    /// Catches: a waiter cancelled before its first poll never constructs its
+    /// guard, permanently stranding the old and all subsequent telemetry rows.
+    #[test]
+    fn critic_r4_unpolled_waiter_shutdown_does_not_strand_recall_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // record_recall queues without yielding; a current-thread runtime cannot
+        // poll the spawned waiter until this top-level future yields or returns.
+        doomed.block_on(record_recall(
+            &handle,
+            "before-poll",
+            RecallMode::Automatic,
+            0.5,
+            vec![],
+        ));
+        drop(doomed);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(
+                &handle,
+                "after-shutdown",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            drop(held);
+            critic_r4_wait_for_sessions(&handle, 2).await
+        });
+        assert_eq!(
+            sessions,
+            ["before-poll", "after-shutdown"],
+            "unpolled waiter cancellation swallowed recall rows"
+        );
+    }
+
+    /// Catches: the cancellation guard only covers a normally suspended waiter,
+    /// leaving a panicked waiter owning the queue and swallowing later rows.
+    #[test]
+    fn critic_r4_panicked_waiter_does_not_strand_recall_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        // Exercise a real waiter panic: Tokio sleep on a runtime without timers.
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            record_recall(&handle, "before-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        });
+        drop(doomed);
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(&handle, "after-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            drop(held);
+            critic_r4_wait_for_sessions(&handle, 2).await
+        });
+        assert_eq!(sessions, ["before-panic", "after-panic"]);
+    }
+
+    /// Catches: runtime shutdown during a blocking drain lets a cancelled
+    /// predecessor erase its successor queue, or shared handles reorder rows.
+    #[test]
+    fn critic_r4_shared_slot_shutdown_mid_drain_preserves_successor_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let shared = RepoHandle::from_shared(
+            handle.root.clone(),
+            Arc::clone(&handle.ctx),
+            Arc::clone(&handle.code_index),
+            handle.config.clone(),
+            vec![],
+            Arc::clone(&handle.doc_reindex_active),
+            Arc::clone(&handle.code_reindex_active),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "critic mid-drain", move |ctx| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                crate::store::recall_ledger::record_prompt(
+                    &ctx.conn,
+                    &crate::store::recall_ledger::RecallPrompt {
+                        session: "in-flight".into(),
+                        mode: "automatic",
+                        floor: 0.5,
+                        candidate_floor: 0.4,
+                    },
+                    &[],
+                    30,
+                    chrono::Utc::now().timestamp(),
+                )
+                .map(|_| ())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        // Running spawn_blocking work survives shutdown; the async waiter does not.
+        doomed.shutdown_timeout(std::time::Duration::ZERO);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(
+                &shared,
+                "shared-successor",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            tokio::task::yield_now().await;
+            record_recall(
+                &handle,
+                "original-successor",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            release_tx.send(()).unwrap();
+            critic_r4_wait_for_sessions(&handle, 3).await
+        });
+        assert_eq!(
+            sessions,
+            ["in-flight", "shared-successor", "original-successor"]
+        );
+    }
+
     /// Deadline of every test handle that does not set one: far above any
     /// loaded-box recall.
     const CONTENT_TEST_DEADLINE_MS: u64 = 60_000;
