@@ -18137,6 +18137,41 @@ mod tests {
         assert!(rows >= 1, "the joined drain must have written the row");
     }
 
+    /// Catches (critic 265-0caa): the daemon route (no collecting dctx) taking the
+    /// drain handle out of the slot's queue, which makes the next
+    /// `write_behind_slot` see no waiting task and start a second concurrent drain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_prompt_leaves_the_deferred_drain_handle_in_its_queue() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.telemetry.query_events = true;
+        });
+        seed_memory_entry(&handle, "qe-daemon").await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        let dctx = make_dctx();
+        assert!(dctx.background.is_none());
+        dispatch_call(
+            "hook.user_prompt_submit",
+            json!({
+                "prompt": "what do we know about the recall_gate_fixture topic content",
+                "session_id": "s1"
+            }),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("hook");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let kept = deferred_writes()
+            .get(&key)
+            .is_some_and(|queue| queue.waiting.is_some());
+        release.send(()).unwrap();
+        held.await.unwrap();
+        assert!(kept, "the daemon route must not take the drain handle");
+    }
+
     /// Catches (#209-bc4b): the real fallback (a read-only open that fails on a
     /// stale schema, so the hook waits for the slot) running outside the hook's
     /// deadline: the stall seam never exercises it.
