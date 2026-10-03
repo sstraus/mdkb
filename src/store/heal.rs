@@ -3113,3 +3113,34 @@ mod sweep_wrapper_tests {
         assert!(fresh.exists(), "a copy inside the retention is kept");
     }
 }
+
+#[cfg(test)]
+mod critic_268_file_identity {
+    use super::*;
+
+    /// Catches: an identity that names the path instead of the file (a constant,
+    /// or volume serial alone), so a torn file renamed over the store inherits
+    /// the verdict of the one it replaced. Runs on every platform: the Windows
+    /// leg needs no open database, so it can replace the file the Unix-only
+    /// probe test cannot.
+    #[test]
+    fn renaming_another_file_over_a_path_changes_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, other) = (dir.path().join("index.sqlite"), dir.path().join("other"));
+        std::fs::write(&db, b"old").unwrap();
+        std::fs::write(&other, b"new").unwrap();
+        let (old, new) = (file_identity(&db).unwrap(), file_identity(&other).unwrap());
+        assert_ne!(old, new, "two files share one identity");
+        assert_eq!(file_identity(&db), Some(old), "identity is not stable");
+        std::fs::rename(&other, &db).unwrap();
+        assert_eq!(file_identity(&db), Some(new), "the path kept the replaced file's identity");
+    }
+
+    /// Catches: a missing file reported with an identity, which would let a
+    /// verdict be recorded for, and trusted on, a path that holds nothing.
+    #[test]
+    fn a_missing_file_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(file_identity(&dir.path().join("absent")), None);
+    }
+}
