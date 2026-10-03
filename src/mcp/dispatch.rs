@@ -712,14 +712,43 @@ fn open_handle_context(
     handle: &RepoHandle,
 ) -> Result<(), McpError> {
     if ctx_guard.is_none() {
-        if handle.doc_reindex_active.load(Ordering::Relaxed) {
+        SlotOpener::of(handle).open(ctx_guard)?;
+    }
+    Ok(())
+}
+
+/// What opening a repo's slot reads from its handle, owned, so a task that
+/// outlives the hook can open the slot too ([`warm_slot_in_background`],
+/// [`write_behind_slot`]).
+#[derive(Clone)]
+struct SlotOpener {
+    ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
+    root: std::path::PathBuf,
+    doc_reindex_active: Arc<AtomicBool>,
+    reindex_tx: tokio::sync::mpsc::Sender<std::path::PathBuf>,
+}
+
+impl SlotOpener {
+    fn of(handle: &RepoHandle) -> Self {
+        Self {
+            ctx: Arc::clone(&handle.ctx),
+            root: handle.root.clone(),
+            doc_reindex_active: Arc::clone(&handle.doc_reindex_active),
+            reindex_tx: handle.reindex_tx.clone(),
+        }
+    }
+
+    /// Open the context into the locked, empty slot: initializes a store that is
+    /// not there, and heals one that is damaged.
+    fn open(&self, ctx_guard: &mut Option<Context>) -> Result<(), McpError> {
+        if self.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open_reusing_process_probe(&handle.root) {
+        let ctx = match Context::open_reusing_process_probe(&self.root) {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
-                tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
-                Context::init(&handle.root)
+                tracing::info!("Auto-initializing mdkb at {}", self.root.display());
+                Context::init(&self.root)
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -730,13 +759,44 @@ fn open_handle_context(
         // file paths post_tool_use injects. Best-effort: a full channel means a
         // rebuild is already queued, which is exactly what we want.
         if ctx.rebuilt_from_corruption {
-            if let Err(e) = handle.reindex_tx.try_send(handle.root.clone()) {
+            if let Err(e) = self.reindex_tx.try_send(self.root.clone()) {
                 tracing::warn!("failed to schedule post-heal reindex: {e}");
             }
         }
         *ctx_guard = Some(ctx);
+        Ok(())
     }
-    Ok(())
+}
+
+/// Open an empty slot off the hook's path. The first open of a store in this
+/// process runs a full-file `quick_check` (1.2 s on a 418 MB store, measured on
+/// a copy of cerebro, 2026-10-03), and a hook that opened inline paid it as its
+/// context phase (#209-bc4b). The task holds the slot while it opens, so a hook
+/// arriving meanwhile finds it busy and reads through its own read-only context.
+///
+/// Nothing is spawned while the startup document reindex owns the store: the
+/// slot is empty then by design, and comes back when the reindex finishes.
+fn warm_slot_in_background(handle: &RepoHandle) {
+    if handle.doc_reindex_active.load(Ordering::Relaxed) {
+        return;
+    }
+    let opener = SlotOpener::of(handle);
+    tokio::spawn(async move {
+        let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+        if guard.is_some() {
+            return;
+        }
+        let opened = tokio::task::spawn_blocking(move || {
+            let _hold = crate::core::SlotHold::start("warm open");
+            opener.open(&mut guard)
+        })
+        .await;
+        match opened {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("warm open failed: {}", error.message),
+            Err(error) => tracing::warn!("warm open task failed: {error}"),
+        }
+    });
 }
 
 /// Test seam: stalls a hook's acquisitions of its store, for the tests that
@@ -913,7 +973,7 @@ impl HookStore {
     /// Callable from a blocking thread.
     fn write_or_defer(
         &mut self,
-        ctx: &Arc<tokio::sync::Mutex<Option<Context>>>,
+        opener: SlotOpener,
         what: &'static str,
         f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
     ) {
@@ -921,7 +981,7 @@ impl HookStore {
             Self::Slot(guard, _) => {
                 log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
             }
-            Self::Bypass(_) => write_behind_slot(Arc::clone(ctx), what, f),
+            Self::Bypass(_) => write_behind_slot(opener, what, f),
         }
     }
 }
@@ -936,33 +996,206 @@ fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
     }
 }
 
+/// Longest a queued write waits for the startup document reindex to hand the
+/// store back before it is given up on.
+const WRITE_BEHIND_REINDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Admit at most 64 telemetry rows together: a 50-hook burst needs one sync,
+/// while larger backlogs release the writer lock between bounded batches so
+/// a foreign CLI writer need not wait for the entire backlog.
+const WRITE_BEHIND_BATCH_ROWS: usize = 64;
+
+type DeferredWrite = (
+    &'static str,
+    Box<dyn FnOnce(&Context) -> crate::error::Result<()> + Send>,
+);
+
+/// The queue owns both its slot identity and the task draining it. A cancelled
+/// or panicked task is detected on enqueue even if its future was never polled.
+/// Keeping the opener prevents an abandoned queue's address from being reused.
+struct DeferredQueue {
+    opener: SlotOpener,
+    writes: VecDeque<DeferredWrite>,
+    waiting: Option<tokio::task::JoinHandle<()>>,
+    // Some reserves a drain, including the interval before its handle is
+    // published. None means cancellation released the pending queue.
+    generation: Option<Arc<()>>,
+}
+
+/// Queues by slot address; each entry retains the slot's Arc until removed.
+static DEFERRED_WRITES: std::sync::LazyLock<StdMutex<HashMap<usize, DeferredQueue>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn deferred_writes() -> std::sync::MutexGuard<'static, HashMap<usize, DeferredQueue>> {
+    DEFERRED_WRITES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A receipt for one queue generation, constructed before its future exists.
+/// Dropping even an unpolled future retires empty queues and releases pending
+/// queues for another drain, without touching a successor generation.
+struct DeferredDrain {
+    key: usize,
+    generation: Arc<()>,
+}
+
+impl Drop for DeferredDrain {
+    fn drop(&mut self) {
+        let mut queues = deferred_writes();
+        if let Some(queue) = queues.get_mut(&self.key) {
+            if !queue
+                .generation
+                .as_ref()
+                .is_some_and(|generation| Arc::ptr_eq(generation, &self.generation))
+            {
+                return;
+            }
+            if queue.writes.is_empty() {
+                queues.remove(&self.key);
+            } else {
+                queue.waiting = None;
+                queue.generation = None;
+            }
+        }
+    }
+}
+
 /// Queue a small write behind whatever holds the slot, off the caller's path.
+///
+/// The write is never lost to an empty slot: at most one task per slot waits out
+/// the startup document reindex (which owns the store, flag set, and gives it
+/// back), then drains the queue in order, opening the slot itself when it holds
+/// it empty, so nothing depends on the order against a background open.
 fn write_behind_slot(
-    ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
+    opener: SlotOpener,
     what: &'static str,
     f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
 ) {
-    tokio::spawn(async move {
-        let mut guard = ctx.lock_owned().await;
-        let written = tokio::task::spawn_blocking(move || {
-            crate::core::run_guarded_write(&mut guard, what, f)
-        })
-        .await;
-        match written {
-            Ok(outcome) => log_slot_write(what, outcome),
-            Err(error) => tracing::warn!("{what} task failed: {error}"),
+    // Fail before enqueue if called without a runtime, rather than poisoning
+    // the map or dropping a cancellation receipt while its mutex is held.
+    let runtime = tokio::runtime::Handle::current();
+    let key = Arc::as_ptr(&opener.ctx) as usize;
+    let (opener, generation) = {
+        let mut queues = deferred_writes();
+        let queue = queues.entry(key).or_insert_with(|| DeferredQueue {
+            opener,
+            writes: VecDeque::new(),
+            waiting: None,
+            generation: None,
+        });
+        queue.writes.push_back((what, Box::new(f)));
+        if queue.generation.is_some()
+            && queue
+                .waiting
+                .as_ref()
+                .is_none_or(|task| !task.is_finished())
+        {
+            return;
+        }
+        let generation = Arc::new(());
+        queue.generation = Some(Arc::clone(&generation));
+        (queue.opener.clone(), generation)
+    };
+    let drain = DeferredDrain {
+        key,
+        generation: Arc::clone(&generation),
+    };
+    // A shut-down runtime drops the future inside spawn, invoking the receipt.
+    // Spawn outside the map lock so that cleanup can acquire it safely.
+    let task = runtime.spawn(async move {
+        let _drain = drain;
+        let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
+        while opener.doc_reindex_active.load(Ordering::Relaxed)
+            && tokio::time::Instant::now() < give_up
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        loop {
+            let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+            let batch = {
+                let mut queues = deferred_writes();
+                let writes = queues
+                    .get_mut(&key)
+                    .map(|queue| {
+                        let count = queue.writes.len().min(WRITE_BEHIND_BATCH_ROWS);
+                        queue.writes.drain(..count).collect::<VecDeque<_>>()
+                    })
+                    .unwrap_or_default();
+                if writes.is_empty() {
+                    queues.remove(&key);
+                    return;
+                }
+                writes
+            };
+            let opener = SlotOpener::clone(&opener);
+            let written = tokio::task::spawn_blocking(move || {
+                if guard.is_none() {
+                    if let Err(error) = opener.open(&mut guard) {
+                        for (what, _) in &batch {
+                            tracing::warn!("{what} dropped: {}", error.message);
+                        }
+                        return;
+                    }
+                }
+                let Some(ctx) = guard.as_ref() else {
+                    for (what, _) in &batch {
+                        log_slot_write(what, None);
+                    }
+                    return;
+                };
+                let admission = match crate::store::mutation_lock::acquire_writer(
+                    &ctx.db_path,
+                    "deferred write batch",
+                ) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        for (what, _) in &batch {
+                            tracing::warn!("{what} dropped: writer admission failed: {error}");
+                        }
+                        return;
+                    }
+                };
+                for (what, f) in batch {
+                    let outcome =
+                        crate::core::run_admitted_write(&mut guard, what, &admission, |ctx| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
+                                .unwrap_or_else(|_| {
+                                    Err(crate::error::Error::other(format!("{what} panicked")))
+                                })
+                        });
+                    log_slot_write(what, outcome);
+                }
+            })
+            .await;
+            if let Err(error) = written {
+                tracing::warn!("deferred write task failed: {error}");
+            }
         }
     });
+    let mut queues = deferred_writes();
+    if let Some(queue) = queues.get_mut(&key) {
+        // The task can finish or be cancelled before spawn returns. Publish
+        // only while its reservation still owns this entry, never a successor.
+        if queue
+            .generation
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &generation))
+        {
+            queue.waiting = Some(task);
+        }
+    }
 }
 
-/// [`ensure_handle_context`] for a hook's context phase: opens an empty slot,
-/// but a busy slot is left to the read leg, which bypasses it, instead of being
-/// waited on (#209-bc4b).
+/// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
+/// the read leg, which bypasses it, instead of being waited on, and an empty one
+/// is opened in the background instead of inline (#209-bc4b).
 async fn ensure_handle_context_unless_busy(handle: &RepoHandle) -> Result<(), McpError> {
-    match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(mut guard) => open_handle_context(&mut guard, handle),
-        Err(_) => Ok(()),
+    if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
+        if guard.is_none() {
+            drop(guard);
+            warm_slot_in_background(handle);
+        }
     }
+    Ok(())
 }
 
 /// [`hook_store`] for the tool hot path, which must never force an open: the
@@ -987,11 +1220,32 @@ async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
     #[cfg(test)]
     store_stall::maybe_stall(&handle.root).await;
     if let Ok(mut guard) = Arc::clone(&handle.ctx).try_lock_owned() {
-        open_handle_context(&mut guard, handle)?;
-        return Ok(HookStore::Slot(
-            guard,
-            crate::core::SlotHold::start("hook read"),
-        ));
+        if guard.is_some() || handle.doc_reindex_active.load(Ordering::Relaxed) {
+            open_handle_context(&mut guard, handle)?;
+            return Ok(HookStore::Slot(
+                guard,
+                crate::core::SlotHold::start("hook read"),
+            ));
+        }
+        // Empty slot: read the store through a read-only context now and open
+        // the slot behind the hook. A store that cannot be read that way (not
+        // initialized, stale schema) still opens inline, where it is
+        // initialized or migrated.
+        match Context::open_read_only(&handle.root) {
+            Ok(ctx) => {
+                drop(guard);
+                warm_slot_in_background(handle);
+                return Ok(HookStore::Bypass(Some(ctx)));
+            }
+            Err(error) => {
+                tracing::debug!("hook cold read bypass unavailable, opening the store: {error}");
+                open_handle_context(&mut guard, handle)?;
+                return Ok(HookStore::Slot(
+                    guard,
+                    crate::core::SlotHold::start("hook read"),
+                ));
+            }
+        }
     }
     match Context::open_read_only(&handle.root) {
         Ok(ctx) => Ok(HookStore::Bypass(Some(ctx))),
@@ -1029,10 +1283,11 @@ async fn run_handle_memory_mutation<T>(
 ) -> Result<T, McpError> {
     let (db_path, generation, result) = {
         let guard = slot.lock().await;
-        let _hold = crate::core::SlotHold::start(what);
+        let mut hold = crate::core::SlotHold::start(what);
         let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
+        hold.in_repo(ctx.root());
         let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
             .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
         let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, what)
@@ -4636,11 +4891,12 @@ async fn record_recall(
     // The ledger is telemetry: a slot held by a mutation must not hold the
     // hook's answer, so the row is written behind it (#209-bc4b).
     match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(mut guard) => log_slot_write(
+        Ok(mut guard) if guard.is_some() => log_slot_write(
             "recall ledger",
             crate::core::run_guarded_write(&mut guard, "recall ledger", record),
         ),
-        Err(_) => write_behind_slot(Arc::clone(&handle.ctx), "recall ledger", record),
+        // Busy, or empty: the queued write opens the slot itself if need be.
+        _ => write_behind_slot(SlotOpener::of(handle), "recall ledger", record),
     }
 }
 
@@ -5828,7 +6084,7 @@ async fn hook_user_prompt_submit_impl_timed(
         // await. It runs on the blocking pool instead, owning the store guard,
         // so the deadline can drop the wait. A cut search still finishes there
         // and releases the store; it has no side effect the deadline must undo.
-        let ctx_arc = Arc::clone(&handle.ctx);
+        let opener = SlotOpener::of(handle);
         let (q, prompt_owned, embedding) = (q.clone(), prompt.to_string(), query_embedding.clone());
         let root = handle.root.clone();
         let telemetry = handle.config.telemetry.clone();
@@ -5927,7 +6183,7 @@ async fn hook_user_prompt_submit_impl_timed(
                 };
                 if !ev.query_hash.is_empty() {
                     let retention_days = telemetry.retention_days;
-                    store.write_or_defer(&ctx_arc, "query event telemetry", move |ctx| {
+                    store.write_or_defer(opener, "query event telemetry", move |ctx| {
                         stats::record_query_event(&ctx.conn, &ev, retention_days).map(|_| ())
                     });
                 }
@@ -8166,6 +8422,202 @@ mod tests {
 
         entry.tags = vec![];
         assert!(!entry_in_scope(&entry, "lattice"));
+    }
+
+    // Read actual telemetry rows: cancellation must not strand or reorder them.
+    fn critic_r4_sessions(handle: &RepoHandle) -> Vec<String> {
+        let guard = handle.ctx.try_lock().unwrap();
+        let ctx = guard.as_ref().unwrap();
+        let sessions = ctx
+            .conn
+            .prepare("SELECT session FROM recall_prompts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        sessions
+    }
+
+    async fn critic_r4_wait_for_sessions(handle: &RepoHandle, count: usize) -> Vec<String> {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(guard) = handle.ctx.try_lock() {
+                    let ctx = guard.as_ref().unwrap();
+                    let rows: i64 = ctx
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM recall_prompts", [], |r| r.get(0))
+                        .unwrap();
+                    if rows == count as i64 {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        // A failed case must not leave address-keyed state for another test.
+        if result.is_err() {
+            deferred_writes().remove(&(Arc::as_ptr(&handle.ctx) as usize));
+        }
+        critic_r4_sessions(handle)
+    }
+
+    /// Catches: a waiter cancelled before its first poll never constructs its
+    /// guard, permanently stranding the old and all subsequent telemetry rows.
+    #[test]
+    fn critic_r4_unpolled_waiter_shutdown_does_not_strand_recall_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // record_recall queues without yielding; a current-thread runtime cannot
+        // poll the spawned waiter until this top-level future yields or returns.
+        doomed.block_on(record_recall(
+            &handle,
+            "before-poll",
+            RecallMode::Automatic,
+            0.5,
+            vec![],
+        ));
+        drop(doomed);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(
+                &handle,
+                "after-shutdown",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            drop(held);
+            critic_r4_wait_for_sessions(&handle, 2).await
+        });
+        assert_eq!(
+            sessions,
+            ["before-poll", "after-shutdown"],
+            "unpolled waiter cancellation swallowed recall rows"
+        );
+    }
+
+    /// Catches: the cancellation guard only covers a normally suspended waiter,
+    /// leaving a panicked waiter owning the queue and swallowing later rows.
+    #[test]
+    fn critic_r4_panicked_waiter_does_not_strand_recall_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        // Exercise a real waiter panic: Tokio sleep on a runtime without timers.
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            record_recall(&handle, "before-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        });
+        drop(doomed);
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(&handle, "after-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            drop(held);
+            critic_r4_wait_for_sessions(&handle, 2).await
+        });
+        assert_eq!(sessions, ["before-panic", "after-panic"]);
+    }
+
+    /// Catches: runtime shutdown during a blocking drain lets a cancelled
+    /// predecessor erase its successor queue, or shared handles reorder rows.
+    #[test]
+    fn critic_r4_shared_slot_shutdown_mid_drain_preserves_successor_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let shared = RepoHandle::from_shared(
+            handle.root.clone(),
+            Arc::clone(&handle.ctx),
+            Arc::clone(&handle.code_index),
+            handle.config.clone(),
+            vec![],
+            Arc::clone(&handle.doc_reindex_active),
+            Arc::clone(&handle.code_reindex_active),
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "critic mid-drain", move |ctx| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                crate::store::recall_ledger::record_prompt(
+                    &ctx.conn,
+                    &crate::store::recall_ledger::RecallPrompt {
+                        session: "in-flight".into(),
+                        mode: "automatic",
+                        floor: 0.5,
+                        candidate_floor: 0.4,
+                    },
+                    &[],
+                    30,
+                    chrono::Utc::now().timestamp(),
+                )
+                .map(|_| ())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        // Running spawn_blocking work survives shutdown; the async waiter does not.
+        doomed.shutdown_timeout(std::time::Duration::ZERO);
+        let later = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let sessions = later.block_on(async {
+            record_recall(
+                &shared,
+                "shared-successor",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            tokio::task::yield_now().await;
+            record_recall(
+                &handle,
+                "original-successor",
+                RecallMode::Automatic,
+                0.5,
+                vec![],
+            )
+            .await;
+            release_tx.send(()).unwrap();
+            critic_r4_wait_for_sessions(&handle, 3).await
+        });
+        assert_eq!(
+            sessions,
+            ["in-flight", "shared-successor", "original-successor"]
+        );
     }
 
     /// Deadline of every test handle that does not set one: far above any
@@ -16753,6 +17205,744 @@ mod tests {
         );
     }
 
+    /// Catches (#209-bc4b): a hook that finds the slot empty (first hook of a
+    /// repo since the daemon started) opening it inline, so the full-file
+    /// `quick_check` of the first open is paid as the hook's context phase
+    /// (1.2 s on a 418 MB store). The hook reads beside the slot and the slot
+    /// opens behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_on_an_empty_slot_reads_beside_it_and_the_slot_opens_behind() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        // A daemon that has not opened this store yet.
+        *handle.ctx.lock().await = None;
+
+        let store = hook_store(&handle).await.unwrap();
+        assert!(store.is_bypass(), "the hook opened the empty slot inline");
+        drop(store);
+
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle.ctx.lock().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "nothing opened the slot behind the hook");
+    }
+
+    /// Catches (#209-bc4b): `record_recall` on an empty slot queueing its write
+    /// before the background open has the slot, so the write meets an empty
+    /// slot and is dropped ("the store was closed before it could be written")
+    /// — the first prompt of a repo since the daemon started leaves no ledger
+    /// row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_row_written_while_the_slot_is_empty_is_kept() {
+        for attempt in 0..8 {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            *handle.ctx.lock().await = None;
+
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+
+            let kept = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    {
+                        let guard = handle.ctx.lock().await;
+                        if let Some(ctx) = guard.as_ref() {
+                            let rows =
+                                crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap();
+                            if rows == 1 {
+                                return;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                kept.is_ok(),
+                "attempt {attempt}: the recall row of a prompt on an empty slot was lost"
+            );
+        }
+    }
+
+    /// Catches (#209-bc4b): a recall row queued while the startup document
+    /// reindex owns the store (slot empty, flag set) being dropped with "the
+    /// store was closed", and no warm task being spawned per hook meanwhile.
+    /// No warm open exists in this test: the queued write opens the slot itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_row_queued_during_the_startup_reindex_is_kept() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            handle.ctx.lock().await.is_none(),
+            "the store was opened while the reindex owned it"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let kept = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let guard = handle.ctx.lock().await;
+                    if let Some(ctx) = guard.as_ref() {
+                        if crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap() == 1 {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            kept.is_ok(),
+            "the recall row queued during the reindex was lost"
+        );
+    }
+
+    /// Waits for a queued write to run or not, on a paused clock: yields and
+    /// lets the blocking pool finish without moving virtual time.
+    async fn settle_blocking() {
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Wait for an observable blocking-pool result without advancing a paused
+    /// Tokio clock. Real I/O needs a real deadline, not a fixed settle window.
+    async fn wait_until_blocking(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Catches (#209-bc4b): a queued write that polls the startup reindex past
+    /// its cap and then opens the store under the flag (a second context over a
+    /// store being rebuilt), or wedges holding the slot lock. At the cap the
+    /// write is given up: it never runs, the slot stays empty and unlocked.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_write_is_given_up_at_the_reindex_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "cap test", move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        // The waiter starts its cap clock on its first poll: let it, or the
+        // jump below moves the clock before the cap starts counting.
+        settle_blocking().await;
+        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until_blocking("the capped queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the write ran under the flag"
+        );
+        let guard = handle.ctx.try_lock().expect("the slot lock was left held");
+        assert!(guard.is_none(), "the store was opened under the flag");
+    }
+
+    /// Catches (#209-bc4b): the wait for the reindex being a fixed delay or the
+    /// cap, so a reindex that ends after minutes still loses its queued write
+    /// or delays it to the cap. Released at 300 s, the write lands at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_write_lands_when_the_reindex_ends_before_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "release test", move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        settle_blocking().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "ran during the reindex");
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        wait_until_blocking("the released write ran", || ran.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the write was lost");
+        assert!(
+            handle.ctx.lock().await.is_some(),
+            "the write did not open the slot"
+        );
+    }
+
+    /// Catches (#209-bc4b): the hook's recall leg waiting for the reindex that
+    /// its ledger write waits for. `record_recall` returns without advancing
+    /// the clock.
+    #[tokio::test(start_paused = true)]
+    async fn record_recall_does_not_wait_for_the_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        let done = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()),
+        )
+        .await;
+        assert!(done.is_ok(), "the hook waited for the reindex");
+    }
+
+    /// Catches (#209-bc4b): every hook that queues a write during the startup
+    /// reindex starting its own polling task (100 ms, up to 600 s), so the task
+    /// count grows with the hooks. One waiter per slot, and every write joins it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifty_hooks_during_a_reindex_leave_one_waiter_and_lose_no_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        for i in 0..50 {
+            record_recall(
+                &handle,
+                &format!("s{i}"),
+                RecallMode::Automatic,
+                0.5,
+                Vec::new(),
+            )
+            .await;
+        }
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        {
+            let queues = deferred_writes();
+            let queue = queues.get(&key).expect("the slot has a queue");
+            assert!(
+                queue
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished()),
+                "a waiter owns the queue"
+            );
+            assert_eq!(queue.writes.len(), 50, "every write joined the one waiter");
+        }
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let kept = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let guard = handle.ctx.lock().await;
+                    if let Some(ctx) = guard.as_ref() {
+                        if crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap() == 50 {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(kept.is_ok(), "rows were lost by the coalesced waiter");
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while deferred_writes().contains_key(&key) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "the waiter left its queue behind");
+    }
+
+    fn counting_write(
+        ran: &Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static {
+        let ran = Arc::clone(ran);
+        move |_| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !done() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out: {what}");
+    }
+
+    /// Catches (#209-bc4b): the waiter dropping its queue entry in a step apart
+    /// from the check that the queue is empty, so a write pushed while the
+    /// waiter exits (or while a batch runs) joins a queue nobody drains and is
+    /// lost. 8 tasks push 50 writes each against a free slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_pushed_while_the_waiter_drains_and_exits_are_all_run() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let pushers: Vec<_> = (0..8)
+            .map(|_| {
+                let (handle, ran) = (Arc::clone(&handle), Arc::clone(&ran));
+                tokio::spawn(async move {
+                    for _ in 0..50 {
+                        write_behind_slot(SlotOpener::of(&handle), "stress", counting_write(&ran));
+                        tokio::task::yield_now().await;
+                    }
+                })
+            })
+            .collect();
+        for pusher in pushers {
+            pusher.await.unwrap();
+        }
+        wait_until("every pushed write ran", || {
+            ran.load(Ordering::SeqCst) >= 400
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            400,
+            "a write ran twice or was lost"
+        );
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue entry is removed", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+    }
+
+    /// Catches: cancelling an unpolled waiter drops the last slot Arc while
+    /// its queued writes survive, allowing another slot to reuse its address.
+    #[test]
+    fn pending_queue_retains_its_slot_identity_after_unpolled_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let slot = Arc::downgrade(&handle.ctx);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "identity", |_| Ok(()));
+        });
+        drop(runtime);
+        drop(handle);
+        let retained = slot.upgrade().is_some();
+        // Always clean up, including on failure, to keep the test independent.
+        deferred_writes().remove(&key);
+        assert!(retained, "queued writes outlived their slot identity");
+        assert!(slot.upgrade().is_none(), "retired queue leaked its slot");
+    }
+
+    /// Catches: admitting each row separately rewrites and fsyncs writer-lock
+    /// metadata for every row, making a queued batch exceed its drain budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_batch_preserves_one_writer_admission_between_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let lock = crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+        let marker = b"one admission spans the batch";
+        let first_lock = lock.clone();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        write_behind_slot(SlotOpener::of(&handle), "batch first", move |_| {
+            // Admission writes diagnostic metadata to this real sidecar. A
+            // second admission would replace the bytes before the next row.
+            std::fs::write(first_lock, marker)?;
+            Ok(())
+        });
+        write_behind_slot(SlotOpener::of(&handle), "batch second", move |_| {
+            let bytes = std::fs::read(lock)?;
+            observed_tx.send(bytes).unwrap();
+            Ok(())
+        });
+        // Both writes enter the same batch while its slot is held.
+        drop(held);
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), observed_rx)
+            .await
+            .expect("the batch completed")
+            .unwrap();
+        assert_eq!(observed, marker, "the batch reacquired writer admission");
+    }
+
+    /// Catches: an unlimited admitted batch holds off foreign CLI writers for
+    /// its entire backlog instead of releasing admission after 64 rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_bursts_release_writer_admission_after_sixty_four_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let lock = crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+        let marker = b"current admitted batch";
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for row in 0..130 {
+            let (lock, starts, ran) = (lock.clone(), Arc::clone(&starts), Arc::clone(&ran));
+            write_behind_slot(SlotOpener::of(&handle), "bounded batch", move |_| {
+                if std::fs::read(&lock)? != marker {
+                    starts.lock().unwrap().push(row);
+                }
+                std::fs::write(lock, marker)?;
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        }
+        drop(held);
+        wait_until("all 130 bounded-batch rows ran", || {
+            ran.load(Ordering::SeqCst) == 130
+        })
+        .await;
+        assert_eq!(*starts.lock().unwrap(), [0, 64, 128]);
+    }
+
+    /// Catches (critic r5): a drain cancelled mid-batch leaves a queue entry
+    /// with no writes and a dead task that nothing ever removes, so the store
+    /// connection of a dropped handle stays pinned for the life of the process.
+    #[test]
+    fn critic_r5_cancelled_drain_with_nothing_pending_releases_its_slot() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let slot = Arc::downgrade(&handle.ctx);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "r5 mid-batch", move |_| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                Ok(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        doomed.shutdown_timeout(std::time::Duration::ZERO);
+        release_tx.send(()).unwrap();
+        drop(handle);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while slot.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let released = slot.upgrade().is_none();
+        deferred_writes().remove(&key);
+        assert!(released, "an empty, abandoned queue still pins its slot");
+    }
+
+    /// Catches (critic r5): one panicking write in a batch drops every write
+    /// queued behind it in the same batch, because the batch dies with the
+    /// blocking task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r5_a_panicking_write_does_not_drop_the_rest_of_its_batch() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        write_behind_slot(SlotOpener::of(&handle), "r5 first", counting_write(&ran));
+        write_behind_slot(SlotOpener::of(&handle), "r5 panics", |_| panic!("r5 write"));
+        write_behind_slot(SlotOpener::of(&handle), "r5 third", counting_write(&ran));
+        drop(held);
+        wait_until("the writes around the panic ran", || {
+            ran.load(Ordering::SeqCst) == 2
+        })
+        .await;
+    }
+
+    /// Catches (critic r5): enqueues that find a terminated waiter at the same
+    /// time each respawn one (or none), duplicating, reordering or losing the
+    /// stranded row and the new ones.
+    #[test]
+    fn critic_r5_concurrent_enqueues_after_a_dead_waiter_run_each_row_once() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let order = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let push = |id: usize| {
+            let order = Arc::clone(&order);
+            move |_: &Context| {
+                order.lock().unwrap().push(id);
+                Ok(())
+            }
+        };
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "r5 stale", push(0));
+        });
+        drop(doomed);
+        let later = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (1..=8)
+            .map(|id| {
+                let (handle, gate, rt) = (
+                    Arc::clone(&handle),
+                    Arc::clone(&gate),
+                    later.handle().clone(),
+                );
+                let write = push(id);
+                std::thread::spawn(move || {
+                    let _enter = rt.enter();
+                    gate.wait();
+                    write_behind_slot(SlotOpener::of(&handle), "r5 racer", write);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let done = later.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while order.lock().unwrap().len() < 9 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        let ran = order.lock().unwrap().clone();
+        deferred_writes().remove(&key);
+        assert!(done.is_ok(), "rows missing, ran {ran:?}");
+        assert_eq!(ran[0], 0, "the stranded row ran after newer rows: {ran:?}");
+        let mut sorted = ran.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..=8).collect::<Vec<_>>(),
+            "a row ran twice: {ran:?}"
+        );
+    }
+
+    /// Catches (#209-bc4b): writes of one slot running out of the order they
+    /// were queued in (a batch drained from the back, or each hook racing its
+    /// own task for the lock). The ledger keeps rows in insertion order.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_writes_run_in_the_order_they_were_queued() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for i in 0..20usize {
+            let order = Arc::clone(&order);
+            write_behind_slot(SlotOpener::of(&handle), "order", move |_| {
+                order.lock().unwrap().push(i);
+                Ok(())
+            });
+        }
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        wait_until("all 20 ran", || order.lock().unwrap().len() == 20).await;
+        assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
+    }
+
+    /// Catches (#209-bc4b): the cap path leaving its queue entry marked as
+    /// owned by a waiter that is gone, so every later write joins a queue
+    /// nobody drains; or replaying the writes it gave up on once the reindex is
+    /// over. Three writes are given up at the cap; one queued afterwards runs
+    /// alone.
+    #[tokio::test(start_paused = true)]
+    async fn after_the_cap_the_queue_is_clear_and_later_writes_run_alone() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..3 {
+            write_behind_slot(SlotOpener::of(&handle), "capped", counting_write(&ran));
+        }
+        // The waiter starts its cap clock on its first poll: let it, or the
+        // jump below moves the clock before the cap starts counting.
+        settle_blocking().await;
+        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until_blocking("the capped queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+        assert!(
+            !deferred_writes().contains_key(&key),
+            "the cap left a queue entry behind"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        write_behind_slot(SlotOpener::of(&handle), "after", counting_write(&ran));
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        wait_until_blocking("the later write ran", || ran.load(Ordering::SeqCst) == 1).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "lost, or the capped writes came back"
+        );
+    }
+
+    /// Catches (#209-bc4b): a waiter cancelled with its runtime (shutdown, or
+    /// an aborted task) leaving `waiting` set under the slot's address, so a
+    /// later write on that slot, or on a new slot allocated at the same
+    /// address, joins a queue nobody drains and is never run.
+    #[test]
+    fn a_waiter_cancelled_with_its_runtime_does_not_swallow_later_writes() {
+        let build = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let tmp = TempDir::new().unwrap();
+        let first = build();
+        let handle = first.block_on(async {
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            *handle.ctx.lock().await = None;
+            handle.doc_reindex_active.store(true, Ordering::Relaxed);
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            write_behind_slot(SlotOpener::of(&handle), "doomed", counting_write(&ran));
+            handle
+        });
+        drop(first);
+
+        let second = build();
+        second.block_on(async {
+            handle.doc_reindex_active.store(false, Ordering::Relaxed);
+            let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            write_behind_slot(SlotOpener::of(&handle), "later", counting_write(&ran));
+            wait_until("a write queued after a cancelled waiter ran", || {
+                ran.load(Ordering::SeqCst) == 1
+            })
+            .await;
+        });
+    }
+
+    /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
+    /// so a hook arriving while the startup reindex owns the store (slot taken
+    /// out, flag set) opens a second context over it; and the opposite, a flag
+    /// left in the way once the reindex is done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_background_open_waits_out_a_document_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            handle.ctx.lock().await.is_none(),
+            "a context was opened while the document reindex owned the store"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle.ctx.lock().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "the slot stayed empty after the reindex");
+    }
+
+    /// Catches (#209-bc4b): a hook that reads a torn store through its
+    /// read-only context before the first integrity probe leaving the slot
+    /// unprobed, so the damaged file is never quarantined and rebuilt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_reading_a_torn_store_on_an_empty_slot_still_gets_it_healed() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let mut guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            ctx.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            let db_path = ctx.db_path.clone();
+            *guard = None;
+            let len = std::fs::metadata(&db_path).unwrap().len();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            file.set_len(len / 2).unwrap();
+        }
+
+        let mut store = hook_store(&handle).await.expect("the hook answers");
+        // A torn read may fail or not, depending on which pages it touches; it
+        // must not panic and must not keep the corrupt context alive.
+        let _ = crate::core::run_guarded_read(store.slot(), "torn read", |ctx| {
+            Ok(ctx
+                .conn
+                .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+        });
+        drop(store);
+
+        let healed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let quarantined = std::fs::read_dir(tmp.path().join(".mdkb"))
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
+                if quarantined && handle.ctx.lock().await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            healed.is_ok(),
+            "the torn store was never quarantined and reopened"
+        );
+    }
+
     /// Catches (#209-bc4b): a PreToolUse/PostToolUse hook still locking the slot
     /// (or the tool path giving up on a busy slot) so that it waits out the
     /// mutation even when no trigger matches.
@@ -17606,6 +18796,336 @@ mod tests {
                 Some(root.join("./da").join("w.md")),
             ]
         );
+    }
+
+    /// Waits until the drain for `handle` has retired its queue.
+    fn critic_r6_wait_retired(handle: &RepoHandle) {
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while deferred_writes().contains_key(&key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drain never retired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// True when no process holds the project writer lock.
+    fn critic_r6_writer_lock_free(db_path: &std::path::Path) -> bool {
+        let lock = crate::store::mutation_lock::writer_lock_path(db_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock)
+            .unwrap();
+        fs4::fs_std::FileExt::try_lock_exclusive(&file).is_ok()
+    }
+
+    /// Catches (critic r6): the cancellation receipt locks the queue map in its
+    /// destructor while `write_behind_slot` spawns under that same non-reentrant
+    /// lock. A runtime that has already shut down drops the future inside
+    /// `spawn`, so a blocking thread of a shutting-down daemon deadlocks itself.
+    #[test]
+    fn critic_r6_enqueue_on_a_shut_down_runtime_does_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = runtime.handle().clone();
+        drop(runtime);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _enter = closed.enter();
+            write_behind_slot(SlotOpener::of(&handle), "r6 closed runtime", |_| Ok(()));
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("enqueue on a shut-down runtime deadlocked on the queue map lock");
+    }
+
+    /// Catches (critic r6): an enqueue without a runtime panicking after the row
+    /// entered the map or while holding its lock, poisoning the map or leaving a
+    /// queue that pins the slot.
+    #[test]
+    fn critic_r6_enqueue_without_a_runtime_leaves_no_queue() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_behind_slot(SlotOpener::of(&handle), "r6 no runtime", |_| Ok(()));
+        }));
+        assert!(outcome.is_err());
+        assert!(!DEFERRED_WRITES.is_poisoned());
+        assert!(!deferred_writes().contains_key(&key));
+    }
+
+    /// Catches (critic r6): a batch holding writer admission past a panicking or
+    /// corrupt row, so another process's writer waits forever; corruption not
+    /// closing the slot; rows after a corrupt row running against a closed slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r6_batch_with_panic_and_corruption_releases_admission_and_closes_slot() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle
+            .ctx
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .db_path
+            .clone();
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 panics", move |_| {
+            log.lock().unwrap().push("panics");
+            panic!("r6 telemetry panic");
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 survives", move |_| {
+            log.lock().unwrap().push("survives");
+            Ok(())
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 corrupt", move |ctx| {
+            log.lock().unwrap().push("corrupt");
+            Err(crate::error::ErrorKind::IndexCorrupt {
+                path: ctx.db_path.clone(),
+            }
+            .into())
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 after corrupt", move |_| {
+            log.lock().unwrap().push("after corrupt");
+            Ok(())
+        });
+        drop(held);
+        let probe = Arc::clone(&handle);
+        tokio::task::spawn_blocking(move || critic_r6_wait_retired(&probe))
+            .await
+            .unwrap();
+        assert_eq!(*ran.lock().unwrap(), ["panics", "survives", "corrupt"]);
+        let probe = Arc::clone(&handle);
+        let free = tokio::task::spawn_blocking(move || {
+            assert!(
+                probe.ctx.try_lock().unwrap().is_none(),
+                "corruption left the slot open"
+            );
+            critic_r6_writer_lock_free(&db_path)
+        })
+        .await
+        .unwrap();
+        assert!(free, "the batch leaked writer admission");
+    }
+
+    /// Catches (critic r6): a batch dropped, instead of waiting, when another
+    /// writer holds the project lock (a non-blocking or timed-out admission).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r6_batch_waits_for_a_foreign_writer_instead_of_dropping_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle
+            .ctx
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .db_path
+            .clone();
+        let foreign = crate::store::mutation_lock::acquire_writer(&db_path, "r6 foreign").unwrap();
+        let (wrote, written) = tokio::sync::oneshot::channel();
+        write_behind_slot(SlotOpener::of(&handle), "r6 waits", move |_| {
+            wrote.send(()).unwrap();
+            Ok(())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            handle.ctx.try_lock().is_err(),
+            "the drain does not hold the slot while it waits"
+        );
+        drop(foreign);
+        tokio::time::timeout(std::time::Duration::from_secs(10), written)
+            .await
+            .expect("the row was dropped instead of waiting for the foreign writer")
+            .unwrap();
+    }
+
+    /// Catches (critic r7): an off-by-one in the admission cap (63/64 rows split
+    /// into two batches, 65 rows still one batch), or a batch boundary that
+    /// reorders, drops or duplicates rows. Rows are queued while the slot is
+    /// held, so the drain sees the whole backlog at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r7_batches_split_exactly_at_the_cap_and_keep_row_order() {
+        let cases: [(usize, &[usize]); 7] = [
+            (1, &[0]),
+            (63, &[0]),
+            (64, &[0]),
+            (65, &[0, 64]),
+            (128, &[0, 64]),
+            (129, &[0, 64, 128]),
+            (192, &[0, 64, 128]),
+        ];
+        for (rows, expected_starts) in cases {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+            let lock =
+                crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+            let marker = b"r7 current batch";
+            let starts = Arc::new(StdMutex::new(Vec::new()));
+            let order = Arc::new(StdMutex::new(Vec::new()));
+            for row in 0..rows {
+                let (lock, starts, order) = (lock.clone(), Arc::clone(&starts), Arc::clone(&order));
+                write_behind_slot(SlotOpener::of(&handle), "r7 boundary", move |_| {
+                    if std::fs::read(&lock)? != marker {
+                        starts.lock().unwrap().push(row);
+                    }
+                    std::fs::write(lock, marker)?;
+                    order.lock().unwrap().push(row);
+                    Ok(())
+                });
+            }
+            drop(held);
+            wait_until("every boundary row ran", || {
+                order.lock().unwrap().len() == rows
+            })
+            .await;
+            assert_eq!(
+                *order.lock().unwrap(),
+                (0..rows).collect::<Vec<_>>(),
+                "{rows} rows ran out of order or were lost"
+            );
+            assert_eq!(*starts.lock().unwrap(), expected_starts, "{rows} rows");
+        }
+    }
+
+    /// Catches (critic r7): a row enqueued by a running row (mid-batch, and
+    /// from the last row of a full batch) being lost or run before earlier
+    /// rows, because the drain already took its batch and the reservation still
+    /// reads as live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r7_a_row_enqueued_by_a_running_row_runs_after_the_batch() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        for row in 0..WRITE_BEHIND_BATCH_ROWS {
+            let (order, opener) = (Arc::clone(&order), SlotOpener::of(&handle));
+            write_behind_slot(SlotOpener::of(&handle), "r7 parent", move |_| {
+                order.lock().unwrap().push(row);
+                if row == WRITE_BEHIND_BATCH_ROWS - 1 {
+                    let order = Arc::clone(&order);
+                    write_behind_slot(opener, "r7 child", move |_| {
+                        order.lock().unwrap().push(1000);
+                        Ok(())
+                    });
+                }
+                Ok(())
+            });
+        }
+        drop(held);
+        wait_until("the child row ran", || {
+            order.lock().unwrap().len() == WRITE_BEHIND_BATCH_ROWS + 1
+        })
+        .await;
+        let mut expected: Vec<usize> = (0..WRITE_BEHIND_BATCH_ROWS).collect();
+        expected.push(1000);
+        assert_eq!(*order.lock().unwrap(), expected);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+    }
+
+    /// Catches (critic r7): a reservation left behind by a spawn that dropped
+    /// its future (runtime already shut down), so every later enqueue on a live
+    /// runtime sees a "running" drain, returns, and the queue is stranded.
+    #[test]
+    fn critic_r7_a_dropped_spawn_does_not_strand_later_enqueues() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dead = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = dead.handle().clone();
+        drop(dead);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let _enter = closed.enter();
+            write_behind_slot(SlotOpener::of(&handle), "r7 orphan", counting_write(&ran));
+        }
+        let live = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        live.block_on(async {
+            ensure_handle_context(&handle).await.unwrap();
+            write_behind_slot(SlotOpener::of(&handle), "r7 live", counting_write(&ran));
+            wait_until("the orphaned and the live write ran", || {
+                ran.load(Ordering::SeqCst) == 2
+            })
+            .await;
+            let key = Arc::as_ptr(&handle.ctx) as usize;
+            wait_until("the queue retired", || {
+                !deferred_writes().contains_key(&key)
+            })
+            .await;
+        });
+    }
+
+    /// Catches (critic r7): two enqueues racing a drain that retires between
+    /// reserve and publish, leaving a reservation that never publishes or a
+    /// successor handle overwritten, so a later round's row never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn critic_r7_racing_enqueues_against_retiring_drains_never_strand_a_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads = 4;
+        for round in 1..=150usize {
+            let barrier = Arc::new(std::sync::Barrier::new(threads));
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (barrier, opener, ran) = (
+                        Arc::clone(&barrier),
+                        SlotOpener::of(&handle),
+                        Arc::clone(&ran),
+                    );
+                    let runtime = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let _enter = runtime.enter();
+                        barrier.wait();
+                        write_behind_slot(opener, "r7 race", counting_write(&ran));
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            wait_until(&format!("round {round} rows ran"), || {
+                ran.load(Ordering::SeqCst) == round * threads
+            })
+            .await;
+        }
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
     }
 }
 

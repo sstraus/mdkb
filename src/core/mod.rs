@@ -116,6 +116,7 @@ const SLOT_HOLD_WARN: std::time::Duration = std::time::Duration::from_millis(100
 /// (`slot held`) rather than from reading the code.
 pub(crate) struct SlotHold {
     what: String,
+    repo: String,
     since: std::time::Instant,
 }
 
@@ -125,8 +126,15 @@ impl SlotHold {
     pub(crate) fn start(what: &str) -> Self {
         Self {
             what: what.to_string(),
+            repo: String::new(),
             since: std::time::Instant::now(),
         }
+    }
+
+    /// Name the repo whose slot this is, once the context is at hand: the log
+    /// line is how the worst hold of each repo is found.
+    pub(crate) fn in_repo(&mut self, root: &Path) {
+        self.repo = root.display().to_string();
     }
 }
 
@@ -135,9 +143,9 @@ impl Drop for SlotHold {
         let held = self.since.elapsed();
         let held_ms = held.as_millis() as u64;
         if held >= SLOT_HOLD_WARN {
-            tracing::warn!(operation = %self.what, held_ms, "slot held");
+            tracing::warn!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
         } else {
-            tracing::debug!(operation = %self.what, held_ms, "slot held");
+            tracing::debug!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
         }
     }
 }
@@ -151,9 +159,10 @@ pub fn run_mutation_verify_after_release<T>(
 ) -> Option<Result<T>> {
     let (db_path, generation, mut result) = {
         let mut guard = slot.blocking_lock();
-        let _hold = SlotHold::start(what);
+        let mut hold = SlotHold::start(what);
         let (db_path, generation) = {
             let ctx = guard.as_ref()?;
+            hold.in_repo(&ctx.root);
             (ctx.db_path.clone(), ctx.generation)
         };
         let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
@@ -216,10 +225,24 @@ pub fn run_guarded_write<T>(
     f: impl FnOnce(&Context) -> Result<T>,
 ) -> Option<Result<T>> {
     let db_path = slot.as_ref()?.db_path.clone();
-    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+    let writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
         Ok(guard) => guard,
         Err(error) => return Some(Err(error)),
     };
+    run_admitted_write(slot, what, &writer_guard, f)
+}
+
+/// Run one small write under an existing writer admission for this store.
+///
+/// Queued telemetry shares admission across a batch, but each row still
+/// invalidates its health marker and closes the slot on typed corruption.
+pub(crate) fn run_admitted_write<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    _admission: &crate::store::mutation_lock::MutationGuard,
+    f: impl FnOnce(&Context) -> Result<T>,
+) -> Option<Result<T>> {
+    let db_path = slot.as_ref()?.db_path.clone();
     // Even tiny writes change bytes certified by the marker. Remove it before
     // the statement so coarse filesystem timestamp granularity cannot make a
     // pre-write marker appear current on the next open.
@@ -790,6 +813,44 @@ mod close_over_corruption_tests {
             Err(Error::other("disk full"))
         });
         assert!(slot.is_some() && !heal::has_process_probe(&db_path));
+    }
+
+    /// Catches (critic r6): `run_admitted_write` re-acquiring the non-reentrant
+    /// writer lock (self-deadlock under a held admission), skipping the marker
+    /// invalidation for every row after the first of a shared admission, or
+    /// keeping the process probe across a corrupt row.
+    #[test]
+    fn critic_r6_admitted_rows_each_invalidate_the_marker_under_one_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        let mut marker = db_path.as_os_str().to_os_string();
+        marker.push(".integrity-ok");
+        let marker = std::path::PathBuf::from(marker);
+        let admission = crate::store::mutation_lock::acquire_writer(&db_path, "r6").unwrap();
+        for row in 0..3 {
+            std::fs::write(&marker, b"").unwrap();
+            let outcome = run_admitted_write(&mut slot, "r6 row", &admission, |_| -> Result<()> {
+                assert!(!marker.exists(), "row {row} ran with a stale health marker");
+                Ok(())
+            });
+            assert!(matches!(outcome, Some(Ok(()))));
+            assert!(
+                heal::has_process_probe(&db_path),
+                "row {row} lost the probe"
+            );
+        }
+        let outcome =
+            run_admitted_write(&mut slot, "r6 corrupt", &admission, |ctx| -> Result<()> {
+                Err(corrupt_error(ctx))
+            });
+        assert!(matches!(outcome, Some(Err(ref e)) if e.is_index_corrupt()));
+        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+        // A row after the closure finds an empty slot and does not run.
+        let later = run_admitted_write(&mut slot, "r6 later", &admission, |_| -> Result<()> {
+            panic!("ran against a closed slot")
+        });
+        assert!(later.is_none());
     }
 }
 
