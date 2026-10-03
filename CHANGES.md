@@ -14,8 +14,12 @@
 - **Queued hook telemetry recovers after runtime shutdown.** The queue now
   retains its store slot and detects a terminated waiter even when it was
   cancelled before its first poll. Later telemetry restarts the drain in
-  insertion order instead of joining an abandoned queue. Found by critic r4's
-  runtime-shutdown regression. Story 259-ecda.
+  insertion order instead of joining an abandoned queue. Empty cancelled queues
+  release their store, and a panicking write leaves subsequent rows intact.
+  Each drain batch shares one writer admission instead of syncing lock metadata
+  for every row (400 admissions took 31.9 s under parallel test load). Found by
+  critic r4 and r5's runtime-shutdown, panic and admission regressions.
+  Story 259-ecda.
 
 - **`mdkb update` prunes the collection of a deleted directory.** An
   auto-detected collection (`docs`, `archive`) whose directory is gone was only

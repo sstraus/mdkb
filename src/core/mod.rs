@@ -225,10 +225,24 @@ pub fn run_guarded_write<T>(
     f: impl FnOnce(&Context) -> Result<T>,
 ) -> Option<Result<T>> {
     let db_path = slot.as_ref()?.db_path.clone();
-    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+    let writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
         Ok(guard) => guard,
         Err(error) => return Some(Err(error)),
     };
+    run_admitted_write(slot, what, &writer_guard, f)
+}
+
+/// Run one small write under an existing writer admission for this store.
+///
+/// Queued telemetry shares admission across a batch, but each row still
+/// invalidates its health marker and closes the slot on typed corruption.
+pub(crate) fn run_admitted_write<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    _admission: &crate::store::mutation_lock::MutationGuard,
+    f: impl FnOnce(&Context) -> Result<T>,
+) -> Option<Result<T>> {
+    let db_path = slot.as_ref()?.db_path.clone();
     // Even tiny writes change bytes certified by the marker. Remove it before
     // the statement so coarse filesystem timestamp granularity cannot make a
     // pre-write marker appear current on the next open.

@@ -1012,6 +1012,7 @@ struct DeferredQueue {
     opener: SlotOpener,
     writes: VecDeque<DeferredWrite>,
     waiting: Option<tokio::task::JoinHandle<()>>,
+    generation: Arc<()>,
 }
 
 /// Queues by slot address; each entry retains the slot's Arc until removed.
@@ -1020,6 +1021,30 @@ static DEFERRED_WRITES: std::sync::LazyLock<StdMutex<HashMap<usize, DeferredQueu
 
 fn deferred_writes() -> std::sync::MutexGuard<'static, HashMap<usize, DeferredQueue>> {
     DEFERRED_WRITES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A receipt for one queue generation, constructed before its future exists.
+/// Dropping even an unpolled future retires empty queues and releases pending
+/// queues for another drain, without touching a successor generation.
+struct DeferredDrain {
+    key: usize,
+    generation: Arc<()>,
+}
+
+impl Drop for DeferredDrain {
+    fn drop(&mut self) {
+        let mut queues = deferred_writes();
+        if let Some(queue) = queues.get_mut(&self.key) {
+            if !Arc::ptr_eq(&queue.generation, &self.generation) {
+                return;
+            }
+            if queue.writes.is_empty() {
+                queues.remove(&self.key);
+            } else {
+                queue.waiting = None;
+            }
+        }
+    }
 }
 
 /// Queue a small write behind whatever holds the slot, off the caller's path.
@@ -1033,12 +1058,16 @@ fn write_behind_slot(
     what: &'static str,
     f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
 ) {
+    // Fail before enqueue if called without a runtime, rather than poisoning
+    // the map or dropping a cancellation receipt while its mutex is held.
+    let runtime = tokio::runtime::Handle::current();
     let key = Arc::as_ptr(&opener.ctx) as usize;
     let mut queues = deferred_writes();
     let queue = queues.entry(key).or_insert_with(|| DeferredQueue {
         opener,
         writes: VecDeque::new(),
         waiting: None,
+        generation: Arc::new(()),
     });
     queue.writes.push_back((what, Box::new(f)));
     if queue
@@ -1049,10 +1078,16 @@ fn write_behind_slot(
         return;
     }
     let opener = queue.opener.clone();
+    queue.generation = Arc::new(());
+    let drain = DeferredDrain {
+        key,
+        generation: Arc::clone(&queue.generation),
+    };
     // Publish the task under the same lock as enqueue and normal retirement.
-    // Recovery reads Tokio's completion state, so no future-owned destructor
-    // can reset or remove a successor queue during runtime shutdown.
-    queue.waiting = Some(tokio::spawn(async move {
+    // The receipt already exists, so cancellation before the first poll still
+    // cleans up this generation. Its identity protects any successor queue.
+    queue.waiting = Some(runtime.spawn(async move {
+        let _drain = drain;
         let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
         while opener.doc_reindex_active.load(Ordering::Relaxed)
             && tokio::time::Instant::now() < give_up
@@ -1083,8 +1118,30 @@ fn write_behind_slot(
                         return;
                     }
                 }
+                let Some(ctx) = guard.as_ref() else {
+                    return;
+                };
+                let admission = match crate::store::mutation_lock::acquire_writer(
+                    &ctx.db_path,
+                    "deferred write batch",
+                ) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        for (what, _) in &batch {
+                            tracing::warn!("{what} dropped: writer admission failed: {error}");
+                        }
+                        return;
+                    }
+                };
                 for (what, f) in batch {
-                    log_slot_write(what, crate::core::run_guarded_write(&mut guard, what, f));
+                    let outcome =
+                        crate::core::run_admitted_write(&mut guard, what, &admission, |ctx| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(ctx)))
+                                .unwrap_or_else(|_| {
+                                    Err(crate::error::Error::other(format!("{what} panicked")))
+                                })
+                        });
+                    log_slot_write(what, outcome);
                 }
             })
             .await;
@@ -17412,6 +17469,38 @@ mod tests {
         deferred_writes().remove(&key);
         assert!(retained, "queued writes outlived their slot identity");
         assert!(slot.upgrade().is_none(), "retired queue leaked its slot");
+    }
+
+    /// Catches: admitting each row separately rewrites and fsyncs writer-lock
+    /// metadata for every row, making a queued batch exceed its drain budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_batch_preserves_one_writer_admission_between_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let lock = crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+        let marker = b"one admission spans the batch";
+        let first_lock = lock.clone();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        write_behind_slot(SlotOpener::of(&handle), "batch first", move |_| {
+            // Admission writes diagnostic metadata to this real sidecar. A
+            // second admission would replace the bytes before the next row.
+            std::fs::write(first_lock, marker)?;
+            Ok(())
+        });
+        write_behind_slot(SlotOpener::of(&handle), "batch second", move |_| {
+            let bytes = std::fs::read(lock)?;
+            observed_tx.send(bytes).unwrap();
+            Ok(())
+        });
+        // Both writes enter the same batch while its slot is held.
+        drop(held);
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(10), observed_rx)
+            .await
+            .expect("the batch completed")
+            .unwrap();
+        assert_eq!(observed, marker, "the batch reacquired writer admission");
     }
 
     /// Catches (critic r5): a drain cancelled mid-batch leaves a queue entry
