@@ -1005,47 +1005,21 @@ type DeferredWrite = (
     Box<dyn FnOnce(&Context) -> crate::error::Result<()> + Send>,
 );
 
-/// The writes queued behind one slot. `waiting` is set while a task owns the
-/// queue, so every hook that queues during a reindex joins it instead of
-/// polling for the flag on its own.
-#[derive(Default)]
+/// The queue owns both its slot identity and the task draining it. A cancelled
+/// or panicked task is detected on enqueue even if its future was never polled.
+/// Keeping the opener prevents an abandoned queue's address from being reused.
 struct DeferredQueue {
+    opener: SlotOpener,
     writes: VecDeque<DeferredWrite>,
-    waiting: bool,
+    waiting: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Queues by slot (the address of its `Arc`; an entry lives only while it holds
-/// writes or a task is on it).
+/// Queues by slot address; each entry retains the slot's Arc until removed.
 static DEFERRED_WRITES: std::sync::LazyLock<StdMutex<HashMap<usize, DeferredQueue>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
 fn deferred_writes() -> std::sync::MutexGuard<'static, HashMap<usize, DeferredQueue>> {
     DEFERRED_WRITES.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Owned by the waiter task: when the task is dropped before it finished (its
-/// runtime shut down, or it was aborted), frees the queue for the next write to
-/// start a waiter, instead of leaving `waiting` set for a task that is gone.
-/// Keys are slot addresses; the waiter holds an `Arc` of its slot, so the
-/// address cannot be reused while the entry stands.
-struct WaiterGuard {
-    key: usize,
-    finished: bool,
-}
-
-impl Drop for WaiterGuard {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let mut queues = deferred_writes();
-        if let Some(queue) = queues.get_mut(&self.key) {
-            queue.waiting = false;
-            if queue.writes.is_empty() {
-                queues.remove(&self.key);
-            }
-        }
-    }
 }
 
 /// Queue a small write behind whatever holds the slot, off the caller's path.
@@ -1060,20 +1034,25 @@ fn write_behind_slot(
     f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
 ) {
     let key = Arc::as_ptr(&opener.ctx) as usize;
+    let mut queues = deferred_writes();
+    let queue = queues.entry(key).or_insert_with(|| DeferredQueue {
+        opener,
+        writes: VecDeque::new(),
+        waiting: None,
+    });
+    queue.writes.push_back((what, Box::new(f)));
+    if queue
+        .waiting
+        .as_ref()
+        .is_some_and(|task| !task.is_finished())
     {
-        let mut queues = deferred_writes();
-        let queue = queues.entry(key).or_default();
-        queue.writes.push_back((what, Box::new(f)));
-        if queue.waiting {
-            return;
-        }
-        queue.waiting = true;
+        return;
     }
-    tokio::spawn(async move {
-        let mut waiter = WaiterGuard {
-            key,
-            finished: false,
-        };
+    let opener = queue.opener.clone();
+    // Publish the task under the same lock as enqueue and normal retirement.
+    // Recovery reads Tokio's completion state, so no future-owned destructor
+    // can reset or remove a successor queue during runtime shutdown.
+    queue.waiting = Some(tokio::spawn(async move {
         let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
         while opener.doc_reindex_active.load(Ordering::Relaxed)
             && tokio::time::Instant::now() < give_up
@@ -1090,7 +1069,6 @@ fn write_behind_slot(
                     .unwrap_or_default();
                 if writes.is_empty() {
                     queues.remove(&key);
-                    waiter.finished = true;
                     return;
                 }
                 writes
@@ -1114,7 +1092,7 @@ fn write_behind_slot(
                 tracing::warn!("deferred write task failed: {error}");
             }
         }
-    });
+    }));
 }
 
 /// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
@@ -17315,7 +17293,13 @@ mod tests {
         {
             let queues = deferred_writes();
             let queue = queues.get(&key).expect("the slot has a queue");
-            assert!(queue.waiting, "a waiter owns the queue");
+            assert!(
+                queue
+                    .waiting
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished()),
+                "a waiter owns the queue"
+            );
             assert_eq!(queue.writes.len(), 50, "every write joined the one waiter");
         }
 
@@ -17404,6 +17388,30 @@ mod tests {
             !deferred_writes().contains_key(&key)
         })
         .await;
+    }
+
+    /// Catches: cancelling an unpolled waiter drops the last slot Arc while
+    /// its queued writes survive, allowing another slot to reuse its address.
+    #[test]
+    fn pending_queue_retains_its_slot_identity_after_unpolled_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let slot = Arc::downgrade(&handle.ctx);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "identity", |_| Ok(()));
+        });
+        drop(runtime);
+        drop(handle);
+        let retained = slot.upgrade().is_some();
+        // Always clean up, including on failure, to keep the test independent.
+        deferred_writes().remove(&key);
+        assert!(retained, "queued writes outlived their slot identity");
+        assert!(slot.upgrade().is_none(), "retired queue leaked its slot");
     }
 
     /// Catches (#209-bc4b): writes of one slot running out of the order they

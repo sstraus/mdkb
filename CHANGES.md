@@ -11,6 +11,12 @@
 
 ### Fixed
 
+- **Queued hook telemetry recovers after runtime shutdown.** The queue now
+  retains its store slot and detects a terminated waiter even when it was
+  cancelled before its first poll. Later telemetry restarts the drain in
+  insertion order instead of joining an abandoned queue. Found by critic r4's
+  runtime-shutdown regression. Story 259-ecda.
+
 - **`mdkb update` prunes the collection of a deleted directory.** An
   auto-detected collection (`docs`, `archive`) whose directory is gone was only
   reported as a missing path, so its documents stayed searchable and recall kept
