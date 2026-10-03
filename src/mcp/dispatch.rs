@@ -16999,6 +16999,9 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
+        // The waiter starts its cap clock on its first poll: let it, or the
+        // jump below moves the clock before the cap starts counting.
+        settle_blocking().await;
         tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
         settle_blocking().await;
 
@@ -17215,6 +17218,9 @@ mod tests {
         for _ in 0..3 {
             write_behind_slot(SlotOpener::of(&handle), "capped", counting_write(&ran));
         }
+        // The waiter starts its cap clock on its first poll: let it, or the
+        // jump below moves the clock before the cap starts counting.
+        settle_blocking().await;
         tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
         settle_blocking().await;
         assert_eq!(ran.load(Ordering::SeqCst), 0);
