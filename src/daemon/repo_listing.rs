@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
@@ -56,8 +57,13 @@ pub struct RepoRow {
 }
 
 /// The rows for `roots`, in the order given.
+///
+/// Each row opens two stores, scans their tables and runs up to three `git`
+/// processes, so a sequential walk over ~30 repos took 0.5 s idle and 7 s under
+/// load (#210-b83b). The rows are independent, so they are read in parallel;
+/// the order of the result does not depend on which finishes first.
 pub fn list_repos(roots: &[PathBuf]) -> Vec<RepoRow> {
-    roots.iter().map(|root| repo_row(root)).collect()
+    roots.par_iter().map(|root| repo_row(root)).collect()
 }
 
 fn repo_row(root: &Path) -> RepoRow {
