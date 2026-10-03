@@ -3048,3 +3048,44 @@ mod diagnose_damage_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sweep_wrapper_tests {
+    use super::*;
+
+    fn quarantined_copy(dir: &Path, stamp: i64) -> PathBuf {
+        let copy = dir.join(format!("index.sqlite.corrupt-{stamp}"));
+        std::fs::write(&copy, b"corrupt bytes").unwrap();
+        std::fs::write(
+            report_path(&copy),
+            format!(
+                r#"{{"corrupt_file":"{}","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":true}}"#,
+                copy.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        copy
+    }
+
+    /// Catches: `sweep_expired_quarantines -> ()`. Only the injectable variant is
+    /// tested elsewhere, so a wrapper that never calls it (or passes the wrong
+    /// retention or clock) leaves expired forensic copies on disk for good.
+    #[test]
+    fn the_sweep_deletes_a_copy_past_the_retention_and_keeps_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expired = quarantined_copy(
+            dir.path(),
+            now - QUARANTINE_RETENTION.as_secs() as i64 - 3600,
+        );
+        let fresh = quarantined_copy(dir.path(), now - 3600);
+
+        sweep_expired_quarantines(dir.path());
+
+        assert!(!expired.exists(), "a copy past the retention is deleted");
+        assert!(fresh.exists(), "a copy inside the retention is kept");
+    }
+}
