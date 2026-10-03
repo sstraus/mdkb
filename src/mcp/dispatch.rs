@@ -17538,7 +17538,11 @@ mod tests {
         assert_eq!(ran[0], 0, "the stranded row ran after newer rows: {ran:?}");
         let mut sorted = ran.clone();
         sorted.sort_unstable();
-        assert_eq!(sorted, (0..=8).collect::<Vec<_>>(), "a row ran twice: {ran:?}");
+        assert_eq!(
+            sorted,
+            (0..=8).collect::<Vec<_>>(),
+            "a row ran twice: {ran:?}"
+        );
     }
 
     /// Catches (#209-bc4b): writes of one slot running out of the order they
