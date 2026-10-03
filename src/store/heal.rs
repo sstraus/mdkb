@@ -87,9 +87,10 @@ struct ProbeRecord {
 /// [`ensure_sound_locked`].
 static PROCESS_VERIFIED: Mutex<Option<HashMap<PathBuf, ProbeRecord>>> = Mutex::new(None);
 
-/// Device and inode of `path`: the file itself, not its name, so a torn file
-/// renamed over the store never inherits the verdict of the one it replaced.
-/// `None` where the platform offers no such identity; nothing is then trusted.
+/// Device and inode of `path` (volume serial and file index on Windows): the
+/// file itself, not its name, so a torn file renamed over the store never
+/// inherits the verdict of the one it replaced. `None` where the platform
+/// offers no such identity; nothing is then trusted.
 #[cfg(unix)]
 fn file_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -97,7 +98,13 @@ fn file_identity(path: &Path) -> Option<(u64, u64)> {
     Some((meta.dev(), meta.ino()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    let info = winapi_util::file::information(std::fs::File::open(path).ok()?).ok()?;
+    Some((info.volume_serial_number(), info.file_index()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn file_identity(_path: &Path) -> Option<(u64, u64)> {
     None
 }
@@ -2860,6 +2867,8 @@ mod critic_201b_r4 {
 
     /// Catches: a probe verdict for the OLD file recorded after the store was
     /// replaced (quarantine + rebuild) while the probe ran.
+    // Unix only: Windows refuses to rename a database file SQLite holds open.
+    #[cfg(unix)]
     #[test]
     fn a_replaced_database_gets_no_verdict_from_the_old_file_probe() {
         let dir = tempfile::tempdir().unwrap();
@@ -3102,5 +3111,40 @@ mod sweep_wrapper_tests {
 
         assert!(!expired.exists(), "a copy past the retention is deleted");
         assert!(fresh.exists(), "a copy inside the retention is kept");
+    }
+}
+
+#[cfg(test)]
+mod critic_268_file_identity {
+    use super::*;
+
+    /// Catches: an identity that names the path instead of the file (a constant,
+    /// or volume serial alone), so a torn file renamed over the store inherits
+    /// the verdict of the one it replaced. Runs on every platform: the Windows
+    /// leg needs no open database, so it can replace the file the Unix-only
+    /// probe test cannot.
+    #[test]
+    fn renaming_another_file_over_a_path_changes_its_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, other) = (dir.path().join("index.sqlite"), dir.path().join("other"));
+        std::fs::write(&db, b"old").unwrap();
+        std::fs::write(&other, b"new").unwrap();
+        let (old, new) = (file_identity(&db).unwrap(), file_identity(&other).unwrap());
+        assert_ne!(old, new, "two files share one identity");
+        assert_eq!(file_identity(&db), Some(old), "identity is not stable");
+        std::fs::rename(&other, &db).unwrap();
+        assert_eq!(
+            file_identity(&db),
+            Some(new),
+            "the path kept the replaced file's identity"
+        );
+    }
+
+    /// Catches: a missing file reported with an identity, which would let a
+    /// verdict be recorded for, and trusted on, a path that holds nothing.
+    #[test]
+    fn a_missing_file_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(file_identity(&dir.path().join("absent")), None);
     }
 }

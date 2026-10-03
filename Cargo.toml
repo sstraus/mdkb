@@ -127,6 +127,10 @@ rcgen = { version = "0.13", optional = true }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
 rustls = { version = "0.23", features = ["ring"], default-features = false, optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# File identity (volume serial + file index) for the in-process probe record.
+winapi-util = "0.1"
+
 [features]
 default = []
 llm = []  # Enable LLM-powered features like memory condense
