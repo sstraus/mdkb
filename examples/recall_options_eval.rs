@@ -13,6 +13,7 @@
 //! the cross-encoder score of every candidate listed in `pool.json` plus its
 //! per-prompt latency on real production chunks. `<data-dir>/translations.json`
 //! (optional) adds machine-translated query sets: `{name: {"pos": [..], "neg": [..]}}`.
+//! CPU and RSS fields are null on platforms without Unix resource usage.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,16 +28,22 @@ use serde_json::{Map, Value, json};
 
 const TOP_N: usize = 50;
 
-fn rusage() -> (f64, u64) {
+#[cfg(unix)]
+fn rusage() -> (Option<f64>, Option<u64>) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     // macOS reports ru_maxrss in bytes, Linux in kilobytes.
     let unit = if cfg!(target_os = "linux") { 1024 } else { 1 };
     (
-        tv(ru.ru_utime) + tv(ru.ru_stime),
-        ru.ru_maxrss as u64 * unit,
+        Some(tv(ru.ru_utime) + tv(ru.ru_stime)),
+        Some(ru.ru_maxrss as u64 * unit),
     )
+}
+
+#[cfg(not(unix))]
+fn rusage() -> (Option<f64>, Option<u64>) {
+    (None, None)
 }
 
 fn quantiles(mut ms: Vec<f64>) -> Value {
@@ -404,7 +411,7 @@ fn rerank(key: &str, d: &Data, pool_path: &str) -> Value {
     let (cpu1, rss_peak) = rusage();
     json!({"model": key, "load_ms": load_ms, "rss_loaded_bytes": rss_loaded,
            "rss_peak_bytes": rss_peak, "latency_top5": lat5, "latency_top10": lat10,
-           "pool_cpu_s": cpu1 - cpu0, "scores": scores})
+           "pool_cpu_s": cpu1.zip(cpu0).map(|(end, start)| end - start), "scores": scores})
 }
 
 fn main() {
