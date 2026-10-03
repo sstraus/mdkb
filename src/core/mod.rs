@@ -814,6 +814,44 @@ mod close_over_corruption_tests {
         });
         assert!(slot.is_some() && !heal::has_process_probe(&db_path));
     }
+
+    /// Catches (critic r6): `run_admitted_write` re-acquiring the non-reentrant
+    /// writer lock (self-deadlock under a held admission), skipping the marker
+    /// invalidation for every row after the first of a shared admission, or
+    /// keeping the process probe across a corrupt row.
+    #[test]
+    fn critic_r6_admitted_rows_each_invalidate_the_marker_under_one_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        let mut marker = db_path.as_os_str().to_os_string();
+        marker.push(".integrity-ok");
+        let marker = std::path::PathBuf::from(marker);
+        let admission = crate::store::mutation_lock::acquire_writer(&db_path, "r6").unwrap();
+        for row in 0..3 {
+            std::fs::write(&marker, b"").unwrap();
+            let outcome = run_admitted_write(&mut slot, "r6 row", &admission, |_| -> Result<()> {
+                assert!(!marker.exists(), "row {row} ran with a stale health marker");
+                Ok(())
+            });
+            assert!(matches!(outcome, Some(Ok(()))));
+            assert!(
+                heal::has_process_probe(&db_path),
+                "row {row} lost the probe"
+            );
+        }
+        let outcome =
+            run_admitted_write(&mut slot, "r6 corrupt", &admission, |ctx| -> Result<()> {
+                Err(corrupt_error(ctx))
+            });
+        assert!(matches!(outcome, Some(Err(ref e)) if e.is_index_corrupt()));
+        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+        // A row after the closure finds an empty slot and does not run.
+        let later = run_admitted_write(&mut slot, "r6 later", &admission, |_| -> Result<()> {
+            panic!("ran against a closed slot")
+        });
+        assert!(later.is_none());
+    }
 }
 
 #[cfg(test)]

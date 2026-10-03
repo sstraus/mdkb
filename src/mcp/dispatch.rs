@@ -18672,6 +18672,166 @@ mod tests {
             ]
         );
     }
+
+    /// Waits until the drain for `handle` has retired its queue.
+    fn critic_r6_wait_retired(handle: &RepoHandle) {
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while deferred_writes().contains_key(&key) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drain never retired"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// True when no process holds the project writer lock.
+    fn critic_r6_writer_lock_free(db_path: &std::path::Path) -> bool {
+        let lock = crate::store::mutation_lock::writer_lock_path(db_path);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock)
+            .unwrap();
+        fs4::fs_std::FileExt::try_lock_exclusive(&file).is_ok()
+    }
+
+    /// Catches (critic r6): the cancellation receipt locks the queue map in its
+    /// destructor while `write_behind_slot` spawns under that same non-reentrant
+    /// lock. A runtime that has already shut down drops the future inside
+    /// `spawn`, so a blocking thread of a shutting-down daemon deadlocks itself.
+    #[test]
+    fn critic_r6_enqueue_on_a_shut_down_runtime_does_not_deadlock() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = runtime.handle().clone();
+        drop(runtime);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _enter = closed.enter();
+            write_behind_slot(SlotOpener::of(&handle), "r6 closed runtime", |_| Ok(()));
+            done.send(()).unwrap();
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("enqueue on a shut-down runtime deadlocked on the queue map lock");
+    }
+
+    /// Catches (critic r6): an enqueue without a runtime panicking after the row
+    /// entered the map or while holding its lock, poisoning the map or leaving a
+    /// queue that pins the slot.
+    #[test]
+    fn critic_r6_enqueue_without_a_runtime_leaves_no_queue() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            write_behind_slot(SlotOpener::of(&handle), "r6 no runtime", |_| Ok(()));
+        }));
+        assert!(outcome.is_err());
+        assert!(!DEFERRED_WRITES.is_poisoned());
+        assert!(!deferred_writes().contains_key(&key));
+    }
+
+    /// Catches (critic r6): a batch holding writer admission past a panicking or
+    /// corrupt row, so another process's writer waits forever; corruption not
+    /// closing the slot; rows after a corrupt row running against a closed slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r6_batch_with_panic_and_corruption_releases_admission_and_closes_slot() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle
+            .ctx
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .db_path
+            .clone();
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 panics", move |_| {
+            log.lock().unwrap().push("panics");
+            panic!("r6 telemetry panic");
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 survives", move |_| {
+            log.lock().unwrap().push("survives");
+            Ok(())
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 corrupt", move |ctx| {
+            log.lock().unwrap().push("corrupt");
+            Err(crate::error::ErrorKind::IndexCorrupt {
+                path: ctx.db_path.clone(),
+            }
+            .into())
+        });
+        let log = Arc::clone(&ran);
+        write_behind_slot(SlotOpener::of(&handle), "r6 after corrupt", move |_| {
+            log.lock().unwrap().push("after corrupt");
+            Ok(())
+        });
+        drop(held);
+        let probe = Arc::clone(&handle);
+        tokio::task::spawn_blocking(move || critic_r6_wait_retired(&probe))
+            .await
+            .unwrap();
+        assert_eq!(*ran.lock().unwrap(), ["panics", "survives", "corrupt"]);
+        let probe = Arc::clone(&handle);
+        let free = tokio::task::spawn_blocking(move || {
+            assert!(
+                probe.ctx.try_lock().unwrap().is_none(),
+                "corruption left the slot open"
+            );
+            critic_r6_writer_lock_free(&db_path)
+        })
+        .await
+        .unwrap();
+        assert!(free, "the batch leaked writer admission");
+    }
+
+    /// Catches (critic r6): a batch dropped, instead of waiting, when another
+    /// writer holds the project lock (a non-blocking or timed-out admission).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r6_batch_waits_for_a_foreign_writer_instead_of_dropping_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle
+            .ctx
+            .try_lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .db_path
+            .clone();
+        let foreign = crate::store::mutation_lock::acquire_writer(&db_path, "r6 foreign").unwrap();
+        let (wrote, written) = tokio::sync::oneshot::channel();
+        write_behind_slot(SlotOpener::of(&handle), "r6 waits", move |_| {
+            wrote.send(()).unwrap();
+            Ok(())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            handle.ctx.try_lock().is_err(),
+            "the drain does not hold the slot while it waits"
+        );
+        drop(foreign);
+        tokio::time::timeout(std::time::Duration::from_secs(10), written)
+            .await
+            .expect("the row was dropped instead of waiting for the foreign writer")
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
