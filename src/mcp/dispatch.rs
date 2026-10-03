@@ -16615,6 +16615,49 @@ mod tests {
         (release_tx, held)
     }
 
+    /// Waits until the embedding backfill a session start spawned has left the
+    /// slot for good. The backfill takes the slot twice (count, then mutation),
+    /// so one acquisition of the slot can land between the two and prove nothing:
+    /// the single-flight flag is what says it is over.
+    async fn settle_background_slot_users(handle: &RepoHandle) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while handle.backfill_in_flight.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the embedding backfill never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(handle.ctx.lock().await);
+    }
+
+    /// Catches (#254-b729): a settle that only takes the slot once, which slips
+    /// into the gap between the backfill's count and its mutation and lets the
+    /// backfill hold the slot during the control session start, so the control
+    /// bypasses a busy slot and reports no drift.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settling_waits_for_a_backfill_that_has_not_yet_taken_the_slot_again() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        handle.backfill_in_flight.store(true, Ordering::Release);
+        let backfill = Arc::clone(&handle);
+        tokio::spawn(async move {
+            // The gap: the slot is free while the backfill is still in flight.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let guard = Arc::clone(&backfill.ctx).lock_owned().await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            drop(guard);
+            backfill.backfill_in_flight.store(false, Ordering::Release);
+        });
+
+        settle_background_slot_users(&handle).await;
+
+        assert!(
+            !handle.backfill_in_flight.load(Ordering::Acquire) && handle.ctx.try_lock().is_ok(),
+            "the settle returned while the backfill was still in flight"
+        );
+    }
+
     /// Catches (#209-bc4b): the session-start doctor comparing the live entry
     /// files with the snapshot's rows while a memory mutation has written a file
     /// and not yet committed its row, so every session that starts during a
@@ -16653,10 +16696,10 @@ mod tests {
         held.await.unwrap();
         let during = during.expect("the session start waited for the mutation");
 
-        // The telemetry the `during` run queued behind the mutation takes the
-        // slot as soon as it is released; wait it out, or the control below
-        // would itself bypass a busy slot.
-        drop(handle.ctx.lock().await);
+        // The embedding backfill the session starts spawned takes the slot as
+        // soon as it is released; wait it out, or the control below would itself
+        // bypass a busy slot.
+        settle_background_slot_users(&handle).await;
 
         // Control: the same file with no row IS drift once nothing is in flight,
         // so the channel under test does carry the finding.
