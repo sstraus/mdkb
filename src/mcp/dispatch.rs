@@ -711,15 +711,31 @@ fn open_handle_context(
     ctx_guard: &mut Option<Context>,
     handle: &RepoHandle,
 ) -> Result<(), McpError> {
+    open_slot(
+        ctx_guard,
+        &handle.root,
+        &handle.doc_reindex_active,
+        &handle.reindex_tx,
+    )
+}
+
+/// [`open_handle_context`] on the parts of the handle it reads, so a task that
+/// outlives the call can open the slot too ([`warm_slot_in_background`]).
+fn open_slot(
+    ctx_guard: &mut Option<Context>,
+    root: &std::path::Path,
+    doc_reindex_active: &AtomicBool,
+    reindex_tx: &tokio::sync::mpsc::Sender<std::path::PathBuf>,
+) -> Result<(), McpError> {
     if ctx_guard.is_none() {
-        if handle.doc_reindex_active.load(Ordering::Relaxed) {
+        if doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open_reusing_process_probe(&handle.root) {
+        let ctx = match Context::open_reusing_process_probe(root) {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
-                tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
-                Context::init(&handle.root)
+                tracing::info!("Auto-initializing mdkb at {}", root.display());
+                Context::init(root)
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -730,13 +746,41 @@ fn open_handle_context(
         // file paths post_tool_use injects. Best-effort: a full channel means a
         // rebuild is already queued, which is exactly what we want.
         if ctx.rebuilt_from_corruption {
-            if let Err(e) = handle.reindex_tx.try_send(handle.root.clone()) {
+            if let Err(e) = reindex_tx.try_send(root.to_path_buf()) {
                 tracing::warn!("failed to schedule post-heal reindex: {e}");
             }
         }
         *ctx_guard = Some(ctx);
     }
     Ok(())
+}
+
+/// Open an empty slot off the hook's path. The first open of a store in this
+/// process runs a full-file `quick_check` (1.2 s on a 418 MB store, measured on
+/// a copy of cerebro, 2026-10-03), and a hook that opened inline paid it as its
+/// context phase (#209-bc4b). The task holds the slot while it opens, so a hook
+/// arriving meanwhile finds it busy and reads through its own read-only context.
+fn warm_slot_in_background(handle: &RepoHandle) {
+    let ctx = Arc::clone(&handle.ctx);
+    let root = handle.root.clone();
+    let doc_reindex_active = Arc::clone(&handle.doc_reindex_active);
+    let reindex_tx = handle.reindex_tx.clone();
+    tokio::spawn(async move {
+        let mut guard = ctx.lock_owned().await;
+        if guard.is_some() {
+            return;
+        }
+        let opened = tokio::task::spawn_blocking(move || {
+            let _hold = crate::core::SlotHold::start("warm open");
+            open_slot(&mut guard, &root, &doc_reindex_active, &reindex_tx)
+        })
+        .await;
+        match opened {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("warm open failed: {}", error.message),
+            Err(error) => tracing::warn!("warm open task failed: {error}"),
+        }
+    });
 }
 
 /// Test seam: stalls a hook's acquisitions of its store, for the tests that
@@ -955,14 +999,17 @@ fn write_behind_slot(
     });
 }
 
-/// [`ensure_handle_context`] for a hook's context phase: opens an empty slot,
-/// but a busy slot is left to the read leg, which bypasses it, instead of being
-/// waited on (#209-bc4b).
+/// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
+/// the read leg, which bypasses it, instead of being waited on, and an empty one
+/// is opened in the background instead of inline (#209-bc4b).
 async fn ensure_handle_context_unless_busy(handle: &RepoHandle) -> Result<(), McpError> {
-    match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(mut guard) => open_handle_context(&mut guard, handle),
-        Err(_) => Ok(()),
+    if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
+        if guard.is_none() {
+            drop(guard);
+            warm_slot_in_background(handle);
+        }
     }
+    Ok(())
 }
 
 /// [`hook_store`] for the tool hot path, which must never force an open: the
@@ -987,11 +1034,32 @@ async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
     #[cfg(test)]
     store_stall::maybe_stall(&handle.root).await;
     if let Ok(mut guard) = Arc::clone(&handle.ctx).try_lock_owned() {
-        open_handle_context(&mut guard, handle)?;
-        return Ok(HookStore::Slot(
-            guard,
-            crate::core::SlotHold::start("hook read"),
-        ));
+        if guard.is_some() || handle.doc_reindex_active.load(Ordering::Relaxed) {
+            open_handle_context(&mut guard, handle)?;
+            return Ok(HookStore::Slot(
+                guard,
+                crate::core::SlotHold::start("hook read"),
+            ));
+        }
+        // Empty slot: read the store through a read-only context now and open
+        // the slot behind the hook. A store that cannot be read that way (not
+        // initialized, stale schema) still opens inline, where it is
+        // initialized or migrated.
+        match Context::open_read_only(&handle.root) {
+            Ok(ctx) => {
+                drop(guard);
+                warm_slot_in_background(handle);
+                return Ok(HookStore::Bypass(Some(ctx)));
+            }
+            Err(error) => {
+                tracing::debug!("hook cold read bypass unavailable, opening the store: {error}");
+                open_handle_context(&mut guard, handle)?;
+                return Ok(HookStore::Slot(
+                    guard,
+                    crate::core::SlotHold::start("hook read"),
+                ));
+            }
+        }
     }
     match Context::open_read_only(&handle.root) {
         Ok(ctx) => Ok(HookStore::Bypass(Some(ctx))),
@@ -1029,10 +1097,11 @@ async fn run_handle_memory_mutation<T>(
 ) -> Result<T, McpError> {
     let (db_path, generation, result) = {
         let guard = slot.lock().await;
-        let _hold = crate::core::SlotHold::start(what);
+        let mut hold = crate::core::SlotHold::start(what);
         let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
+        hold.in_repo(ctx.root());
         let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
             .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
         let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, what)
@@ -4636,11 +4705,12 @@ async fn record_recall(
     // The ledger is telemetry: a slot held by a mutation must not hold the
     // hook's answer, so the row is written behind it (#209-bc4b).
     match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(mut guard) => log_slot_write(
+        Ok(mut guard) if guard.is_some() => log_slot_write(
             "recall ledger",
             crate::core::run_guarded_write(&mut guard, "recall ledger", record),
         ),
-        Err(_) => write_behind_slot(Arc::clone(&handle.ctx), "recall ledger", record),
+        // Busy, or still empty while the background open runs.
+        _ => write_behind_slot(Arc::clone(&handle.ctx), "recall ledger", record),
     }
 }
 
@@ -16708,6 +16778,32 @@ mod tests {
             after.contains("Half applied rule."),
             "control: the committed row must be delivered: {after}"
         );
+    }
+
+    /// Catches (#209-bc4b): a hook that finds the slot empty (first hook of a
+    /// repo since the daemon started) opening it inline, so the full-file
+    /// `quick_check` of the first open is paid as the hook's context phase
+    /// (1.2 s on a 418 MB store). The hook reads beside the slot and the slot
+    /// opens behind it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_on_an_empty_slot_reads_beside_it_and_the_slot_opens_behind() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        // A daemon that has not opened this store yet.
+        *handle.ctx.lock().await = None;
+
+        let store = hook_store(&handle).await.unwrap();
+        assert!(store.is_bypass(), "the hook opened the empty slot inline");
+        drop(store);
+
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle.ctx.lock().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "nothing opened the slot behind the hook");
     }
 
     /// Catches (#209-bc4b): a PreToolUse/PostToolUse hook still locking the slot

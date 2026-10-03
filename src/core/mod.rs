@@ -116,6 +116,7 @@ const SLOT_HOLD_WARN: std::time::Duration = std::time::Duration::from_millis(100
 /// (`slot held`) rather than from reading the code.
 pub(crate) struct SlotHold {
     what: String,
+    repo: String,
     since: std::time::Instant,
 }
 
@@ -125,8 +126,15 @@ impl SlotHold {
     pub(crate) fn start(what: &str) -> Self {
         Self {
             what: what.to_string(),
+            repo: String::new(),
             since: std::time::Instant::now(),
         }
+    }
+
+    /// Name the repo whose slot this is, once the context is at hand: the log
+    /// line is how the worst hold of each repo is found.
+    pub(crate) fn in_repo(&mut self, root: &Path) {
+        self.repo = root.display().to_string();
     }
 }
 
@@ -135,9 +143,9 @@ impl Drop for SlotHold {
         let held = self.since.elapsed();
         let held_ms = held.as_millis() as u64;
         if held >= SLOT_HOLD_WARN {
-            tracing::warn!(operation = %self.what, held_ms, "slot held");
+            tracing::warn!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
         } else {
-            tracing::debug!(operation = %self.what, held_ms, "slot held");
+            tracing::debug!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
         }
     }
 }
@@ -151,9 +159,10 @@ pub fn run_mutation_verify_after_release<T>(
 ) -> Option<Result<T>> {
     let (db_path, generation, mut result) = {
         let mut guard = slot.blocking_lock();
-        let _hold = SlotHold::start(what);
+        let mut hold = SlotHold::start(what);
         let (db_path, generation) = {
             let ctx = guard.as_ref()?;
+            hold.in_repo(&ctx.root);
             (ctx.db_path.clone(), ctx.generation)
         };
         let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
