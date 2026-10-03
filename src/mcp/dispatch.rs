@@ -1185,6 +1185,24 @@ fn write_behind_slot(
     }
 }
 
+/// Wait for the drain `write_behind_slot` started for this slot, if one runs.
+///
+/// The drain is a detached task. On the `MDKB_NO_DAEMON` route the process
+/// exits when the hook returns, so a hook hands this to
+/// [`DispatchContext::spawn_background`] and the caller's join keeps the process
+/// alive until the queued rows are written.
+async fn settle_deferred_writes(key: usize) {
+    loop {
+        let task = deferred_writes()
+            .get_mut(&key)
+            .and_then(|queue| queue.waiting.take());
+        let Some(task) = task else {
+            return;
+        };
+        let _ = task.await;
+    }
+}
+
 /// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
 /// the read leg, which bypasses it, instead of being waited on, and an empty one
 /// is opened in the background instead of inline (#209-bc4b).
@@ -7663,6 +7681,9 @@ fn render_code_index_hits(
 /// code index in one-shot CLI invocations). Called AFTER the hook impl, so
 /// session_start (which warms the ctx) is counted; a cold pre_tool_use one-shot
 /// skips. In the daemon the ctx stays warm, so all hook traffic is counted.
+/// The one exception is the one-shot `session_start` arm, which does open the
+/// context and writes through `write_hook_call` itself (#261-95fe): its count is
+/// the one the in-process route would otherwise lose at exit.
 /// `record_call` is three tiny local-SQLite writes (sub-millisecond).
 async fn record_hook_call(handle: &RepoHandle, method: &str) {
     let event = method.strip_prefix("hook.").unwrap_or(method).to_string();
@@ -8142,6 +8163,11 @@ pub async fn dispatch_call(
                     budget,
                 ),
             });
+            // A recall that bypassed a busy slot queued its query event behind
+            // it. The one-shot caller joins that drain after emitting.
+            if dctx.background.is_some() {
+                dctx.spawn_background(settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize));
+            }
             // Telemetry takes the same store lock the stalled recall waited
             // on; awaiting it here would hold the answer past the deadline.
             let telemetry_handle = Arc::clone(&handle);
@@ -18062,6 +18088,53 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Catches (#265-0caa): a one-shot `user_prompt_submit` whose query event is
+    /// queued behind a busy slot while `join_background` returns at once, so the
+    /// process exits and the row is lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_shot_prompt_joins_its_deferred_query_event() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.telemetry.query_events = true;
+        });
+        seed_memory_entry(&handle, "qe-join").await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        let dctx = make_collecting_dctx();
+        dispatch_call(
+            "hook.user_prompt_submit",
+            json!({
+                "prompt": "what do we know about the recall_gate_fixture topic content",
+                "session_id": "s1"
+            }),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("hook");
+
+        // The slot is still held, so the row cannot have been written: a join
+        // that finishes now did not wait for the drain.
+        let join = dctx.join_background();
+        tokio::pin!(join);
+        tokio::select! {
+            _ = &mut join => panic!("join_background returned while the query event was still queued"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        }
+        release.send(()).unwrap();
+        held.await.unwrap();
+        join.await;
+
+        let guard = handle.ctx.lock().await;
+        let rows: i64 = guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM query_events", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows >= 1, "the joined drain must have written the row");
     }
 
     /// Catches (#209-bc4b): the real fallback (a read-only open that fails on a

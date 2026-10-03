@@ -162,6 +162,14 @@
   and the local release gate found the missing reserved hooks session.
   Story 261-95fe.
 
+- **One-shot `UserPromptSubmit` keeps its query event.** With telemetry
+  opted in, a recall that read through the bypass while the store was still
+  opening queued its query event on a detached task, and the fallback CLI
+  exited before it ran. The one-shot caller now joins that queue through the
+  same background-task collection. The critic's full release run found
+  `stats_hooks::query_events_on_records_hash_but_never_text` failing under
+  load, on the previous commit too. Story 265-0caa.
+
 - **Reranker downloads respect `HF_ENDPOINT`.** A configured endpoint now
   applies to the reranker as well as the embedding model. The local release
   CI regression found that an offline test contacted Hugging Face instead
