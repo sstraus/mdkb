@@ -16806,6 +16806,129 @@ mod tests {
         assert!(opened.is_ok(), "nothing opened the slot behind the hook");
     }
 
+    /// Catches (#209-bc4b): `record_recall` on an empty slot queueing its write
+    /// before the background open has the slot, so the write meets an empty
+    /// slot and is dropped ("the store was closed before it could be written")
+    /// — the first prompt of a repo since the daemon started leaves no ledger
+    /// row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recall_row_written_while_the_slot_is_empty_is_kept() {
+        for attempt in 0..8 {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            *handle.ctx.lock().await = None;
+
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+
+            let kept = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    {
+                        let guard = handle.ctx.lock().await;
+                        if let Some(ctx) = guard.as_ref() {
+                            let rows =
+                                crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap();
+                            if rows == 1 {
+                                return;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            assert!(
+                kept.is_ok(),
+                "attempt {attempt}: the recall row of a prompt on an empty slot was lost"
+            );
+        }
+    }
+
+    /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
+    /// so a hook arriving while the startup reindex owns the store (slot taken
+    /// out, flag set) opens a second context over it; and the opposite, a flag
+    /// left in the way once the reindex is done.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_background_open_waits_out_a_document_reindex() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            handle.ctx.lock().await.is_none(),
+            "a context was opened while the document reindex owned the store"
+        );
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while handle.ctx.lock().await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(opened.is_ok(), "the slot stayed empty after the reindex");
+    }
+
+    /// Catches (#209-bc4b): a hook that reads a torn store through its
+    /// read-only context before the first integrity probe leaving the slot
+    /// unprobed, so the damaged file is never quarantined and rebuilt.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hook_reading_a_torn_store_on_an_empty_slot_still_gets_it_healed() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let mut guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            ctx.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            let db_path = ctx.db_path.clone();
+            *guard = None;
+            let len = std::fs::metadata(&db_path).unwrap().len();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&db_path)
+                .unwrap();
+            file.set_len(len / 2).unwrap();
+        }
+
+        let mut store = hook_store(&handle).await.expect("the hook answers");
+        // A torn read may fail or not, depending on which pages it touches; it
+        // must not panic and must not keep the corrupt context alive.
+        let _ = crate::core::run_guarded_read(store.slot(), "torn read", |ctx| {
+            Ok(ctx
+                .conn
+                .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+        });
+        drop(store);
+
+        let healed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let quarantined = std::fs::read_dir(tmp.path().join(".mdkb"))
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"));
+                if quarantined && handle.ctx.lock().await.is_some() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            healed.is_ok(),
+            "the torn store was never quarantined and reopened"
+        );
+    }
+
     /// Catches (#209-bc4b): a PreToolUse/PostToolUse hook still locking the slot
     /// (or the tool path giving up on a busy slot) so that it waits out the
     /// mutation even when no trigger matches.

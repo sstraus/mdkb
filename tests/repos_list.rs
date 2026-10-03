@@ -253,3 +253,32 @@ fn cli_json_lists_every_field_and_writes_nothing() {
         "no migration"
     );
 }
+
+/// Catches (#210-b83b): the parallel listing returning rows in the order they
+/// finish rather than the order of `roots`, or attributing a row to the wrong
+/// root. Rows differ in cost: a gone root answers at once, a store with more
+/// documents takes longer.
+#[test]
+fn parallel_listing_keeps_the_order_of_the_roots() {
+    let dir = TempDir::new().unwrap();
+    let mut roots = Vec::new();
+    for i in 0..24usize {
+        if i % 3 == 0 {
+            roots.push(dir.path().join(format!("gone-{i}")));
+        } else {
+            roots.push(store(dir.path(), &format!("repo-{i}"), 60 - i, 1));
+        }
+    }
+
+    let rows = list_repos(&roots);
+
+    assert_eq!(rows.len(), roots.len());
+    for (i, (row, root)) in rows.iter().zip(&roots).enumerate() {
+        assert_eq!(&row.path, root, "row {i} belongs to another root");
+        if i % 3 == 0 {
+            assert_eq!(row.health, Health::Gone, "row {i}");
+        } else {
+            assert_eq!(row.docs, Some((60 - i) as i64), "row {i} carries another store");
+        }
+    }
+}
