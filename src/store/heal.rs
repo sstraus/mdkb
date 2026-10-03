@@ -2984,3 +2984,67 @@ mod verify_and_mark_tests {
         assert!(!marker_path(&missing).exists());
     }
 }
+
+#[cfg(test)]
+mod diagnose_damage_tests {
+    use super::*;
+
+    const PAGE: usize = 1024;
+
+    /// A quarantined file that still opens but whose index root page has its cell
+    /// pointers overwritten, so `quick_check` reports the index tree. Returns
+    /// the index name.
+    fn damaged_index_db(path: &Path) -> &'static str {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA page_size = {PAGE}; PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+             CREATE INDEX ib ON t (b);"
+        ))
+        .unwrap();
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO t (b) VALUES (?1)",
+                [format!("v{i:05}").repeat(3)],
+            )
+            .unwrap();
+        }
+        let root: usize = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'ib'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[(root - 1) * PAGE + 8..(root - 1) * PAGE + 40].fill(0xFF);
+        std::fs::write(path, bytes).unwrap();
+        "ib"
+    }
+
+    /// Catches: the match guard `text != "ok"` replaced by `false`: every
+    /// `quick_check` line is dropped and the report says "no damage found" for a
+    /// file that is torn.
+    #[test]
+    fn diagnose_keeps_the_quick_check_lines_of_a_damaged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-1");
+        damaged_index_db(&corrupt);
+
+        let diagnosis = diagnose(&corrupt);
+
+        assert!(!diagnosis.quick_check.is_empty(), "{diagnosis:?}");
+        assert!(
+            diagnosis.quick_check.iter().all(|row| row != "ok"),
+            "{diagnosis:?}"
+        );
+        assert!(
+            diagnosis
+                .quick_check
+                .iter()
+                .any(|row| row.contains("Tree ")),
+            "{diagnosis:?}"
+        );
+    }
+}
