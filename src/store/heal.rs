@@ -826,8 +826,9 @@ struct Diagnosis {
 /// 4: ...`). Extract those root pages so they can be resolved to table names.
 fn root_pages_in(rows: &[String]) -> Vec<i64> {
     let mut pages = Vec::new();
-    for row in rows {
-        let Some(rest) = row.strip_prefix("Tree ") else {
+    // SQLite joins the messages of one database into a single row.
+    for line in rows.iter().flat_map(|row| row.lines()) {
+        let Some(rest) = line.strip_prefix("Tree ") else {
             continue;
         };
         let Some(page) = rest.split_whitespace().next() else {
@@ -2879,5 +2880,227 @@ mod critic_201b_r4 {
         .unwrap();
         assert!(!has_process_probe(&db));
         assert!(!marker_path(&db).exists());
+    }
+}
+
+#[cfg(test)]
+mod verify_and_mark_tests {
+    use super::*;
+
+    fn healthy_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+    }
+
+    /// A file `quick_check` flags: a row that breaks its CHECK constraint.
+    fn corrupt_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (n INTEGER CHECK (n > 0));
+             PRAGMA ignore_check_constraints = ON;
+             INSERT INTO t VALUES (-1);",
+        )
+        .unwrap();
+    }
+
+    fn is_index_corrupt(result: Result<()>) -> bool {
+        result.is_err_and(|e| matches!(e.kind(), crate::error::ErrorKind::IndexCorrupt { .. }))
+    }
+
+    /// Catches: `verify_and_mark -> Ok(())`: a sound file never gets its marker,
+    /// and a corrupt one is reported as fine and keeps the marker that certifies it.
+    #[test]
+    fn verify_and_mark_certifies_a_sound_file_and_condemns_a_corrupt_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let sound = dir.path().join("sound.sqlite");
+        healthy_db(&sound);
+        verify_and_mark(&Connection::open(&sound).unwrap(), &sound).unwrap();
+        assert!(marker_path(&sound).exists(), "a sound file is certified");
+
+        let bad = dir.path().join("bad.sqlite");
+        corrupt_db(&bad);
+        touch_marker(&marker_path(&bad));
+        let result = verify_and_mark(&Connection::open(&bad).unwrap(), &bad);
+        assert!(is_index_corrupt(result));
+        assert!(
+            !marker_path(&bad).exists(),
+            "a corrupt file loses its marker"
+        );
+    }
+
+    /// Catches: `verify_and_mark_throttled_at -> Ok(())` and the same for
+    /// `verify_and_mark_throttled`: a stale or absent marker would not lead to a
+    /// probe, so corruption goes unreported and a sound file is never certified.
+    #[test]
+    fn a_stale_marker_leads_to_a_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let sound = dir.path().join("sound.sqlite");
+        healthy_db(&sound);
+        verify_and_mark_throttled_at(&sound, Duration::ZERO, SystemTime::now()).unwrap();
+        assert!(marker_path(&sound).exists());
+
+        let bad = dir.path().join("bad.sqlite");
+        corrupt_db(&bad);
+        assert!(is_index_corrupt(verify_and_mark_throttled_at(
+            &bad,
+            Duration::ZERO,
+            SystemTime::now()
+        )));
+        assert!(is_index_corrupt(verify_and_mark_throttled(&bad)));
+
+        let other = dir.path().join("other.sqlite");
+        healthy_db(&other);
+        verify_and_mark_throttled(&other).unwrap();
+        assert!(marker_path(&other).exists());
+    }
+
+    /// Catches: the throttle dropped: a marker younger than the interval must
+    /// suppress the probe even over a file `quick_check` would condemn.
+    #[test]
+    fn a_fresh_marker_suppresses_the_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.sqlite");
+        corrupt_db(&bad);
+        touch_marker(&marker_path(&bad));
+
+        verify_and_mark_throttled_at(&bad, CHECK_INTERVAL, SystemTime::now()).unwrap();
+        assert!(marker_path(&bad).exists());
+    }
+
+    /// Catches: `delete !` in `!db_path.exists()`: a missing file would be opened
+    /// (and so created) by the probe, and an existing one would skip its probe.
+    #[test]
+    fn a_missing_database_is_neither_probed_nor_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.sqlite");
+
+        verify_and_mark_throttled_at(&missing, Duration::ZERO, SystemTime::now()).unwrap();
+
+        assert!(!missing.exists(), "the probe must not create the file");
+        assert!(!marker_path(&missing).exists());
+    }
+}
+
+#[cfg(test)]
+mod diagnose_damage_tests {
+    use super::*;
+
+    const PAGE: usize = 1024;
+
+    /// A quarantined file that still opens but whose index root page has its cell
+    /// pointers overwritten, so `quick_check` reports the index tree. Returns
+    /// the index name.
+    fn damaged_index_db(path: &Path) -> &'static str {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA page_size = {PAGE}; PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT);
+             CREATE INDEX ib ON t (b);"
+        ))
+        .unwrap();
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO t (b) VALUES (?1)",
+                [format!("v{i:05}").repeat(3)],
+            )
+            .unwrap();
+        }
+        let root: usize = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = 'ib'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[(root - 1) * PAGE + 8..(root - 1) * PAGE + 40].fill(0xFF);
+        std::fs::write(path, bytes).unwrap();
+        "ib"
+    }
+
+    /// Catches: the match guard `text != "ok"` replaced by `false`: every
+    /// `quick_check` line is dropped and the report says "no damage found" for a
+    /// file that is torn.
+    #[test]
+    fn diagnose_keeps_the_quick_check_lines_of_a_damaged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-1");
+        damaged_index_db(&corrupt);
+
+        let diagnosis = diagnose(&corrupt);
+
+        assert!(!diagnosis.quick_check.is_empty(), "{diagnosis:?}");
+        assert!(
+            diagnosis.quick_check.iter().all(|row| row != "ok"),
+            "{diagnosis:?}"
+        );
+        assert!(
+            diagnosis
+                .quick_check
+                .iter()
+                .any(|row| row.contains("Tree ")),
+            "{diagnosis:?}"
+        );
+    }
+
+    /// Catches: `delete !` in `!damaged_tables.contains(&name)`: the table named
+    /// by a damaged root page is never recorded (and, once recorded, would be
+    /// repeated for every further page that resolves to it).
+    #[test]
+    fn diagnose_names_the_damaged_index_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-1");
+        let index = damaged_index_db(&corrupt);
+
+        let diagnosis = diagnose(&corrupt);
+
+        assert_eq!(diagnosis.damaged_tables, [index], "{diagnosis:?}");
+    }
+}
+
+#[cfg(test)]
+mod sweep_wrapper_tests {
+    use super::*;
+
+    fn quarantined_copy(dir: &Path, stamp: i64) -> PathBuf {
+        let copy = dir.join(format!("index.sqlite.corrupt-{stamp}"));
+        std::fs::write(&copy, b"corrupt bytes").unwrap();
+        std::fs::write(
+            report_path(&copy),
+            format!(
+                r#"{{"corrupt_file":"{}","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":true}}"#,
+                copy.file_name().unwrap().to_string_lossy()
+            ),
+        )
+        .unwrap();
+        copy
+    }
+
+    /// Catches: `sweep_expired_quarantines -> ()`. Only the injectable variant is
+    /// tested elsewhere, so a wrapper that never calls it (or passes the wrong
+    /// retention or clock) leaves expired forensic copies on disk for good.
+    #[test]
+    fn the_sweep_deletes_a_copy_past_the_retention_and_keeps_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let expired = quarantined_copy(
+            dir.path(),
+            now - QUARANTINE_RETENTION.as_secs() as i64 - 3600,
+        );
+        let fresh = quarantined_copy(dir.path(), now - 3600);
+
+        sweep_expired_quarantines(dir.path());
+
+        assert!(!expired.exists(), "a copy past the retention is deleted");
+        assert!(fresh.exists(), "a copy inside the retention is kept");
     }
 }
