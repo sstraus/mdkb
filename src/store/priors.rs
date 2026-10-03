@@ -4278,4 +4278,16 @@ mod tests {
             );
         }
     }
+
+    // Catches: `||` -> `&&` in the guard of curate_cluster_family: one id, or a
+    // list naming a cluster twice, would be merged instead of rejected.
+    #[test]
+    fn curation_rejects_one_cluster_and_a_repeated_cluster() {
+        let conn = conn();
+        let ids = family(&conn, ["s-a", "s-b"]);
+
+        assert!(curate_cluster_family(&conn, &[&ids[0]], 9000).is_err());
+        assert!(curate_cluster_family(&conn, &[&ids[0], &ids[0], &ids[1]], 9000).is_err());
+        assert!(curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).is_ok());
+    }
 }
