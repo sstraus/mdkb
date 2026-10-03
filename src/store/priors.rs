@@ -4257,4 +4257,25 @@ mod tests {
         assert!(!with_unobservable.is_empty());
         assert!(!with_unrefuted.is_empty());
     }
+
+    // Catches: `+` -> `*` in `strength = 1.0 + (1.0 + evidence).ln()`. Every other
+    // score test uses zero elapsed days, where freshness is 1 whatever the
+    // strength. Expected values: 0.25 * exp(-90 days / (90 * (1 + ln(1 + e)))).
+    #[test]
+    fn more_evidence_slows_the_freshness_decay() {
+        let mut c = promoted_cluster("clu-strength", r#"{"path_glob":"src/**"}"#, 1);
+        let now = c.last_seen_at + 90 * 86_400;
+        for (evidence, expected) in [
+            (0, 0.091_969_860_292_860_58),
+            (1, 0.138_496_465_952_391_04),
+            (3, 0.164_416_219_031_591_59),
+        ] {
+            c.evidence_count = evidence;
+            let got = cluster_injection_score(&c, now);
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "evidence {evidence}: score {got} != {expected}"
+            );
+        }
+    }
 }
