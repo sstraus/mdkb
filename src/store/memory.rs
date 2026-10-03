@@ -6989,6 +6989,37 @@ mod tests {
         assert_eq!(prunable(1), ["eight-days", "six-days", "two-days"]);
     }
 
+    /// Catches: `limit * 2` -> `limit + 2` when the BM25 leg is over-fetched for
+    /// fusion. Ten entries match "alpha" with strictly falling BM25 rank (same
+    /// length, fewer "alpha" each); the last one is the only one accessed. With a
+    /// limit of 5 the recency fold can lift it to the top only if the BM25 leg
+    /// fetched all ten candidates (`5 * 2`), not seven (`5 + 2`).
+    #[test]
+    fn the_bm25_leg_fetches_twice_the_limit_of_candidates() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        for i in 0..10_usize {
+            let alphas = 12 - i;
+            let content = format!("{}{}", "alpha ".repeat(alphas), "zz ".repeat(12 - alphas));
+            let mut entry = typed_entry(
+                &format!("e{i}"),
+                &format!("title {i}"),
+                &content,
+                EntryType::Topic,
+            );
+            if i == 9 {
+                entry.access_count = 50;
+                entry.last_accessed = Some(now - 10);
+            }
+            add_entry(&conn, &entry).unwrap();
+        }
+
+        let results = search_entries_recall(&conn, "alpha", None, 5, None, &ungated(0.2)).unwrap();
+
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].id, "e9");
+    }
+
     /// Four entries no BM25 term reaches, so the vector leg alone ranks them:
     /// `n`, `a`, `b`, `c` in that order. `counts` is each one's access count
     /// (recently accessed when positive). Returns the final scores, in that
