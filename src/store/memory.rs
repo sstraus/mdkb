@@ -6230,6 +6230,16 @@ mod tests {
         );
     }
 
+    /// Catches: `SourceType::valid_set` returning an empty or placeholder string,
+    /// which leaves the "Invalid source type" error with nothing to choose from.
+    #[test]
+    fn the_valid_source_types_are_listed_in_declaration_order() {
+        assert_eq!(
+            SourceType::valid_set(),
+            "official_docs, user_statement, auto_extracted, inference"
+        );
+    }
+
     /// Catches: a status or sort-order name dropped from its parser.
     #[test]
     fn every_status_and_sort_order_name_parses() {
