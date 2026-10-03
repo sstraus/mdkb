@@ -352,6 +352,7 @@ fn a_repos_json_that_cannot_be_read_keeps_the_last_good_scopes() {
 /// linked worktree's `.git` file spells it. When that path goes through a
 /// symlink it is not the canonical spelling the rules use, so the caller has no
 /// scope and `*` excludes nothing.
+#[cfg(unix)]
 #[test]
 fn the_cli_caller_root_is_canonical_after_following_a_worktree_to_its_main() {
     let tmp = tempfile::tempdir().expect("tmp");
