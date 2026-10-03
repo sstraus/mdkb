@@ -18972,4 +18972,174 @@ mod file_stem_admission_critic_tests {
         assert_eq!(admitted.len(), 1);
         assert_eq!(admitted[0].path, "followups.md");
     }
+
+    /// Catches (critic r7): an off-by-one in the admission cap (63/64 rows split
+    /// into two batches, 65 rows still one batch), or a batch boundary that
+    /// reorders, drops or duplicates rows. Rows are queued while the slot is
+    /// held, so the drain sees the whole backlog at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r7_batches_split_exactly_at_the_cap_and_keep_row_order() {
+        let cases: [(usize, &[usize]); 7] = [
+            (1, &[0]),
+            (63, &[0]),
+            (64, &[0]),
+            (65, &[0, 64]),
+            (128, &[0, 64]),
+            (129, &[0, 64, 128]),
+            (192, &[0, 64, 128]),
+        ];
+        for (rows, expected_starts) in cases {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+            let lock =
+                crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+            let marker = b"r7 current batch";
+            let starts = Arc::new(StdMutex::new(Vec::new()));
+            let order = Arc::new(StdMutex::new(Vec::new()));
+            for row in 0..rows {
+                let (lock, starts, order) = (lock.clone(), Arc::clone(&starts), Arc::clone(&order));
+                write_behind_slot(SlotOpener::of(&handle), "r7 boundary", move |_| {
+                    if std::fs::read(&lock)? != marker {
+                        starts.lock().unwrap().push(row);
+                    }
+                    std::fs::write(lock, marker)?;
+                    order.lock().unwrap().push(row);
+                    Ok(())
+                });
+            }
+            drop(held);
+            wait_until("every boundary row ran", || {
+                order.lock().unwrap().len() == rows
+            })
+            .await;
+            assert_eq!(
+                *order.lock().unwrap(),
+                (0..rows).collect::<Vec<_>>(),
+                "{rows} rows ran out of order or were lost"
+            );
+            assert_eq!(*starts.lock().unwrap(), expected_starts, "{rows} rows");
+        }
+    }
+
+    /// Catches (critic r7): a row enqueued by a running row (mid-batch, and
+    /// from the last row of a full batch) being lost or run before earlier
+    /// rows, because the drain already took its batch and the reservation still
+    /// reads as live.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r7_a_row_enqueued_by_a_running_row_runs_after_the_batch() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let order = Arc::new(StdMutex::new(Vec::new()));
+        for row in 0..WRITE_BEHIND_BATCH_ROWS {
+            let (order, opener) = (Arc::clone(&order), SlotOpener::of(&handle));
+            write_behind_slot(SlotOpener::of(&handle), "r7 parent", move |_| {
+                order.lock().unwrap().push(row);
+                if row == WRITE_BEHIND_BATCH_ROWS - 1 {
+                    let order = Arc::clone(&order);
+                    write_behind_slot(opener, "r7 child", move |_| {
+                        order.lock().unwrap().push(1000);
+                        Ok(())
+                    });
+                }
+                Ok(())
+            });
+        }
+        drop(held);
+        wait_until("the child row ran", || {
+            order.lock().unwrap().len() == WRITE_BEHIND_BATCH_ROWS + 1
+        })
+        .await;
+        let mut expected: Vec<usize> = (0..WRITE_BEHIND_BATCH_ROWS).collect();
+        expected.push(1000);
+        assert_eq!(*order.lock().unwrap(), expected);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+    }
+
+    /// Catches (critic r7): a reservation left behind by a spawn that dropped
+    /// its future (runtime already shut down), so every later enqueue on a live
+    /// runtime sees a "running" drain, returns, and the queue is stranded.
+    #[test]
+    fn critic_r7_a_dropped_spawn_does_not_strand_later_enqueues() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dead = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let closed = dead.handle().clone();
+        drop(dead);
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let _enter = closed.enter();
+            write_behind_slot(SlotOpener::of(&handle), "r7 orphan", counting_write(&ran));
+        }
+        let live = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        live.block_on(async {
+            ensure_handle_context(&handle).await.unwrap();
+            write_behind_slot(SlotOpener::of(&handle), "r7 live", counting_write(&ran));
+            wait_until("the orphaned and the live write ran", || {
+                ran.load(Ordering::SeqCst) == 2
+            })
+            .await;
+            let key = Arc::as_ptr(&handle.ctx) as usize;
+            wait_until("the queue retired", || {
+                !deferred_writes().contains_key(&key)
+            })
+            .await;
+        });
+    }
+
+    /// Catches (critic r7): two enqueues racing a drain that retires between
+    /// reserve and publish, leaving a reservation that never publishes or a
+    /// successor handle overwritten, so a later round's row never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn critic_r7_racing_enqueues_against_retiring_drains_never_strand_a_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads = 4;
+        for round in 1..=150usize {
+            let barrier = Arc::new(std::sync::Barrier::new(threads));
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (barrier, opener, ran) = (
+                        Arc::clone(&barrier),
+                        SlotOpener::of(&handle),
+                        Arc::clone(&ran),
+                    );
+                    let runtime = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let _enter = runtime.enter();
+                        barrier.wait();
+                        write_behind_slot(opener, "r7 race", counting_write(&ran));
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            wait_until(&format!("round {round} rows ran"), || {
+                ran.load(Ordering::SeqCst) == round * threads
+            })
+            .await;
+        }
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until("the queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+    }
 }
