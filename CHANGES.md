@@ -11,6 +11,11 @@
 
 ### Fixed
 
+- **Linux release compatibility with Ubuntu 22.04.** Build x64 and arm64 on
+  Ubuntu 22.04 and reject binaries that import GLIBC symbols newer than 2.35
+  before packaging. CI applies the same check. The maintainer found that
+  v3.11.1 required GLIBC_2.39 and could not start on mac-mint. Story 262-1329.
+
 - **Queued hook telemetry recovers after runtime shutdown.** The queue now
   retains its store slot and detects a terminated waiter even when it was
   cancelled before its first poll. Later telemetry restarts the drain in
