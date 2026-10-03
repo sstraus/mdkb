@@ -8054,7 +8054,25 @@ pub async fn dispatch_call(
                     budget,
                 );
             });
-            record_hook_call(&handle, tool_name).await;
+            if dctx.background.is_some() {
+                // Snapshot warmup can answer before the writable slot opens.
+                // The one-shot caller joins this after emitting its response.
+                let telemetry_handle = Arc::clone(&handle);
+                let event = tool_name
+                    .strip_prefix("hook.")
+                    .unwrap_or(tool_name)
+                    .to_string();
+                dctx.spawn_background(async move {
+                    if let Err(error) = ensure_handle_context(&telemetry_handle).await {
+                        tracing::warn!("hook telemetry context failed to open: {error}");
+                        return;
+                    }
+                    let guard = Arc::clone(&telemetry_handle.ctx).lock_owned().await;
+                    write_hook_call(guard, event).await;
+                });
+            } else {
+                record_hook_call(&handle, tool_name).await;
+            }
             Ok(result)
         }
         "hook.user_prompt_submit" => {

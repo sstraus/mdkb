@@ -2,66 +2,14 @@
 
 ## Unreleased
 
+## 3.11.2 (2026-10-03)
+
 ### Added
 
 - **`repos` MCP tool.** Lists the known repos with the rows `mdkb repos list`
   prints (name, kind, counts, freshness, health), from the same listing and
   renderer, so a client that carries MCP only (AI Chat over ACP) has the CLI's
   answer. MCP tools: 12 to 13. Story 220-711b.
-
-### Fixed
-
-- **Linux release compatibility with Ubuntu 22.04.** Build x64 and arm64 on
-  Ubuntu 22.04 and reject binaries that import GLIBC symbols newer than 2.35
-  before packaging. CI applies the same check. The maintainer found that
-  v3.11.1 required GLIBC_2.39 and could not start on mac-mint. Story 262-1329.
-
-- **Queued hook telemetry recovers after runtime shutdown.** The queue now
-  retains its store slot and detects a terminated waiter even when it was
-  cancelled before its first poll. Later telemetry restarts the drain in
-  insertion order instead of joining an abandoned queue. Empty cancelled queues
-  release their store, and a panicking write leaves subsequent rows intact.
-  Each drain batch shares one writer admission instead of syncing lock metadata
-  for every row (400 admissions took 31.9 s under parallel test load), limited
-  to 64 rows before releasing admission for other writers. Enqueue on a runtime
-  already shut down returns without deadlocking queue cleanup. Found by
-  critic r4–r6's runtime-shutdown, panic and admission regressions.
-  Story 259-ecda.
-
-- **`mdkb update` prunes the collection of a deleted directory.** An
-  auto-detected collection (`docs`, `archive`) whose directory is gone was only
-  reported as a missing path, so its documents stayed searchable and recall kept
-  injecting them. It is now unregistered and its documents removed; the
-  collection returns, re-indexed, when the directory does. A hand-registered or
-  hand-repointed collection (`collection update --path` now marks it manual)
-  keeps the path error. When a store has several convention collections and all
-  would go in one run, none is pruned and the update says so (likely an
-  unmounted volume; `mdkb collection remove <name>` for a deliberate deletion).
-  With a single convention collection the deleted directory is pruned: the data
-  is derived index data, rebuilt when the directory returns; evolution rows
-  cascade. Story 214-1b93.
-
-- **The UserPromptSubmit deadline is reachable on the daemon path.** The hook
-  client gave up after a fixed 1 s, so a daemon answer between 1 s and the
-  1500 ms deadline was dropped and the host got no recall. The client now waits
-  `user_prompt_submit_deadline_ms` plus a 250 ms margin, and the default
-  deadline drops to 1000 ms so the interactive prompt latency stays at the
-  former 1 s. Raise `[hooks] user_prompt_submit_deadline_ms` to trade latency
-  for the 1.0 – 1.25 s warm rows; the client wait follows. The rerank budget
-  clamps to the same deadline (`0` still stops at the default). Story 203-353e.
-
-### Changed
-
-- **Automatic recall is the default.** `[hooks] user_prompt_submit_require_sigil`
-  now defaults to `false`: a prompt without `*` is searched and injected when a
-  candidate clears `hooks.recall_auto_min_cosine` (0.50); `*` still selects the
-  lower 0.40 floor. Set `user_prompt_submit_require_sigil = true` to restore
-  sigil-only recall. The floors are unchanged, `mdkb init` writes the new
-  default in its commented template, and `mdkb doctor` no longer reports
-  `recall.sigil_only` for a default config. Decided by the maintainer on
-  2026-09-30 without a shadow week.
-
-### Added
 
 - **Automatic recall reranks MiniLM's top five with jina-reranker-v2 (int8).**
   The cosine gate rejects an Italian prompt over an English store; a
@@ -149,7 +97,38 @@
   Precision is withheld until 30 candidates are labelled. Holdout rows are
   reported in their own table.
 
+- **Cross-repository search on the CLI and MCP.** `mdkb search --root`
+  accepts a path, repository name or set of roots. `root=*` searches the
+  caller's HOME/WORK scope and leaves session stores out; `root=*:all`
+  includes them. Symbol search also fans out. Results report coverage and
+  rank repositories on shared evidence. Stories 179-e4ac, 218-78c8,
+  222-596a and 223-cad1.
+
+- **`mdkb repos refresh --only outdated`.** Migrate older stores to schema
+  v34 after making and verifying a backup. Repository listings report schema
+  freshness and health, and `mdkb daemon status` asks the running daemon for
+  its repositories. Stories 210-b83b, 219-9d67 and 220-711b.
+
+- **Prior curation and migration review.** `mdkb memory curate-priors` merges
+  reviewed equivalent clusters into the oldest cluster. `mdkb memory propose`
+  lists conservative migration proposals for user-authored priors without a
+  cluster, without changing them. Stories 170-1d2f and 177-ac4b.
+
+- **`mdkb doctor` checks hooks, config, index health and recall settings.**
+  Findings include severity and a remedy; errors return a non-zero exit.
+  Hook repair commands target the scope that contains the hooks.
+  Stories 186-446e and 191-6b10.
+
 ### Changed
+
+- **Automatic recall is the default.** `[hooks] user_prompt_submit_require_sigil`
+  now defaults to `false`: a prompt without `*` is searched and injected when a
+  candidate clears `hooks.recall_auto_min_cosine` (0.50); `*` still selects the
+  lower 0.40 floor. Set `user_prompt_submit_require_sigil = true` to restore
+  sigil-only recall. The floors are unchanged, `mdkb init` writes the new
+  default in its commented template, and `mdkb doctor` no longer reports
+  `recall.sigil_only` for a default config. Decided by the maintainer on
+  2026-09-30 without a shadow week.
 
 - **Working priors stay fresh through use.** Injection scoring now considers
   the latest injection that was not refuted as well as the last observed
@@ -157,7 +136,75 @@
   majority still suppresses injection; misfires lower reach without refuting
   the lesson. Found by the maintainer's 2026-09-23 prior audit.
 
+- **Document recall requires a stronger match.** The default document
+  cosine floor is 0.55. A prompt that names a file stem can admit it at 0.50;
+  documents from a sibling project are excluded when the prompt names another
+  project. Missing files, directories and broken paths are left out of direct
+  and graph recall. Maintainer recall audits and critic regressions found
+  these cases. Stories 193-33f0, 197-3801, 217-11bc and 226-d09e.
+
+- **Repository discovery skips scratch directories and respects an ignore
+  list.** `daemon.toml` ignore rules apply to discovery and explicit opens;
+  invalid rules and unknown settings produce warnings. Repository names can
+  resolve by path suffix. Found during the maintainer's discovery audit.
+  Stories 196-7e19 and 221-8fb6.
+
+- **Linux arm64 builds use a generic CPU baseline.** Release binaries no
+  longer inherit the build host's CPU features. The maintainer's CPU
+  compatibility check found this issue. Story 190-d11e.
+
 ### Fixed
+
+- **One-shot hooks finish their call telemetry before exit.** A call count
+  queued behind a warm store open now joins the fallback CLI's existing
+  background-task collection after the response is emitted. Daemon hooks
+  keep their asynchronous response path. Full-crate validation on Linux
+  and the local release gate found the missing reserved hooks session.
+  Story 261-95fe.
+
+- **Reranker downloads respect `HF_ENDPOINT`.** A configured endpoint now
+  applies to the reranker as well as the embedding model. The local release
+  CI regression found that an offline test contacted Hugging Face instead
+  and unexpectedly succeeded. Story 263-f5be.
+
+- **Linux release compatibility with Ubuntu 22.04.** Build x64 and arm64 on
+  Ubuntu 22.04 and reject binaries that import GLIBC symbols newer than 2.35
+  before packaging. CI applies the same check. The maintainer found that
+  v3.11.1 required GLIBC_2.39 and could not start on mac-mint. Story 262-1329.
+
+- **Queued hook telemetry recovers after runtime shutdown.** The queue now
+  retains its store slot and detects a terminated waiter even when it was
+  cancelled before its first poll. Later telemetry restarts the drain in
+  insertion order instead of joining an abandoned queue. Empty cancelled queues
+  release their store, and a panicking write leaves subsequent rows intact.
+  Each drain batch shares one writer admission instead of syncing lock metadata
+  for every row (400 admissions took 31.9 s under parallel test load), limited
+  to 64 rows before releasing admission for other writers. Enqueue on a runtime
+  already shut down returns without deadlocking queue cleanup. Found by
+  critic r4–r6's runtime-shutdown, panic and admission regressions.
+  Story 259-ecda.
+
+- **`mdkb update` prunes the collection of a deleted directory.** An
+  auto-detected collection (`docs`, `archive`) whose directory is gone was only
+  reported as a missing path, so its documents stayed searchable and recall kept
+  injecting them. It is now unregistered and its documents removed; the
+  collection returns, re-indexed, when the directory does. A hand-registered or
+  hand-repointed collection (`collection update --path` now marks it manual)
+  keeps the path error. When a store has several convention collections and all
+  would go in one run, none is pruned and the update says so (likely an
+  unmounted volume; `mdkb collection remove <name>` for a deliberate deletion).
+  With a single convention collection the deleted directory is pruned: the data
+  is derived index data, rebuilt when the directory returns; evolution rows
+  cascade. Story 214-1b93.
+
+- **The UserPromptSubmit deadline is reachable on the daemon path.** The hook
+  client gave up after a fixed 1 s, so a daemon answer between 1 s and the
+  1500 ms deadline was dropped and the host got no recall. The client now waits
+  `user_prompt_submit_deadline_ms` plus a 250 ms margin, and the default
+  deadline drops to 1000 ms so the interactive prompt latency stays at the
+  former 1 s. Raise `[hooks] user_prompt_submit_deadline_ms` to trade latency
+  for the 1.0 – 1.25 s warm rows; the client wait follows. The rerank budget
+  clamps to the same deadline (`0` still stops at the default). Story 203-353e.
 
 - **A `config.toml` edit now applies on the next request.** The daemon read
   a repository's config once, when it opened the repository, and ignored
@@ -196,6 +243,48 @@
   cap; cold-model recall keeps deterministic newest-edge order. A read-only
   2026-09-27 census found 19 TUICommander documents with more than three
   eligible frontmatter neighbors, exposing the old truncation order.
+
+- **Hooks can answer while another operation holds the store.** A private
+  read snapshot lets recall proceed, and an empty store slot opens in the
+  background. Telemetry queues wait for startup reindexing instead of losing
+  rows. Repository listings read stores in parallel; store-holder logs name
+  the repository. Found by the maintainer's hook latency watch and critic
+  regressions. Stories 209-bc4b, 210-b83b and 215-ef2e.
+
+- **Recall deadlines also bound blocking search and telemetry.** These tasks
+  run off the async runtime thread. A cut recall does not mark entries as
+  delivered, and a later prompt can still recall them. Long prompts use a
+  bounded BM25 expression; hook injections stay within 2048 bytes without
+  crediting trimmed entries as delivered. Handoffs and notification turns
+  skip automatic recall. Found by the maintainer's latency watch and critic
+  regressions. Stories 194-f82f, 195-f9c0, 198-59a5, 199-77a9, 200-9f07
+  and 207-c0bd.
+
+- **Integrity checks no longer hold the store mutex after a daemon write.**
+  Post-write checks run after release, account for competing writers and
+  close only the context they probed. Reopening a previously checked file
+  avoids a repeated full scan. Found by the maintainer's latency watch and
+  critic regressions. Story 201-481e.
+
+- **Repository scope survives an unreadable or partially edited map.**
+  Readers leave `repos.json` untouched; the daemon keeps its last good policy
+  and retries a skipped persist. Scope rules for temporarily missing stores
+  are retained, without returning a missing root as searchable. Found by
+  critic regressions. Story 222-596a.
+
+- **Schema migration checks the version inside its transaction.** A waiting
+  older binary refuses a store migrated by a newer binary, and refresh moves
+  pre-migration changes into the same transaction. Found by critic migration
+  regressions. Story 219-9d67.
+
+- **Code pruning removes deleted files' vectors in one rewrite.** A failed
+  file deletion retains its vectors. Found by the maintainer's indexing
+  audit and critic regressions. Story 211-f651.
+
+- **Corruption diagnosis names tables from multi-line SQLite output.**
+  All lines in a `quick_check` row are inspected, so damaged tables are
+  reported rather than lost after the first line. Found by mutation
+  validation and a damaged-index regression. Stories 251-c2c4 and 253-c927.
 
 ## 3.11.1 (2026-09-27)
 

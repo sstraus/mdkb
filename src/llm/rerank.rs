@@ -310,7 +310,11 @@ pub fn download() -> Result<()> {
     if is_cached() {
         return Ok(());
     }
-    let api = ApiBuilder::from_cache(Cache::new(super::embeddings::cache_base_dir()))
+    let mut builder = ApiBuilder::from_cache(Cache::new(super::embeddings::cache_base_dir()));
+    if let Ok(endpoint) = std::env::var("HF_ENDPOINT") {
+        builder = builder.with_endpoint(endpoint);
+    }
+    let api = builder
         .with_progress(true)
         .build()
         .map_err(|e| Error::other(format!("reranker download: {e}")))?;
