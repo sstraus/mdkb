@@ -17414,6 +17414,133 @@ mod tests {
         assert!(slot.upgrade().is_none(), "retired queue leaked its slot");
     }
 
+    /// Catches (critic r5): a drain cancelled mid-batch leaves a queue entry
+    /// with no writes and a dead task that nothing ever removes, so the store
+    /// connection of a dropped handle stays pinned for the life of the process.
+    #[test]
+    fn critic_r5_cancelled_drain_with_nothing_pending_releases_its_slot() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let slot = Arc::downgrade(&handle.ctx);
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "r5 mid-batch", move |_| {
+                started_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                Ok(())
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        });
+        doomed.shutdown_timeout(std::time::Duration::ZERO);
+        release_tx.send(()).unwrap();
+        drop(handle);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while slot.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let released = slot.upgrade().is_none();
+        deferred_writes().remove(&key);
+        assert!(released, "an empty, abandoned queue still pins its slot");
+    }
+
+    /// Catches (critic r5): one panicking write in a batch drops every write
+    /// queued behind it in the same batch, because the batch dies with the
+    /// blocking task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_r5_a_panicking_write_does_not_drop_the_rest_of_its_batch() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        write_behind_slot(SlotOpener::of(&handle), "r5 first", counting_write(&ran));
+        write_behind_slot(SlotOpener::of(&handle), "r5 panics", |_| panic!("r5 write"));
+        write_behind_slot(SlotOpener::of(&handle), "r5 third", counting_write(&ran));
+        drop(held);
+        wait_until("the writes around the panic ran", || {
+            ran.load(Ordering::SeqCst) == 2
+        })
+        .await;
+    }
+
+    /// Catches (critic r5): enqueues that find a terminated waiter at the same
+    /// time each respawn one (or none), duplicating, reordering or losing the
+    /// stranded row and the new ones.
+    #[test]
+    fn critic_r5_concurrent_enqueues_after_a_dead_waiter_run_each_row_once() {
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_at(tmp.path().to_path_buf(), |_| {});
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        let order = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        let push = |id: usize| {
+            let order = Arc::clone(&order);
+            move |_: &Context| {
+                order.lock().unwrap().push(id);
+                Ok(())
+            }
+        };
+        let doomed = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        doomed.block_on(async {
+            write_behind_slot(SlotOpener::of(&handle), "r5 stale", push(0));
+        });
+        drop(doomed);
+        let later = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let gate = Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (1..=8)
+            .map(|id| {
+                let (handle, gate, rt) = (
+                    Arc::clone(&handle),
+                    Arc::clone(&gate),
+                    later.handle().clone(),
+                );
+                let write = push(id);
+                std::thread::spawn(move || {
+                    let _enter = rt.enter();
+                    gate.wait();
+                    write_behind_slot(SlotOpener::of(&handle), "r5 racer", write);
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let done = later.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while order.lock().unwrap().len() < 9 {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+        });
+        let ran = order.lock().unwrap().clone();
+        deferred_writes().remove(&key);
+        assert!(done.is_ok(), "rows missing, ran {ran:?}");
+        assert_eq!(ran[0], 0, "the stranded row ran after newer rows: {ran:?}");
+        let mut sorted = ran.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..=8).collect::<Vec<_>>(), "a row ran twice: {ran:?}");
+    }
+
     /// Catches (#209-bc4b): writes of one slot running out of the order they
     /// were queued in (a batch drained from the back, or each hook racing its
     /// own task for the lock). The ledger keeps rows in insertion order.
