@@ -1023,6 +1023,31 @@ fn deferred_writes() -> std::sync::MutexGuard<'static, HashMap<usize, DeferredQu
     DEFERRED_WRITES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Owned by the waiter task: when the task is dropped before it finished (its
+/// runtime shut down, or it was aborted), frees the queue for the next write to
+/// start a waiter, instead of leaving `waiting` set for a task that is gone.
+/// Keys are slot addresses; the waiter holds an `Arc` of its slot, so the
+/// address cannot be reused while the entry stands.
+struct WaiterGuard {
+    key: usize,
+    finished: bool,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let mut queues = deferred_writes();
+        if let Some(queue) = queues.get_mut(&self.key) {
+            queue.waiting = false;
+            if queue.writes.is_empty() {
+                queues.remove(&self.key);
+            }
+        }
+    }
+}
+
 /// Queue a small write behind whatever holds the slot, off the caller's path.
 ///
 /// The write is never lost to an empty slot: at most one task per slot waits out
@@ -1045,6 +1070,10 @@ fn write_behind_slot(
         queue.waiting = true;
     }
     tokio::spawn(async move {
+        let mut waiter = WaiterGuard {
+            key,
+            finished: false,
+        };
         let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
         while opener.doc_reindex_active.load(Ordering::Relaxed)
             && tokio::time::Instant::now() < give_up
@@ -1061,6 +1090,7 @@ fn write_behind_slot(
                     .unwrap_or_default();
                 if writes.is_empty() {
                     queues.remove(&key);
+                    waiter.finished = true;
                     return;
                 }
                 writes
