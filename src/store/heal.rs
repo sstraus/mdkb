@@ -826,8 +826,9 @@ struct Diagnosis {
 /// 4: ...`). Extract those root pages so they can be resolved to table names.
 fn root_pages_in(rows: &[String]) -> Vec<i64> {
     let mut pages = Vec::new();
-    for row in rows {
-        let Some(rest) = row.strip_prefix("Tree ") else {
+    // SQLite joins the messages of one database into a single row.
+    for line in rows.iter().flat_map(|row| row.lines()) {
+        let Some(rest) = line.strip_prefix("Tree ") else {
             continue;
         };
         let Some(page) = rest.split_whitespace().next() else {
@@ -3046,6 +3047,20 @@ mod diagnose_damage_tests {
                 .any(|row| row.contains("Tree ")),
             "{diagnosis:?}"
         );
+    }
+
+    /// Catches: `delete !` in `!damaged_tables.contains(&name)`: the table named
+    /// by a damaged root page is never recorded (and, once recorded, would be
+    /// repeated for every further page that resolves to it).
+    #[test]
+    fn diagnose_names_the_damaged_index_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-1");
+        let index = damaged_index_db(&corrupt);
+
+        let diagnosis = diagnose(&corrupt);
+
+        assert_eq!(diagnosis.damaged_tables, [index], "{diagnosis:?}");
     }
 }
 
