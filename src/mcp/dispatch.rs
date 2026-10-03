@@ -720,6 +720,7 @@ fn open_handle_context(
 /// What opening a repo's slot reads from its handle, owned, so a task that
 /// outlives the hook can open the slot too ([`warm_slot_in_background`],
 /// [`write_behind_slot`]).
+#[derive(Clone)]
 struct SlotOpener {
     ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
     root: std::path::PathBuf,
@@ -999,17 +1000,50 @@ fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
 /// store back before it is given up on.
 const WRITE_BEHIND_REINDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
+type DeferredWrite = (
+    &'static str,
+    Box<dyn FnOnce(&Context) -> crate::error::Result<()> + Send>,
+);
+
+/// The writes queued behind one slot. `waiting` is set while a task owns the
+/// queue, so every hook that queues during a reindex joins it instead of
+/// polling for the flag on its own.
+#[derive(Default)]
+struct DeferredQueue {
+    writes: VecDeque<DeferredWrite>,
+    waiting: bool,
+}
+
+/// Queues by slot (the address of its `Arc`; an entry lives only while it holds
+/// writes or a task is on it).
+static DEFERRED_WRITES: std::sync::LazyLock<StdMutex<HashMap<usize, DeferredQueue>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+fn deferred_writes() -> std::sync::MutexGuard<'static, HashMap<usize, DeferredQueue>> {
+    DEFERRED_WRITES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Queue a small write behind whatever holds the slot, off the caller's path.
 ///
-/// The write is never lost to an empty slot: it waits out the startup document
-/// reindex (which owns the store, flag set, and gives it back), and opens the
-/// slot itself when it is still empty once it holds it, so it does not depend
-/// on the order against a background open.
+/// The write is never lost to an empty slot: at most one task per slot waits out
+/// the startup document reindex (which owns the store, flag set, and gives it
+/// back), then drains the queue in order, opening the slot itself when it holds
+/// it empty, so nothing depends on the order against a background open.
 fn write_behind_slot(
     opener: SlotOpener,
     what: &'static str,
     f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
 ) {
+    let key = Arc::as_ptr(&opener.ctx) as usize;
+    {
+        let mut queues = deferred_writes();
+        let queue = queues.entry(key).or_default();
+        queue.writes.push_back((what, Box::new(f)));
+        if queue.waiting {
+            return;
+        }
+        queue.waiting = true;
+    }
     tokio::spawn(async move {
         let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
         while opener.doc_reindex_active.load(Ordering::Relaxed)
@@ -1017,18 +1051,38 @@ fn write_behind_slot(
         {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
-        let written = tokio::task::spawn_blocking(move || {
-            if guard.is_none() {
-                opener.open(&mut guard)?;
+        loop {
+            let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+            let batch = {
+                let mut queues = deferred_writes();
+                let writes = queues
+                    .get_mut(&key)
+                    .map(|queue| std::mem::take(&mut queue.writes))
+                    .unwrap_or_default();
+                if writes.is_empty() {
+                    queues.remove(&key);
+                    return;
+                }
+                writes
+            };
+            let opener = SlotOpener::clone(&opener);
+            let written = tokio::task::spawn_blocking(move || {
+                if guard.is_none() {
+                    if let Err(error) = opener.open(&mut guard) {
+                        for (what, _) in &batch {
+                            tracing::warn!("{what} dropped: {}", error.message);
+                        }
+                        return;
+                    }
+                }
+                for (what, f) in batch {
+                    log_slot_write(what, crate::core::run_guarded_write(&mut guard, what, f));
+                }
+            })
+            .await;
+            if let Err(error) = written {
+                tracing::warn!("deferred write task failed: {error}");
             }
-            Ok::<_, McpError>(crate::core::run_guarded_write(&mut guard, what, f))
-        })
-        .await;
-        match written {
-            Ok(Ok(outcome)) => log_slot_write(what, outcome),
-            Ok(Err(error)) => tracing::warn!("{what} dropped: {}", error.message),
-            Err(error) => tracing::warn!("{what} task failed: {error}"),
         }
     });
 }
@@ -17005,6 +17059,60 @@ mod tests {
         )
         .await;
         assert!(done.is_ok(), "the hook waited for the reindex");
+    }
+
+    /// Catches (#209-bc4b): every hook that queues a write during the startup
+    /// reindex starting its own polling task (100 ms, up to 600 s), so the task
+    /// count grows with the hooks. One waiter per slot, and every write joins it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifty_hooks_during_a_reindex_leave_one_waiter_and_lose_no_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        *handle.ctx.lock().await = None;
+        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+
+        for i in 0..50 {
+            record_recall(
+                &handle,
+                &format!("s{i}"),
+                RecallMode::Automatic,
+                0.5,
+                Vec::new(),
+            )
+            .await;
+        }
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        {
+            let queues = deferred_writes();
+            let queue = queues.get(&key).expect("the slot has a queue");
+            assert!(queue.waiting, "a waiter owns the queue");
+            assert_eq!(queue.writes.len(), 50, "every write joined the one waiter");
+        }
+
+        handle.doc_reindex_active.store(false, Ordering::Relaxed);
+        let kept = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let guard = handle.ctx.lock().await;
+                    if let Some(ctx) = guard.as_ref() {
+                        if crate::store::recall_ledger::prompts_since(&ctx.conn, 0).unwrap() == 50 {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(kept.is_ok(), "rows were lost by the coalesced waiter");
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while deferred_writes().contains_key(&key) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(drained.is_ok(), "the waiter left its queue behind");
     }
 
     /// Catches (#209-bc4b): the background open ignoring `doc_reindex_active`,
