@@ -17,8 +17,10 @@
   insertion order instead of joining an abandoned queue. Empty cancelled queues
   release their store, and a panicking write leaves subsequent rows intact.
   Each drain batch shares one writer admission instead of syncing lock metadata
-  for every row (400 admissions took 31.9 s under parallel test load). Found by
-  critic r4 and r5's runtime-shutdown, panic and admission regressions.
+  for every row (400 admissions took 31.9 s under parallel test load), limited
+  to 64 rows before releasing admission for other writers. Enqueue on a runtime
+  already shut down returns without deadlocking queue cleanup. Found by
+  critic r4–r6's runtime-shutdown, panic and admission regressions.
   Story 259-ecda.
 
 - **`mdkb update` prunes the collection of a deleted directory.** An

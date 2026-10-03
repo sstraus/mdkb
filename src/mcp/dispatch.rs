@@ -1000,6 +1000,11 @@ fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
 /// store back before it is given up on.
 const WRITE_BEHIND_REINDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Admit at most 64 telemetry rows together: a 50-hook burst needs one sync,
+/// while larger backlogs release the writer lock between bounded batches so
+/// a foreign CLI writer need not wait for the entire backlog.
+const WRITE_BEHIND_BATCH_ROWS: usize = 64;
+
 type DeferredWrite = (
     &'static str,
     Box<dyn FnOnce(&Context) -> crate::error::Result<()> + Send>,
@@ -1012,7 +1017,9 @@ struct DeferredQueue {
     opener: SlotOpener,
     writes: VecDeque<DeferredWrite>,
     waiting: Option<tokio::task::JoinHandle<()>>,
-    generation: Arc<()>,
+    // Some reserves a drain, including the interval before its handle is
+    // published. None means cancellation released the pending queue.
+    generation: Option<Arc<()>>,
 }
 
 /// Queues by slot address; each entry retains the slot's Arc until removed.
@@ -1035,13 +1042,18 @@ impl Drop for DeferredDrain {
     fn drop(&mut self) {
         let mut queues = deferred_writes();
         if let Some(queue) = queues.get_mut(&self.key) {
-            if !Arc::ptr_eq(&queue.generation, &self.generation) {
+            if !queue
+                .generation
+                .as_ref()
+                .is_some_and(|generation| Arc::ptr_eq(generation, &self.generation))
+            {
                 return;
             }
             if queue.writes.is_empty() {
                 queues.remove(&self.key);
             } else {
                 queue.waiting = None;
+                queue.generation = None;
             }
         }
     }
@@ -1062,31 +1074,34 @@ fn write_behind_slot(
     // the map or dropping a cancellation receipt while its mutex is held.
     let runtime = tokio::runtime::Handle::current();
     let key = Arc::as_ptr(&opener.ctx) as usize;
-    let mut queues = deferred_writes();
-    let queue = queues.entry(key).or_insert_with(|| DeferredQueue {
-        opener,
-        writes: VecDeque::new(),
-        waiting: None,
-        generation: Arc::new(()),
-    });
-    queue.writes.push_back((what, Box::new(f)));
-    if queue
-        .waiting
-        .as_ref()
-        .is_some_and(|task| !task.is_finished())
-    {
-        return;
-    }
-    let opener = queue.opener.clone();
-    queue.generation = Arc::new(());
+    let (opener, generation) = {
+        let mut queues = deferred_writes();
+        let queue = queues.entry(key).or_insert_with(|| DeferredQueue {
+            opener,
+            writes: VecDeque::new(),
+            waiting: None,
+            generation: None,
+        });
+        queue.writes.push_back((what, Box::new(f)));
+        if queue.generation.is_some()
+            && queue
+                .waiting
+                .as_ref()
+                .is_none_or(|task| !task.is_finished())
+        {
+            return;
+        }
+        let generation = Arc::new(());
+        queue.generation = Some(Arc::clone(&generation));
+        (queue.opener.clone(), generation)
+    };
     let drain = DeferredDrain {
         key,
-        generation: Arc::clone(&queue.generation),
+        generation: Arc::clone(&generation),
     };
-    // Publish the task under the same lock as enqueue and normal retirement.
-    // The receipt already exists, so cancellation before the first poll still
-    // cleans up this generation. Its identity protects any successor queue.
-    queue.waiting = Some(runtime.spawn(async move {
+    // A shut-down runtime drops the future inside spawn, invoking the receipt.
+    // Spawn outside the map lock so that cleanup can acquire it safely.
+    let task = runtime.spawn(async move {
         let _drain = drain;
         let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
         while opener.doc_reindex_active.load(Ordering::Relaxed)
@@ -1100,7 +1115,10 @@ fn write_behind_slot(
                 let mut queues = deferred_writes();
                 let writes = queues
                     .get_mut(&key)
-                    .map(|queue| std::mem::take(&mut queue.writes))
+                    .map(|queue| {
+                        let count = queue.writes.len().min(WRITE_BEHIND_BATCH_ROWS);
+                        queue.writes.drain(..count).collect::<VecDeque<_>>()
+                    })
                     .unwrap_or_default();
                 if writes.is_empty() {
                     queues.remove(&key);
@@ -1119,6 +1137,9 @@ fn write_behind_slot(
                     }
                 }
                 let Some(ctx) = guard.as_ref() else {
+                    for (what, _) in &batch {
+                        log_slot_write(what, None);
+                    }
                     return;
                 };
                 let admission = match crate::store::mutation_lock::acquire_writer(
@@ -1149,7 +1170,19 @@ fn write_behind_slot(
                 tracing::warn!("deferred write task failed: {error}");
             }
         }
-    }));
+    });
+    let mut queues = deferred_writes();
+    if let Some(queue) = queues.get_mut(&key) {
+        // The task can finish or be cancelled before spawn returns. Publish
+        // only while its reservation still owns this entry, never a successor.
+        if queue
+            .generation
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &generation))
+        {
+            queue.waiting = Some(task);
+        }
+    }
 }
 
 /// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
@@ -17242,6 +17275,17 @@ mod tests {
         }
     }
 
+    /// Wait for an observable blocking-pool result without advancing a paused
+    /// Tokio clock. Real I/O needs a real deadline, not a fixed settle window.
+    async fn wait_until_blocking(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Catches (#209-bc4b): a queued write that polls the startup reindex past
     /// its cap and then opens the store under the flag (a second context over a
     /// store being rebuilt), or wedges holding the slot lock. At the cap the
@@ -17264,7 +17308,11 @@ mod tests {
         // jump below moves the clock before the cap starts counting.
         settle_blocking().await;
         tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
-        settle_blocking().await;
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until_blocking("the capped queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
 
         assert_eq!(
             ran.load(Ordering::SeqCst),
@@ -17298,7 +17346,7 @@ mod tests {
 
         handle.doc_reindex_active.store(false, Ordering::Relaxed);
         tokio::time::advance(std::time::Duration::from_millis(200)).await;
-        settle_blocking().await;
+        wait_until_blocking("the released write ran", || ran.load(Ordering::SeqCst) == 1).await;
         assert_eq!(ran.load(Ordering::SeqCst), 1, "the write was lost");
         assert!(
             handle.ctx.lock().await.is_some(),
@@ -17503,6 +17551,37 @@ mod tests {
         assert_eq!(observed, marker, "the batch reacquired writer admission");
     }
 
+    /// Catches: an unlimited admitted batch holds off foreign CLI writers for
+    /// its entire backlog instead of releasing admission after 64 rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_bursts_release_writer_admission_after_sixty_four_rows() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = Arc::clone(&handle.ctx).try_lock_owned().unwrap();
+        let lock = crate::store::mutation_lock::writer_lock_path(&held.as_ref().unwrap().db_path);
+        let marker = b"current admitted batch";
+        let starts = Arc::new(StdMutex::new(Vec::new()));
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for row in 0..130 {
+            let (lock, starts, ran) = (lock.clone(), Arc::clone(&starts), Arc::clone(&ran));
+            write_behind_slot(SlotOpener::of(&handle), "bounded batch", move |_| {
+                if std::fs::read(&lock)? != marker {
+                    starts.lock().unwrap().push(row);
+                }
+                std::fs::write(lock, marker)?;
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+        }
+        drop(held);
+        wait_until("all 130 bounded-batch rows ran", || {
+            ran.load(Ordering::SeqCst) == 130
+        })
+        .await;
+        assert_eq!(*starts.lock().unwrap(), [0, 64, 128]);
+    }
+
     /// Catches (critic r5): a drain cancelled mid-batch leaves a queue entry
     /// with no writes and a dead task that nothing ever removes, so the store
     /// connection of a dropped handle stays pinned for the life of the process.
@@ -17676,9 +17755,12 @@ mod tests {
         // jump below moves the clock before the cap starts counting.
         settle_blocking().await;
         tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
-        settle_blocking().await;
-        assert_eq!(ran.load(Ordering::SeqCst), 0);
         let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until_blocking("the capped queue retired", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
         assert!(
             !deferred_writes().contains_key(&key),
             "the cap left a queue entry behind"
@@ -17687,7 +17769,7 @@ mod tests {
         handle.doc_reindex_active.store(false, Ordering::Relaxed);
         write_behind_slot(SlotOpener::of(&handle), "after", counting_write(&ran));
         tokio::time::advance(std::time::Duration::from_millis(200)).await;
-        settle_blocking().await;
+        wait_until_blocking("the later write ran", || ran.load(Ordering::SeqCst) == 1).await;
         assert_eq!(
             ran.load(Ordering::SeqCst),
             1,
