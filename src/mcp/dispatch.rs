@@ -11160,6 +11160,21 @@ mod tests {
                 &mut Vec::new(),
             )
             .await;
+            let rows = ledger_rows(&handle).await;
+            for (id, injected) in [
+                ("boundary-memory", true),
+                ("pending-memory", true),
+                ("below-floor-memory", floor == 0.0),
+            ] {
+                assert!(
+                    rows.iter().any(|(mode, entry_id, delivered)| {
+                        mode == if shadow_mode { "shadow" } else { "automatic" }
+                            && entry_id.as_deref() == Some(id)
+                            && *delivered == Some(injected)
+                    }),
+                    "ledger must record {id} with injected={injected}: {rows:?}"
+                );
+            }
             if shadow_mode {
                 assert_eq!(output, json!({}), "shadow must not inject: {output}");
                 let row = shadow.expect("shadow output must record the admitted memories");
