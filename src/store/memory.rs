@@ -6722,7 +6722,7 @@ mod tests {
 
     /// Catches: a vector fetch of zero rows (`limit * 2` as `limit / 2` at limit
     /// 1) that silently drops the search to BM25-only: the entry would lose its
-    /// distance.
+    ///    distance.
     #[test]
     fn a_result_in_both_legs_carries_its_vector_distance() {
         let conn = setup_db_with_vectors();

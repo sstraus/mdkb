@@ -328,6 +328,11 @@ impl Context {
         Self::open_impl(root.as_ref(), true, false)
     }
 
+    /// Open a background slot under admission, reusing its process health probe.
+    pub(crate) fn open_writer_admitted_reusing_process_probe(root: &Path) -> Result<Self> {
+        Self::open_impl(root, true, true)
+    }
+
     fn open_impl(root: &Path, writer_admitted: bool, trust_process_probe: bool) -> Result<Self> {
         let mdkb_dir = namespace::store_dir(root)?;
 

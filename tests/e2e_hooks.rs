@@ -22,6 +22,85 @@ fn mdkb_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mdkb")
 }
 
+// Catches: treating deadline 0 as an immediate timeout drops a queued hook
+// call under foreign admission; retaining the detached count path doubles it.
+#[test]
+fn critic_266_unlimited_settlement_waits_for_writer_and_counts_each_prompt_once() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    handle_init(root).expect("init");
+    let config = root.join(".mdkb/config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("\n[hooks]\nuser_prompt_submit_deadline_ms = 0\n");
+    std::fs::write(config, text).expect("write config");
+    let ctx = Context::open(root).expect("open store");
+    let writer = mdkb::store::mutation_lock::acquire_writer(&ctx.db_path, "critic foreign writer")
+        .expect("hold admission");
+    let mut child = Command::new(mdkb_bin())
+        .args(["hook", "user-prompt-submit"])
+        .current_dir(root)
+        .env("MDKB_NO_DAEMON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"prompt":"ordinary prompt"}"#)
+        .unwrap();
+    // Ordinary prompts intentionally emit no stdout. The production event
+    // log signals that dispatch reached settlement, rather than timing startup.
+    let dispatch_limit = Instant::now() + Duration::from_secs(10);
+    while !root.join(".mdkb/hook-events.jsonl").exists()
+        && child.try_wait().expect("poll dispatch").is_none()
+        && Instant::now() < dispatch_limit
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    let premature_exit = child.try_wait().expect("poll child");
+    drop(writer);
+    let limit = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll released child") {
+            break status;
+        }
+        if Instant::now() >= limit {
+            child.kill().expect("kill own stuck hook");
+            child.wait().expect("reap own hook");
+            panic!("admitted cold open reacquired the non-reentrant writer lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        premature_exit.is_none(),
+        "deadline zero discarded pending telemetry"
+    );
+    assert!(status.success());
+    for _ in 0..2 {
+        let (_, stderr, code) = run_hook(
+            "user-prompt-submit",
+            root,
+            r#"{"prompt":"ordinary prompt"}"#,
+        );
+        assert_eq!(code, 0, "{stderr}");
+    }
+    let calls: i64 = ctx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM call_log WHERE tool_name = 'user_prompt_submit'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count persisted calls");
+    assert_eq!(calls, 3, "lost or double-counted one-shot hook calls");
+}
+
 /// Run `mdkb hook <event>` with the given stdin payload and return stdout.
 fn run_hook(event: &str, cwd: &Path, stdin_payload: &str) -> (String, String, i32) {
     run_hook_with_home(event, cwd, stdin_payload, None)
@@ -307,4 +386,75 @@ fn hooks_e2e_session_start_names_undetected_relation_keys() {
         stdout.contains("frontmatter") && stdout.contains("mdkb graph relations"),
         "the undetected `org` key must be named in the body: {stdout}"
     );
+}
+
+// Catches: one-shot shutdown waits for a blocking writer-lock admission after
+// the prompt deadline, even though stdout has already been emitted.
+#[test]
+fn one_shot_prompt_exits_before_foreign_writer_releases() {
+    let temp = tempfile::tempdir().unwrap();
+    handle_init(temp.path()).unwrap();
+    let cfg = temp.path().join(".mdkb/config.toml");
+    let mut config = std::fs::read_to_string(&cfg).unwrap();
+    config.push_str("\n[hooks]\nuser_prompt_submit_require_sigil = false\nuser_prompt_submit_deadline_ms = 300\n[telemetry]\nquery_events = true\n");
+    std::fs::write(cfg, config).unwrap();
+    let ctx = Context::open(temp.path()).unwrap();
+    let writer =
+        mdkb::store::mutation_lock::acquire_writer(&ctx.db_path, "foreign update").unwrap();
+    drop(ctx);
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let exited_first = released
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(writer);
+        exited_first
+    });
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_hook(
+        "user-prompt-submit",
+        temp.path(),
+        r#"{"prompt":"???","session_id":"foreign-update"}"#,
+    );
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    let exited_first = holder.join().unwrap();
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        exited_first,
+        "one-shot waited for the foreign writer: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "prompt exit exceeded its deadline allowance: {elapsed:?}"
+    );
+}
+
+// Catches: detached prompt telemetry is cancelled at one-shot process exit.
+#[test]
+fn one_shot_prompt_persists_its_hook_call() {
+    for deadline in [0, 60000] {
+        let temp = tempfile::tempdir().unwrap();
+        handle_init(temp.path()).unwrap();
+        let cfg = temp.path().join(".mdkb/config.toml");
+        let mut config = std::fs::read_to_string(&cfg).unwrap();
+        config.push_str(&format!(
+            "\n[hooks]\nuser_prompt_submit_deadline_ms = {deadline}\n"
+        ));
+        std::fs::write(cfg, config).unwrap();
+        let (stdout, stderr, code) = run_hook(
+            "user-prompt-submit",
+            temp.path(),
+            r#"{"prompt":"ordinary prompt","session_id":"counted-prompt"}"#,
+        );
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        let ctx = Context::open(temp.path()).unwrap();
+        let calls: i64 = ctx.conn.query_row(
+        "SELECT COUNT(*) FROM call_log c JOIN sessions s ON s.id = c.session_id WHERE s.agent = 'hooks' AND c.tool_name = 'user_prompt_submit'",
+        [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            calls, 1,
+            "the completed one-shot must persist exactly one hook call"
+        );
+    }
 }

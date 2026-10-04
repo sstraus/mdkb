@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **One-shot prompt hooks bound their telemetry settlement by the existing
+  prompt deadline.** Writer admission yields while another process holds the
+  store, so runtime shutdown cannot wait indefinitely. Prompt call counts share
+  the recall ledger queue and persist before an uncontended exit. Found by the
+  maintainer's review of the one-shot exit path. Story 266-e5c5.
+
 - **Recall ledger writes no longer block prompt answers on a foreign writer.**
   Queue ledger telemetry even when the local store slot is free; Stop settlement
   drains pending rows before reading them. Found by the recall watch and reproduced
