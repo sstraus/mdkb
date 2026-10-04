@@ -5881,6 +5881,16 @@ enum RecallMode {
 }
 
 impl RecallMode {
+    // Regression baseline: the store's lexical gate is the only admission gate.
+    fn admit_memories(
+        self,
+        entries: Vec<memory::ScoredMemoryEntry>,
+        _has_embedding: bool,
+        _floor: f32,
+    ) -> Vec<memory::ScoredMemoryEntry> {
+        entries
+    }
+
     /// The name the recall ledger stores. `Off` never reaches it.
     fn as_str(self) -> &'static str {
         match self {
@@ -6305,6 +6315,11 @@ async fn hook_user_prompt_submit_impl_timed(
         // The best absolute score in the result, read before `injectable` drops
         // it. `score` cannot stand in: it is max-normalized, so the top hit is
         // 1.0 for every prompt including the ones nothing in the store answers.
+        scored_results = mode.admit_memories(
+            scored_results,
+            query_embedding.is_some(),
+            search_cfg.min_recall_cosine,
+        );
         top_cosine = scored_results
             .iter()
             .filter_map(|e| e.distance)
@@ -10797,6 +10812,129 @@ mod tests {
             recall_mode(&cfg, "  *   where is the parser"),
             (RecallMode::Sigil, "where is the parser"),
             "the sigil still selects the lower floor, and still never reaches the query"
+        );
+    }
+
+    /// Catches: incidental rare-term overlap bypassing the automatic cosine
+    /// floor, so fresh unrelated memories from the live recall watch inject.
+    #[test]
+    fn automatic_recall_rejects_recorded_subfloor_memories_despite_lexical_overlap() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
+        let prompt = fixture["prompt"].as_str().unwrap();
+        let scored: Vec<memory::ScoredMemoryEntry> = fixture["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let entry: memory::MemoryEntry =
+                    serde_json::from_value(row["entry"].clone()).unwrap();
+                let lexical = crate::store::hybrid::strong_lexical_match(
+                    prompt,
+                    &format!("{}\n{}", entry.title, entry.content),
+                );
+                assert!(
+                    lexical,
+                    "control: recorded incidental overlap opens the store gate"
+                );
+                assert_eq!(entry.access_count, 0, "recency was not the cause");
+                memory::ScoredMemoryEntry {
+                    entry,
+                    score: 1.0,
+                    distance: Some((2.0 * (1.0 - row["cosine"].as_f64().unwrap())).sqrt() as f32),
+                    strong_lexical: lexical,
+                }
+            })
+            .collect();
+        let floor = crate::config::HooksConfig::default().recall_auto_min_cosine;
+        for mode in [RecallMode::Automatic, RecallMode::Shadow] {
+            assert!(injectable(mode.admit_memories(scored.clone(), true, floor)).is_empty());
+        }
+        assert_eq!(
+            injectable(RecallMode::Sigil.admit_memories(scored.clone(), true, floor)).len(),
+            2,
+            "explicit recall keeps its lexical admission arm"
+        );
+        assert_eq!(
+            injectable(RecallMode::Automatic.admit_memories(scored.clone(), false, floor)).len(),
+            2,
+            "without an embedding, lexical evidence remains the fallback"
+        );
+        assert_eq!(
+            injectable(RecallMode::Automatic.admit_memories(scored, true, 0.0)).len(),
+            2,
+            "a disabled floor stays disabled"
+        );
+
+        let docs = fixture["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    crate::domain::SearchResult {
+                        id: 0,
+                        collection: "docs".into(),
+                        path: row["path"].as_str().unwrap().into(),
+                        title: Some(row["title"].as_str().unwrap().into()),
+                        score: 1.0,
+                        snippets: vec![],
+                        status: None,
+                        superseded_by: None,
+                        repo_root: None,
+                    },
+                    None,
+                )
+            })
+            .collect();
+        let admitted_docs = admit_doc_hits(docs, prompt, 0.55);
+        assert!(
+            admitted_docs
+                .iter()
+                .any(|hit| hit.path == "recall-watch.md")
+        );
+    }
+
+    /// Catches: dropping the inclusive floor boundary, or letting BM25-only
+    /// candidates evade it when a query embedding is available.
+    #[test]
+    fn automatic_recall_keeps_the_floor_boundary_and_rejects_missing_distance() {
+        let floor = crate::config::HooksConfig::default().recall_auto_min_cosine;
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
+        let entry: memory::MemoryEntry =
+            serde_json::from_value(fixture["memories"][0]["entry"].clone()).unwrap();
+        let boundary = memory::ScoredMemoryEntry {
+            entry,
+            score: 1.0,
+            distance: Some(crate::store::hybrid::distance_bound(floor)),
+            strong_lexical: true,
+        };
+        let missing = memory::ScoredMemoryEntry {
+            distance: None,
+            ..boundary.clone()
+        };
+        let below = memory::ScoredMemoryEntry {
+            distance: Some(crate::store::hybrid::distance_bound(floor) + 0.001),
+            ..boundary.clone()
+        };
+        let admitted =
+            RecallMode::Automatic.admit_memories(vec![missing, boundary, below], true, floor);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            admitted[0].distance,
+            Some(crate::store::hybrid::distance_bound(floor))
+        );
+        let bm25_only = memory::ScoredMemoryEntry {
+            distance: None,
+            ..admitted[0].clone()
+        };
+        assert_eq!(
+            RecallMode::Automatic
+                .admit_memories(vec![bm25_only], true, floor)
+                .len(),
+            1,
+            "an available embedder does not imply the store has memory vectors"
         );
     }
 
