@@ -10884,13 +10884,119 @@ mod tests {
         );
     }
 
+    /// Catches: calibrating the floor without separating its recall cost from
+    /// removal of lexical admission on the same production candidates.
+    #[test]
+    #[ignore = "requires ONNX model download"]
+    fn automatic_recall_measures_floor_and_lexical_losses_separately() {
+        let fixture = crate::eval::fixture::Fixture::bundled().unwrap();
+        let store = fixture.open_store().unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        fixture.embed(&store.ctx.conn).unwrap();
+        let mut totals = [0; 4];
+        for case in &fixture.recall {
+            let Some(fts) = crate::store::search::build_recall_query(&case.query) else {
+                continue;
+            };
+            let embedding = svc.embed_query(&case.query).unwrap();
+            for (index, (floor, strict)) in
+                [(0.50, false), (0.55, false), (0.50, true), (0.55, true)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let cfg = crate::config::SearchMemoryConfig {
+                    min_recall_cosine: floor,
+                    ..Default::default()
+                };
+                let mut hits = memory::search_entries_hybrid_fts(
+                    &store.ctx.conn,
+                    &fts,
+                    &case.query,
+                    Some(&embedding),
+                    5,
+                    None,
+                    &cfg,
+                )
+                .unwrap();
+                if index == 0 {
+                    for hit in &hits {
+                        if case.expected_ids.contains(&hit.id) {
+                            println!(
+                                "expected {}: cosine={:?} lexical={} query={}",
+                                hit.id,
+                                hit.distance.map(crate::store::hybrid::cosine_from_distance),
+                                hit.strong_lexical,
+                                case.query
+                            );
+                        }
+                    }
+                }
+                if strict {
+                    let bound = crate::store::hybrid::distance_bound(floor);
+                    hits.retain(|hit| hit.distance.is_some_and(|distance| distance <= bound));
+                }
+                totals[index] +=
+                    usize::from(hits.iter().any(|hit| case.expected_ids.contains(&hit.id)));
+            }
+        }
+        println!(
+            "floor/lexical matrix: 0.50 lexical={}, 0.55 lexical={}, 0.50 strict={}, 0.55 strict={}",
+            totals[0], totals[1], totals[2], totals[3]
+        );
+        assert!(totals[0] > 0, "measurement must include relevant answers");
+    }
+
     /// Catches: incidental rare-term overlap bypassing the automatic cosine
     /// floor, so fresh unrelated memories from the live recall watch inject.
-    #[test]
-    fn automatic_recall_rejects_recorded_subfloor_memories_despite_lexical_overlap() {
+    #[tokio::test]
+    #[ignore = "requires ONNX model download"]
+    async fn automatic_recall_rejects_recorded_subfloor_memories_despite_lexical_overlap() {
         let fixture: Value =
             serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
         let prompt = fixture["prompt"].as_str().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 5;
+            config.hooks.recall_holdout_rate = 0.0;
+        });
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            for row in fixture["memories"].as_array().unwrap() {
+                let entry: memory::MemoryEntry =
+                    serde_json::from_value(row["entry"].clone()).unwrap();
+                memory::add_entry(&ctx.conn, &entry).unwrap();
+            }
+            memory::backfill_memory_embeddings(&ctx.conn).unwrap();
+        }
+        seed_document(
+            &handle,
+            "recall-watch.md",
+            "Recall watch",
+            "Recall watch records hook events and recall stats.",
+        )
+        .await;
+        let output = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&output);
+        for row in fixture["memories"].as_array().unwrap() {
+            assert!(
+                !body.contains(row["entry"]["id"].as_str().unwrap()),
+                "recorded unrelated memory reached hook additionalContext: {output}"
+            );
+        }
+        assert!(
+            body.contains("recall-watch.md"),
+            "relevant document must inject: {output}"
+        );
+        let asked = hook_user_prompt_submit_impl(&handle, &format!("* {prompt}")).await;
+        for row in fixture["memories"].as_array().unwrap() {
+            assert!(
+                additional_context(&asked).contains(row["entry"]["id"].as_str().unwrap()),
+                "sigil control must retrieve recorded memory: {asked}"
+            );
+        }
         let scored: Vec<memory::ScoredMemoryEntry> = fixture["memories"]
             .as_array()
             .unwrap()
@@ -10968,7 +11074,7 @@ mod tests {
     /// candidates evade it when a query embedding is available.
     #[test]
     fn automatic_recall_keeps_the_floor_boundary_and_rejects_missing_distance() {
-        let floor = crate::config::HooksConfig::default().recall_auto_min_cosine;
+        let floor = 0.50; // Independent oracle: normalized L2 1.0 means cosine 0.50.
         let fixture: Value =
             serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
         let entry: memory::MemoryEntry =
@@ -10976,24 +11082,27 @@ mod tests {
         let boundary = memory::ScoredMemoryEntry {
             entry,
             score: 1.0,
-            distance: Some(crate::store::hybrid::distance_bound(floor)),
+            distance: Some(1.0),
             strong_lexical: true,
         };
-        let missing = memory::ScoredMemoryEntry {
+        let mut missing = memory::ScoredMemoryEntry {
             distance: None,
             ..boundary.clone()
         };
-        let below = memory::ScoredMemoryEntry {
-            distance: Some(crate::store::hybrid::distance_bound(floor) + 0.001),
+        missing.entry.id = "missing-distance".into();
+        let mut below = memory::ScoredMemoryEntry {
+            distance: Some(1.001),
             ..boundary.clone()
         };
+        below.entry.id = "below-floor".into();
+        let expected_id = boundary.entry.id.clone();
         let admitted =
             RecallMode::Automatic.admit_memories(vec![missing, boundary, below], true, floor);
-        assert_eq!(admitted.len(), 1);
         assert_eq!(
-            admitted[0].distance,
-            Some(crate::store::hybrid::distance_bound(floor))
+            admitted.iter().map(|hit| &hit.entry.id).collect::<Vec<_>>(),
+            vec![&expected_id]
         );
+        assert_eq!(admitted[0].distance, Some(1.0));
         let bm25_only = memory::ScoredMemoryEntry {
             distance: None,
             ..admitted[0].clone()

@@ -444,13 +444,17 @@ mod tests {
             at_chosen.recall_at_k
         );
 
-        // The automatic default now follows live ledger evidence (story 260),
-        // rather than the plateau of this small fixture. The fixture still
-        // protects precision at that stricter floor.
+        // Catches: raising the automatic floor while silently losing positive
+        // answers on the calibrated 15-of-36 recall plateau.
         let auto = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
         assert!(
             auto > chosen,
             "the automatic floor {auto} must be stricter than the sigil floor {chosen}"
+        );
+        assert!(
+            at(auto).recall_at_k >= 15.0 / 36.0 - 0.001,
+            "automatic floor lost calibrated positive recall: {}",
+            at(auto).recall_at_k
         );
         assert_eq!(
             at(auto).precision,

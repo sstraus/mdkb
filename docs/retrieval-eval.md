@@ -92,7 +92,7 @@ The rule is the lowest floor that admits no labelled negative, which is 0.40. F1
 
 The price is 15 of 36 held-out queries no longer retrieving their memory, several of them well-formed questions (`which entry should a bounded cache drop when it is full`). Recovering them needs a floor below 0.40, which this curve prices at 5 false positives per 5 recovered hits (tau 0.35) — a one-for-one trade, and still an open question rather than a settled one. It is not what the second floor below does.
 
-### Automatic recall: live floor 0.55
+### Automatic recall: floor 0.50
 
 The original 0.50 `config::RECALL_AUTO_MIN_COSINE_DEFAULT` was the floor for a prompt that carries **no** sigil — see the two-floor table in the README. Precision cannot choose it: every floor from 0.40 up admits none of the 40 negatives, so they all score 1.000 and the curve has nothing left to say about correctness above 0.40.
 
@@ -104,7 +104,7 @@ The rule is the recall curve instead — the **plateau**, the floor whose step c
 | **0.45 → 0.50** | **0.027** |
 | 0.50 → 0.55 | 0.111 |
 
-0.50 is the cheapest extra margin the curve offers: it buys a stricter gate for a prompt nobody asked to enrich at roughly a fifth of what either neighbouring step costs. Story 260-9f26 supersedes that fixture-only choice with 0.55: on 2026-10-04 the live orchestrator ledger had no positive label below 0.55, while the <0.40 band injected 71 decisions, 28 problems and 12 handoffs. Automatic memory admission with an embedding now requires the cosine floor even when incidental rare terms overlap. The fixture test retains the precision check at the current default; it no longer asserts the old plateau.
+0.50 is the cheapest extra margin the curve offers. The recorded unrelated recall-watch memories scored 0.492916 and 0.318912: enforcing 0.50 already rejects both. The attempted 0.55 floor lost four expected fixture answers; removing lexical admission at 0.55 loses one more (critic story 271-db58). At 0.50, both lexical and strict admission recall 15/36; at 0.55 they recall 11/36 and 10/36 respectively. Absence of positive live labels below 0.55 was not evidence that those answers were irrelevant. The automatic floor stays at 0.50, and the fixture protects both precision and its 15-of-36 positive recall plateau.
 
 This is a *calibration* rather than a *decision*: it says which floor is cheapest, not whether always-on recall is worth having. That is what `hooks.user_prompt_submit_shadow` is for — the fixture cannot rank floors above 0.40, so the sigil default stays `true` until a week of shadow rows says otherwise.
 

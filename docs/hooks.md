@@ -151,7 +151,7 @@ documents reuse the same query embedding, avoiding a second ONNX inference pass.
 The sigil selects a **cosine floor**, not a feature: a sigil prompt is admitted
 at `search.memory.min_recall_cosine` (0.40) and — while
 `user_prompt_submit_require_sigil` is `false`, the default — a plain one at
-`hooks.recall_auto_min_cosine` (0.55), because an injection nobody asked for is
+`hooks.recall_auto_min_cosine` (0.50), because an injection nobody asked for is
 charged on every turn after it. The floor is absolute, measured against the
 query embedding. Automatic memory recall with an embedding must clear it;
 incidental lexical overlap cannot bypass it. Explicit sigil recall and recall
@@ -332,7 +332,7 @@ user_prompt_submit_require_sigil = false
 # prompt uses the lower `search.memory.min_recall_cosine` (0.40): the
 # sigil selects a threshold, it does not switch recall on. Unused when
 # require_sigil is true, except in shadow mode.
-recall_auto_min_cosine = 0.55
+recall_auto_min_cosine = 0.50
 
 # Run the always-on path on the prompts the sigil gate skips, record
 # what it would have injected in .mdkb/hook-events.jsonl, inject

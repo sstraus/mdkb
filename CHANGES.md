@@ -17,7 +17,7 @@
 
 - **Automatic memory recall enforces its semantic floor.** Incidental rare-term
   overlap cannot bypass the cosine gate when an embedding is available. The
-  default is 0.55, based on live recall labels; explicit recall and lexical
+  default remains 0.50, preserving the calibrated positive recall; explicit recall and lexical
   fallback without embeddings keep their admission behavior. Found by the
   maintainer’s recall watch: two unrelated memories repeatedly injected despite
   cosine 0.493 and 0.319, with no access-recency bonus. Story 260-9f26.

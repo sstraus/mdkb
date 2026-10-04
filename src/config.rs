@@ -188,11 +188,10 @@ pub const MIN_RECALL_COSINE_DEFAULT: f32 = 0.40;
 
 /// Default cosine floor for automatic memory recall.
 ///
-/// The orchestrator recall ledger on 2026-10-04 had no positive label below
-/// 0.55: the <0.40 band alone injected 71 decisions, 28 problems and 12
-/// handoffs. Incidental lexical overlap had bypassed the earlier 0.50 floor.
-/// Use 0.55 with semantic admission on automatic prompts (story 260-9f26).
-pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.55;
+/// The eval curve retains more relevant answers at 0.50 than 0.55.
+/// The recorded recall-watch false positives scored 0.493 and 0.319, so
+/// enforcing 0.50 rejects them without raising the floor (stories 260, 271).
+pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 
 /// Default absolute cosine floor for the documents leg of recall.
 ///
@@ -827,9 +826,8 @@ pub struct HooksConfig {
     /// enrich, and a wrong entry there is paid on every turn after it. So the
     /// automatic floor is the stricter one.
     ///
-    /// Calibrated from the live recall ledger: no positive labels below 0.55
-    /// on 2026-10-04. With a query embedding, incidental lexical overlap cannot
-    /// bypass it; without one, lexical fallback remains. A successful
+    /// Calibrated from the eval recall curve at 0.50. With a query embedding,
+    /// incidental lexical overlap cannot bypass it; without one, lexical fallback remains. A successful
     /// cross-encoder rerank uses its own semantic score floor.
     ///
     /// Unused while the sigil is required except in shadow mode.
