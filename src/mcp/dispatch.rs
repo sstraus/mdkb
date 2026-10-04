@@ -18690,6 +18690,49 @@ mod tests {
         }
     }
 
+    /// Catches (#266-e5c5): removing admitted initialization loses the first
+    /// prompt's count when no database exists, whether its directory exists or not.
+    #[tokio::test]
+    async fn critic_266_fresh_store_keeps_first_prompt_without_admitted_init() {
+        for directory_present in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = true;
+                config.hooks.user_prompt_submit_deadline_ms = 0;
+                config.telemetry.query_events = false;
+            });
+            let store = tmp.path().join(".mdkb");
+            if !directory_present {
+                std::fs::remove_dir(&store).unwrap();
+            }
+            assert!(!store.join("index.sqlite").exists());
+            let dctx = make_collecting_dctx();
+            dispatch_call(
+                "hook.user_prompt_submit",
+                json!({"prompt": "ordinary prompt", "session_id": "first-prompt"}),
+                Arc::clone(&handle),
+                &dctx,
+            )
+            .await
+            .expect("first hook");
+            tokio::time::timeout(std::time::Duration::from_secs(10), dctx.join_background())
+                .await
+                .expect("first prompt settlement must not reacquire admission");
+            assert!(
+                store.join("index.sqlite").exists(),
+                "first prompt lost its store"
+            );
+            let conn = rusqlite::Connection::open(store.join("index.sqlite")).unwrap();
+            let calls: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM call_log c JOIN sessions s ON s.id = c.session_id WHERE s.agent = 'hooks' AND c.tool_name = 'user_prompt_submit'",
+                [], |row| row.get(0)).unwrap();
+            assert_eq!(
+                calls, 1,
+                "first prompt count lost; directory_present={directory_present}"
+            );
+        }
+    }
+
     /// Catches (#266-e5c5): detached prompt telemetry waits for a busy slot,
     /// but the one-shot join returns and runtime shutdown cancels its count.
     #[test]
