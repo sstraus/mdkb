@@ -10848,7 +10848,7 @@ mod tests {
         };
         let mut lost = Vec::new();
         for case in &fixture.recall {
-            let Some(fts) = build_recall_query(&case.query) else {
+            let Some(fts) = crate::store::search::build_recall_query(&case.query) else {
                 continue;
             };
             let embedding = svc.embed_query(&case.query).unwrap();
