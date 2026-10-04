@@ -9270,6 +9270,52 @@ mod tests {
         assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
     }
 
+    /// Catches: embedding a peer silently removes lexical recall of a relevant
+    /// newly inserted memory that is still awaiting its own embedding.
+    #[tokio::test]
+    #[ignore = "requires the production ONNX embedding model"]
+    async fn critic_260_partial_embedding_preserves_pending_relevant_memory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 0;
+            config.hooks.recall_holdout_rate = 0.0;
+            config.hooks.recall_limit = 10;
+        });
+        let prompt = "what do we know about the recall_gate_fixture topic content";
+        seed_memory_entry(&handle, "pending-relevant-memory").await;
+        seed_memory_entry(&handle, "embedded-relevant-memory").await;
+
+        let before = hook_user_prompt_submit_impl(&handle, prompt).await;
+        assert!(
+            additional_context(&before).contains("pending-relevant-memory"),
+            "lexical fallback must recall the named pending memory: {before}"
+        );
+        let embedding = crate::llm::get_cached_service()
+            .expect("production embedding service")
+            .embed_query("Some content about the topic: the recall_gate_fixture knob.")
+            .expect("embed the real peer content");
+        {
+            let guard = handle.ctx.lock().await;
+            memory::store_entry_embedding(
+                &guard.as_ref().unwrap().conn,
+                "embedded-relevant-memory",
+                &embedding,
+            )
+            .expect("store the peer embedding");
+        }
+        let after = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&after);
+        assert!(
+            body.contains("embedded-relevant-memory"),
+            "positive control: the embedded peer remains relevant: {body}"
+        );
+        assert!(
+            body.contains("pending-relevant-memory"),
+            "embedding a peer must not erase the pending memory's lexical fallback: {body}"
+        );
+    }
+
     async fn seed_memory_entry(handle: &RepoHandle, id: &str) {
         seed_memory_entry_titled(handle, id, &format!("Title for {id}")).await;
     }
