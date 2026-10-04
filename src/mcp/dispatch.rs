@@ -10829,6 +10829,61 @@ mod tests {
         );
     }
 
+    /// Catches: tightening automatic admission silently drops known relevant
+    /// answers that the previous automatic floor retrieved from the eval corpus.
+    #[test]
+    #[ignore = "requires ONNX model download"]
+    fn critic_260_automatic_floor_preserves_previously_recalled_expected_memories() {
+        let fixture = crate::eval::fixture::Fixture::bundled().unwrap();
+        let store = fixture.open_store().unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        fixture.embed(&store.ctx.conn).unwrap();
+        let old_cfg = crate::config::SearchMemoryConfig {
+            min_recall_cosine: 0.50,
+            ..Default::default()
+        };
+        let new_cfg = crate::config::SearchMemoryConfig {
+            min_recall_cosine: crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT,
+            ..old_cfg.clone()
+        };
+        let mut lost = Vec::new();
+        for case in &fixture.recall {
+            let Some(fts) = build_recall_query(&case.query) else {
+                continue;
+            };
+            let embedding = svc.embed_query(&case.query).unwrap();
+            let search = |cfg: &crate::config::SearchMemoryConfig| {
+                memory::search_entries_hybrid_fts(
+                    &store.ctx.conn,
+                    &fts,
+                    &case.query,
+                    Some(&embedding),
+                    5,
+                    None,
+                    cfg,
+                )
+                .unwrap()
+            };
+            let old = search(&old_cfg);
+            let new = RecallMode::Automatic.admit_memories(
+                search(&new_cfg),
+                true,
+                new_cfg.min_recall_cosine,
+            );
+            for expected in &case.expected_ids {
+                if old.iter().any(|entry| &entry.id == expected)
+                    && !new.iter().any(|entry| &entry.id == expected)
+                {
+                    lost.push(format!("{} => {}", case.query, expected));
+                }
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "automatic recall lost known relevant answers: {lost:#?}"
+        );
+    }
+
     /// Catches: incidental rare-term overlap bypassing the automatic cosine
     /// floor, so fresh unrelated memories from the live recall watch inject.
     #[test]
