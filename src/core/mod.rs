@@ -767,12 +767,12 @@ mod close_over_corruption_tests {
     }
 
     /// A slot holding a context whose store this process has probed sound.
-    fn probed_slot(dir: &Path) -> Option<Context> {
+    fn probed_slot(dir: &Path) -> Context {
         let ctx = Context::init(dir).unwrap();
         let _guard = crate::store::mutation_lock::acquire(&ctx.db_path, "test").unwrap();
         heal::ensure_sound_locked(&ctx.db_path, false).unwrap();
         assert!(heal::has_process_probe(&ctx.db_path));
-        Some(ctx)
+        ctx
     }
 
     /// Catches: a corruption-close path that drops the context but keeps the
@@ -780,7 +780,7 @@ mod close_over_corruption_tests {
     #[test]
     fn every_corruption_close_forgets_the_process_probe() {
         let dir = tempfile::tempdir().unwrap();
-        let mut slot = probed_slot(dir.path());
+        let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
         run_guarded_read(&mut slot, "test read", |ctx| -> Result<()> {
             Err(corrupt_error(ctx))
@@ -788,7 +788,7 @@ mod close_over_corruption_tests {
         assert!(slot.is_none() && !heal::has_process_probe(&db_path));
 
         let dir = tempfile::tempdir().unwrap();
-        let mut slot = probed_slot(dir.path());
+        let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
         run_guarded_write(&mut slot, "test write", |ctx| -> Result<()> {
             Err(corrupt_error(ctx))
@@ -796,7 +796,7 @@ mod close_over_corruption_tests {
         assert!(slot.is_none() && !heal::has_process_probe(&db_path));
 
         let dir = tempfile::tempdir().unwrap();
-        let slot = tokio::sync::Mutex::new(probed_slot(dir.path()));
+        let slot = tokio::sync::Mutex::new(Some(probed_slot(dir.path())));
         let db_path = slot.try_lock().unwrap().as_ref().unwrap().db_path.clone();
         run_mutation(&slot, "test mutation", |ctx| -> Result<()> {
             Err(corrupt_error(ctx))
@@ -810,7 +810,7 @@ mod close_over_corruption_tests {
     #[test]
     fn a_successful_guarded_write_keeps_the_probe_and_a_failed_one_drops_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mut slot = probed_slot(dir.path());
+        let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
         run_guarded_write(&mut slot, "ok write", |_| -> Result<()> { Ok(()) });
         assert!(heal::has_process_probe(&db_path));
@@ -827,7 +827,7 @@ mod close_over_corruption_tests {
     #[test]
     fn critic_r6_admitted_rows_each_invalidate_the_marker_under_one_admission() {
         let dir = tempfile::tempdir().unwrap();
-        let mut slot = probed_slot(dir.path());
+        let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
         let mut marker = db_path.as_os_str().to_os_string();
         marker.push(".integrity-ok");

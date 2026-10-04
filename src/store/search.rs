@@ -363,7 +363,11 @@ mod tests {
     /// brief ORed hundreds of terms and docs BM25 ran for seconds.
     #[test]
     fn a_long_prompt_yields_a_bounded_expression() {
-        let prompt: String = (0..500).map(|i| format!("term{i:03}x ")).collect();
+        let prompt = (0..500).fold(String::new(), |mut text, i| {
+            use std::fmt::Write as _;
+            write!(text, "term{i:03}x ").unwrap();
+            text
+        });
         assert_eq!(recall_terms(&prompt).len(), MAX_RECALL_TERMS);
     }
 
@@ -380,7 +384,11 @@ mod tests {
     /// at the end of a long prompt.
     #[test]
     fn the_cap_keeps_long_words_and_prompt_order() {
-        let filler: String = (0..100).map(|i| format!("ab{i:02}c ")).collect();
+        let filler = (0..100).fold(String::new(), |mut text, i| {
+            use std::fmt::Write as _;
+            write!(text, "ab{i:02}c ").unwrap();
+            text
+        });
         let prompt = format!("{filler} reindex_watcher_debouncer {filler}");
         let terms = recall_terms(&prompt);
         assert_eq!(terms.len(), MAX_RECALL_TERMS);

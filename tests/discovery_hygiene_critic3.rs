@@ -174,7 +174,7 @@ fn a_bad_entry_is_reported_once_across_repeated_discovery_calls() {
     });
     let extra = vec![repos.path().to_path_buf()];
 
-    let (_, warnings) = warnings_during(|| {
+    let ((), warnings) = warnings_during(|| {
         for _ in 0..5 {
             registry.discoverable_roots_under(&extra);
         }

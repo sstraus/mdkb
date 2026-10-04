@@ -854,17 +854,6 @@ mod store_stall {
 
     static STALLS: LazyLock<Mutex<HashMap<PathBuf, Stall>>> = LazyLock::new(Default::default);
 
-    /// Let `pass` acquisitions of `root` through, then stall the next for `hold`.
-    pub fn arm(root: &Path, pass: usize, hold: Duration) {
-        let stall = Stall {
-            pass,
-            hold,
-            every: false,
-            cut: None,
-        };
-        STALLS.lock().unwrap().insert(root.to_path_buf(), stall);
-    }
-
     /// Let `pass` acquisitions of `root` through, then cut the run: the next
     /// acquisition never returns and the hook's deadline fires at once (see
     /// [`cut_signal`]), whatever the configured deadline is.
@@ -944,8 +933,8 @@ async fn run_until_deadline<T>(
         let cut = store_stall::cut_signal(root);
         async move {
             tokio::select! {
-                _ = deadline => {}
-                _ = store_stall::cut(cut) => {}
+                () = deadline => {}
+                () = store_stall::cut(cut) => {}
             }
         }
     };
@@ -954,7 +943,7 @@ async fn run_until_deadline<T>(
     tokio::select! {
         biased;
         result = run => Some(result),
-        _ = deadline => None,
+        () = deadline => None,
     }
 }
 
@@ -976,7 +965,7 @@ enum HookStore {
     /// A corrupt read empties it, like [`crate::core::run_guarded_read`] does the
     /// slot, but the slot is not closed from here: the mutation holding it probes
     /// the file as soon as it finishes, and the next free-slot read closes it.
-    Bypass(Option<Context>),
+    Bypass(Box<Option<Context>>),
 }
 
 impl HookStore {
@@ -987,7 +976,7 @@ impl HookStore {
     /// The slot-shaped view the guarded readers take.
     fn slot(&mut self) -> &mut Option<Context> {
         match self {
-            Self::Slot(guard, _) => &mut **guard,
+            Self::Slot(guard, _hold) => guard,
             Self::Bypass(ctx) => ctx,
         }
     }
@@ -1013,7 +1002,7 @@ impl HookStore {
         f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
     ) {
         match self {
-            Self::Slot(guard, _) => {
+            Self::Slot(guard, _hold) => {
                 log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
             }
             Self::Bypass(_) => write_behind_slot(opener, what, f),
@@ -1260,14 +1249,13 @@ async fn settle_prompt_writes(key: usize, deadline: Option<tokio::time::Instant>
 /// [`ensure_handle_context`] for a hook's context phase: a busy slot is left to
 /// the read leg, which bypasses it, instead of being waited on, and an empty one
 /// is opened in the background instead of inline (#209-bc4b).
-async fn ensure_handle_context_unless_busy(handle: &RepoHandle) -> Result<(), McpError> {
+fn ensure_handle_context_unless_busy(handle: &RepoHandle) {
     if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
         if guard.is_none() {
             drop(guard);
             warm_slot_in_background(handle);
         }
     }
-    Ok(())
 }
 
 /// [`hook_store`] for the tool hot path, which must never force an open: the
@@ -1281,7 +1269,7 @@ fn hook_store_if_open(handle: &RepoHandle) -> Option<HookStore> {
         )),
         Err(_) => Context::open_read_only(&handle.root)
             .ok()
-            .map(|ctx| HookStore::Bypass(Some(ctx))),
+            .map(|ctx| HookStore::Bypass(Box::new(Some(ctx)))),
     }
 }
 
@@ -1307,7 +1295,7 @@ async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
             Ok(ctx) => {
                 drop(guard);
                 warm_slot_in_background(handle);
-                return Ok(HookStore::Bypass(Some(ctx)));
+                return Ok(HookStore::Bypass(Box::new(Some(ctx))));
             }
             Err(error) => {
                 tracing::debug!("hook cold read bypass unavailable, opening the store: {error}");
@@ -1320,7 +1308,7 @@ async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
         }
     }
     match Context::open_read_only(&handle.root) {
-        Ok(ctx) => Ok(HookStore::Bypass(Some(ctx))),
+        Ok(ctx) => Ok(HookStore::Bypass(Box::new(Some(ctx)))),
         Err(error) => {
             tracing::debug!("hook read bypass unavailable, waiting for the store: {error}");
             ensure_handle_context(handle).await?;
@@ -4932,16 +4920,14 @@ fn candidate_search_cfg(
 
 /// Append one prompt and its candidates to the recall ledger. Best effort:
 /// a hook must not fail because its telemetry did.
-async fn record_recall(
+fn record_recall(
     handle: &RepoHandle,
     session: &str,
     mode: RecallMode,
     floor: f32,
     candidates: Vec<crate::store::recall_ledger::RecallCandidate>,
 ) {
-    if ensure_handle_context_unless_busy(handle).await.is_err() {
-        return;
-    }
+    ensure_handle_context_unless_busy(handle);
     let prompt = crate::store::recall_ledger::RecallPrompt {
         session: session.to_string(),
         mode: mode.as_str(),
@@ -6140,8 +6126,7 @@ async fn hook_user_prompt_submit_impl_timed(
             mode,
             search_cfg.min_recall_cosine,
             Vec::new(),
-        )
-        .await;
+        );
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -6157,9 +6142,7 @@ async fn hook_user_prompt_submit_impl_timed(
     // reranker is for the prompts nobody asked to enrich.
     let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
     if let Some(ref q) = fts_query {
-        if ensure_handle_context_unless_busy(handle).await.is_err() {
-            return json!({});
-        }
+        ensure_handle_context_unless_busy(handle);
         phases.mark("context");
         // Embed the raw prompt off the runtime BEFORE locking — this is the
         // per-turn UserPromptSubmit path, so holding the ctx mutex across
@@ -6564,8 +6547,7 @@ async fn hook_user_prompt_submit_impl_timed(
             mode,
             search_cfg.min_recall_cosine,
             candidates,
-        )
-        .await;
+        );
         *shadow = Some(ShadowRecall {
             session: session.to_string(),
             entries: results.iter().map(|e| e.id.clone()).collect(),
@@ -6633,8 +6615,7 @@ async fn hook_user_prompt_submit_impl_timed(
         mode,
         search_cfg.min_recall_cosine,
         candidates,
-    )
-    .await;
+    );
 
     // Marked once the run has no await left to be cut at, not at retrieval.
     if let Some((dctx, key)) = recall_dedup {
@@ -6865,7 +6846,7 @@ async fn prompt_prior_block(
                 }
             }
             Err(error) => {
-                tracing::warn!("record prompt prior injection: no store: {}", error.message)
+                tracing::warn!("record prompt prior injection: no store: {}", error.message);
             }
         }
         if let Some((dctx, key)) = dedup {
@@ -7771,12 +7752,11 @@ async fn record_hook_call(handle: &RepoHandle, method: &str) {
     // A slot held by a mutation must not hold the hook's answer: the count is
     // taken behind it instead, off the hook's path (#209-bc4b). An in-process
     // hook finds the slot free, so it is still written before the process exits.
-    match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(guard) => write_hook_call(guard, event).await,
-        Err(_) => {
-            let ctx = Arc::clone(&handle.ctx);
-            tokio::spawn(async move { write_hook_call(ctx.lock_owned().await, event).await });
-        }
+    if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
+        write_hook_call(guard, event).await;
+    } else {
+        let ctx = Arc::clone(&handle.ctx);
+        tokio::spawn(async move { write_hook_call(ctx.lock_owned().await, event).await });
     }
 }
 
@@ -8556,15 +8536,13 @@ mod tests {
     fn critic_r4_sessions(handle: &RepoHandle) -> Vec<String> {
         let guard = handle.ctx.try_lock().unwrap();
         let ctx = guard.as_ref().unwrap();
-        let sessions = ctx
-            .conn
+        ctx.conn
             .prepare("SELECT session FROM recall_prompts ORDER BY id")
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
             .collect::<Result<Vec<String>, _>>()
-            .unwrap();
-        sessions
+            .unwrap()
     }
 
     async fn critic_r4_wait_for_sessions(handle: &RepoHandle, count: usize) -> Vec<String> {
@@ -8605,13 +8583,9 @@ mod tests {
             .unwrap();
         // record_recall queues without yielding; a current-thread runtime cannot
         // poll the spawned waiter until this top-level future yields or returns.
-        doomed.block_on(record_recall(
-            &handle,
-            "before-poll",
-            RecallMode::Automatic,
-            0.5,
-            vec![],
-        ));
+        doomed.block_on(async {
+            record_recall(&handle, "before-poll", RecallMode::Automatic, 0.5, vec![]);
+        });
         drop(doomed);
         let later = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8624,8 +8598,7 @@ mod tests {
                 RecallMode::Automatic,
                 0.5,
                 vec![],
-            )
-            .await;
+            );
             drop(held);
             critic_r4_wait_for_sessions(&handle, 2).await
         });
@@ -8650,7 +8623,7 @@ mod tests {
             .build()
             .unwrap();
         doomed.block_on(async {
-            record_recall(&handle, "before-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            record_recall(&handle, "before-panic", RecallMode::Automatic, 0.5, vec![]);
             tokio::task::yield_now().await;
             tokio::task::yield_now().await;
         });
@@ -8661,7 +8634,7 @@ mod tests {
             .build()
             .unwrap();
         let sessions = later.block_on(async {
-            record_recall(&handle, "after-panic", RecallMode::Automatic, 0.5, vec![]).await;
+            record_recall(&handle, "after-panic", RecallMode::Automatic, 0.5, vec![]);
             drop(held);
             critic_r4_wait_for_sessions(&handle, 2).await
         });
@@ -8728,8 +8701,7 @@ mod tests {
                 RecallMode::Automatic,
                 0.5,
                 vec![],
-            )
-            .await;
+            );
             tokio::task::yield_now().await;
             record_recall(
                 &handle,
@@ -8737,8 +8709,7 @@ mod tests {
                 RecallMode::Automatic,
                 0.5,
                 vec![],
-            )
-            .await;
+            );
             release_tx.send(()).unwrap();
             critic_r4_wait_for_sessions(&handle, 3).await
         });
@@ -11607,7 +11578,7 @@ mod tests {
         ensure_handle_context(&handle).await.unwrap();
         let held = handle.ctx.lock().await;
         for _ in 0..129 {
-            record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, vec![]).await;
+            record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, vec![]);
         }
         let candidates = [
             ("delivered", true, false),
@@ -11627,7 +11598,7 @@ mod tests {
             holdout,
         })
         .collect();
-        record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, candidates).await;
+        record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, candidates);
         let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
         let transcript = tmp.path().join("backlog.jsonl");
         let lines: Vec<String> = ["delivered", "holdout", "trimmed"]
@@ -17831,7 +17802,7 @@ mod tests {
             ensure_handle_context(&handle).await.unwrap();
             *handle.ctx.lock().await = None;
 
-            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new());
 
             let kept = tokio::time::timeout(std::time::Duration::from_secs(3), async {
                 loop {
@@ -17868,7 +17839,7 @@ mod tests {
         *handle.ctx.lock().await = None;
         handle.doc_reindex_active.store(true, Ordering::Relaxed);
 
-        record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()).await;
+        record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new());
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         assert!(
             handle.ctx.lock().await.is_none(),
@@ -18048,10 +18019,9 @@ mod tests {
         *handle.ctx.lock().await = None;
         handle.doc_reindex_active.store(true, Ordering::Relaxed);
 
-        let done = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new()),
-        )
+        let done = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            record_recall(&handle, "s1", RecallMode::Automatic, 0.5, Vec::new());
+        })
         .await;
         assert!(done.is_ok(), "the hook waited for the reindex");
     }
@@ -18074,8 +18044,7 @@ mod tests {
                 RecallMode::Automatic,
                 0.5,
                 Vec::new(),
-            )
-            .await;
+            );
         }
         let key = Arc::as_ptr(&handle.ctx) as usize;
         {
@@ -18514,7 +18483,7 @@ mod tests {
         *handle.ctx.lock().await = None;
 
         handle.doc_reindex_active.store(true, Ordering::Relaxed);
-        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        ensure_handle_context_unless_busy(&handle);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
             handle.ctx.lock().await.is_none(),
@@ -18522,7 +18491,7 @@ mod tests {
         );
 
         handle.doc_reindex_active.store(false, Ordering::Relaxed);
-        ensure_handle_context_unless_busy(&handle).await.unwrap();
+        ensure_handle_context_unless_busy(&handle);
         let opened = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while handle.ctx.lock().await.is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -18821,8 +18790,8 @@ mod tests {
         let join = dctx.join_background();
         tokio::pin!(join);
         tokio::select! {
-            _ = &mut join => panic!("join_background returned while the query event was still queued"),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            () = &mut join => panic!("join_background returned while the query event was still queued"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
         release.send(()).unwrap();
         held.await.unwrap();
@@ -18889,7 +18858,7 @@ mod tests {
             |ctx| {
                 ctx.conn
                     .execute_batch("UPDATE schema_version SET version = 1;")
-                    .unwrap()
+                    .unwrap();
             },
             |ctx| {
                 ctx.conn
@@ -18897,7 +18866,7 @@ mod tests {
                         "UPDATE schema_version SET version = {};",
                         crate::store::schema::SCHEMA_VERSION
                     ))
-                    .unwrap()
+                    .unwrap();
             },
         )
         .await;

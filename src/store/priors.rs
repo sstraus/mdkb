@@ -4268,7 +4268,7 @@ mod tests {
         for (evidence, expected) in [
             (0, 0.091_969_860_292_860_58),
             (1, 0.138_496_465_952_391_04),
-            (3, 0.164_416_219_031_591_59),
+            (3, 0.164_416_219_031_591_6),
         ] {
             c.evidence_count = evidence;
             let got = cluster_injection_score(&c, now);

@@ -2004,7 +2004,7 @@ fn run_search(
     match scope.as_deref() {
         Some("docs") => {
             let results = handle_hybrid_search(
-                &ctx,
+                ctx,
                 &query,
                 limit,
                 collection.as_deref(),
@@ -2013,13 +2013,13 @@ fn run_search(
             format_search_results(&results, format);
         }
         Some("memory") => {
-            let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
+            let entries = handle_memory_search(ctx, &query, limit, entry_type.as_deref())?;
             format_memory_list(&entries, format);
         }
         None => {
             // Default: search docs + memory
             let results = handle_hybrid_search(
-                &ctx,
+                ctx,
                 &query,
                 limit,
                 collection.as_deref(),
@@ -2028,7 +2028,7 @@ fn run_search(
             // `--entry-type` narrows the memory half here too: the flag
             // describes the memory corpus, not the scope it was asked
             // for, and it used to be dropped silently without `--scope`.
-            let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
+            let entries = handle_memory_search(ctx, &query, limit, entry_type.as_deref())?;
             // One JSON document, not two arrays under markdown headings:
             // a consumer parsing stdout must never see anything else.
             if matches!(format, OutputFormat::Json) {
@@ -2067,7 +2067,7 @@ fn run_search(
         }
         Some("code") => {
             let scored = mdkb::cli::handlers::handle_semantic_code_search(
-                &cwd,
+                cwd,
                 &ctx.config_path,
                 &query,
                 kind.as_deref(),
@@ -2077,7 +2077,7 @@ fn run_search(
         }
         Some("symbols") => {
             let found = mdkb::cli::handlers::handle_symbol_search(
-                &cwd,
+                cwd,
                 &query,
                 kind.as_deref(),
                 file.as_deref(),
@@ -2091,7 +2091,7 @@ fn run_search(
             // and what narrows it is `--file`, not words. An empty
             // query is therefore the ordinary case, not a mistake.
             let report = run_dup(
-                &cwd,
+                cwd,
                 Some(&ctx.conn),
                 &ctx.config_path,
                 &mdkb::core::dup::DupOverrides {
@@ -2107,7 +2107,7 @@ fn run_search(
             // Same shape as `duplicates` above: a sweep, not a query,
             // so there is nothing to pass the query text to.
             let report = mdkb::core::coupling::handle_coupling(
-                &cwd,
+                cwd,
                 &mdkb::core::coupling::CouplingOverrides::default(),
             )?;
             print!("{}", report.markdown);

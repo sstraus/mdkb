@@ -31,8 +31,14 @@ const TOP_N: usize = 50;
 #[cfg(unix)]
 fn rusage() -> (Option<f64>, Option<u64>) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &raw mut ru) };
+    let tv = |t: libc::timeval| {
+        #[cfg(target_os = "macos")]
+        let micros = f64::from(t.tv_usec);
+        #[cfg(not(target_os = "macos"))]
+        let micros = t.tv_usec as f64;
+        t.tv_sec as f64 + micros / 1e6
+    };
     // macOS reports ru_maxrss in bytes, Linux in kilobytes.
     let unit = if cfg!(target_os = "linux") { 1024 } else { 1 };
     (
@@ -153,22 +159,24 @@ fn embedding_spec(key: &str) -> (EmbeddingModel, &'static str, &'static str) {
 fn normalize(mut v: Vec<f32>) -> Vec<f32> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if n > 0.0 {
-        v.iter_mut().for_each(|x| *x /= n);
+        for x in &mut v {
+            *x /= n;
+        }
     }
     v
 }
 
-fn embed(cmd_model: &str, d: &Data) -> Value {
+fn embed(cmd_model: &str, data: &Data) -> Value {
     let (model_id, qp, pp) = embedding_spec(cmd_model);
     let cache = std::env::var("FASTEMBED_CACHE_DIR").expect("set FASTEMBED_CACHE_DIR");
-    let t = Instant::now();
+    let started = Instant::now();
     let model = TextEmbedding::try_new(
         InitOptions::new(model_id)
             .with_cache_dir(cache.into())
             .with_show_download_progress(false),
     )
     .unwrap();
-    let load_ms = t.elapsed().as_secs_f64() * 1e3;
+    let load_ms = started.elapsed().as_secs_f64() * 1e3;
     let (_, rss_loaded) = rusage();
     let embed_all = |texts: Vec<String>| -> Vec<Vec<f32>> {
         model
@@ -179,38 +187,38 @@ fn embed(cmd_model: &str, d: &Data) -> Value {
             .collect()
     };
     let docs = embed_all(
-        d.corpus
+        data.corpus
             .iter()
-            .map(|(_, _, t)| format!("{pp}{t}"))
+            .map(|(_, _, text)| format!("{pp}{text}"))
             .collect(),
     );
     let mems = embed_all(
-        d.memories
+        data.memories
             .iter()
-            .map(|(_, t, _)| format!("{pp}{t}"))
+            .map(|(_, text, _)| format!("{pp}{text}"))
             .collect(),
     );
     let mut out = Map::new();
-    for (set, queries) in &d.sets {
+    for (set, queries) in &data.sets {
         let (pool, ids): (&[Vec<f32>], Vec<&str>) = if is_en(set) {
-            (&mems, d.memories.iter().map(|m| m.0.as_str()).collect())
+            (&mems, data.memories.iter().map(|m| m.0.as_str()).collect())
         } else {
-            (&docs, d.corpus.iter().map(|c| c.0.as_str()).collect())
+            (&docs, data.corpus.iter().map(|c| c.0.as_str()).collect())
         };
-        let q = embed_all(queries.iter().map(|q| format!("{qp}{q}")).collect());
-        let rows: Vec<Value> = q
+        let query = embed_all(queries.iter().map(|query| format!("{qp}{query}")).collect());
+        let rows: Vec<Value> = query
             .iter()
             .map(|qv| {
-                let mut s: Vec<(usize, f32)> = pool
+                let mut scores: Vec<(usize, f32)> = pool
                     .iter()
                     .enumerate()
                     .map(|(i, dv)| (i, qv.iter().zip(dv).map(|(a, b)| a * b).sum()))
                     .collect();
-                let n = s.len() as f32;
-                let mean = s.iter().map(|x| x.1).sum::<f32>() / n;
-                let std = (s.iter().map(|x| (x.1 - mean).powi(2)).sum::<f32>() / n).sqrt();
-                s.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-                let top: Vec<Value> = s
+                let count = scores.len() as f32;
+                let mean = scores.iter().map(|x| x.1).sum::<f32>() / count;
+                let std = (scores.iter().map(|x| (x.1 - mean).powi(2)).sum::<f32>() / count).sqrt();
+                scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                let top: Vec<Value> = scores
                     .iter()
                     .take(TOP_N)
                     .map(|(i, c)| json!([ids[*i], c]))
