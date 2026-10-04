@@ -170,7 +170,7 @@ pub fn acquire(db_path: &Path, operation: &str) -> Result<MutationGuard> {
 /// Callers that also need [`acquire`] must always take this writer lock first.
 pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> {
     let path = writer_lock_path(db_path);
-    let mut file = open_lock_file(&path)?;
+    let file = open_lock_file(&path)?;
 
     file.lock_exclusive().map_err(|e| {
         Error::from(ErrorKind::Io {
@@ -179,25 +179,28 @@ pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> 
         })
     })?;
 
-    let _ = file.set_len(0);
-    let _ = writeln!(file, "pid={} operation={operation}", std::process::id());
-    let _ = file.sync_data();
-
-    Ok(MutationGuard { file })
+    Ok(announce_writer(file, operation))
 }
 
 /// Probe writer admission without leaving a blocking lock waiter at shutdown.
-pub(crate) fn try_acquire_writer(db_path: &Path) -> Result<Option<MutationGuard>> {
+pub(crate) fn try_acquire_writer(db_path: &Path, operation: &str) -> Result<Option<MutationGuard>> {
     let path = writer_lock_path(db_path);
     let file = open_lock_file(&path)?;
     match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(MutationGuard { file })),
+        Ok(()) => Ok(Some(announce_writer(file, operation))),
         Err(e) if is_lock_contention(&e) => Ok(None),
         Err(e) => Err(Error::from(ErrorKind::Io {
             path,
             operation: format!("probe writer lock: {e}"),
         })),
     }
+}
+
+fn announce_writer(mut file: File, operation: &str) -> MutationGuard {
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "pid={} operation={operation}", std::process::id());
+    let _ = file.sync_data();
+    MutationGuard { file }
 }
 
 /// Admit a direct CLI writer using the same lock as daemon-owned writers.

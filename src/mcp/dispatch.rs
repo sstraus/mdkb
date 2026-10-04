@@ -791,7 +791,9 @@ async fn admit_slot_writer(
     std::fs::create_dir_all(&dir)?;
     let db = crate::domain::canonicalize_plain(&dir)?.join("index.sqlite");
     loop {
-        if let Some(admission) = crate::store::mutation_lock::try_acquire_writer(&db)? {
+        if let Some(admission) =
+            crate::store::mutation_lock::try_acquire_writer(&db, "background slot writer")?
+        {
             return Ok(admission);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
