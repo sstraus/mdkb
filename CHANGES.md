@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Recall ledger writes no longer block prompt answers on a foreign writer.**
+  Queue ledger telemetry even when the local store slot is free; Stop settlement
+  drains pending rows before reading them. Found by the recall watch and reproduced
+  with a held writer lock: 1211 ms despite a 100 ms hook deadline. Story 215-ef2e.
+
 - **Four release-gate regressions use deterministic test synchronization.**
   Keep salvage log capture on one persistent subscriber, control IPC test time
   independently of OS scheduling, and check watcher filtering at bounded

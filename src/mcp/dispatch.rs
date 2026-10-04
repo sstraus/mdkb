@@ -4906,16 +4906,10 @@ async fn record_recall(
         )
         .map(|_| ())
     };
-    // The ledger is telemetry: a slot held by a mutation must not hold the
-    // hook's answer, so the row is written behind it (#209-bc4b).
-    match Arc::clone(&handle.ctx).try_lock_owned() {
-        Ok(mut guard) if guard.is_some() => log_slot_write(
-            "recall ledger",
-            crate::core::run_guarded_write(&mut guard, "recall ledger", record),
-        ),
-        // Busy, or empty: the queued write opens the slot itself if need be.
-        _ => write_behind_slot(SlotOpener::of(handle), "recall ledger", record),
-    }
+    // A free slot does not mean writer admission is free: a CLI process can
+    // hold it. Always queue telemetry so neither admission nor SQLite blocks
+    // the runtime past the hook deadline (#215-ef2e).
+    write_behind_slot(SlotOpener::of(handle), "recall ledger", record);
 }
 
 /// How many times `recall_docs_limit` documents the docs leg retrieves before
@@ -6962,6 +6956,8 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         })
         .collect();
 
+    // Stop must observe the prompt rows queued before its settlement.
+    settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
     if ensure_handle_context(&handle).await.is_err() {
         return;
     }
@@ -9854,6 +9850,7 @@ mod tests {
             "the fixture must force a trim: {body}"
         );
 
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
         let guard = handle.ctx.lock().await;
         let conn = &guard.as_ref().unwrap().conn;
         let mut stmt = conn
@@ -10918,6 +10915,7 @@ mod tests {
     /// Every recall ledger row for this handle: `(mode, entry_id, injected)`,
     /// with `entry_id` `None` for a prompt that had no candidates.
     async fn ledger_rows(handle: &RepoHandle) -> Vec<(String, Option<String>, Option<bool>)> {
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
         let guard = handle.ctx.lock().await;
         let conn = &guard.as_ref().unwrap().conn;
         let mut stmt = conn
@@ -11139,6 +11137,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.as_deref(), Some("used"));
+    }
+
+    /// Catches (#215-ef2e): Stop settling after only the first telemetry batch,
+    /// losing or duplicating later prompts or leaving their candidates unlabelled.
+    #[tokio::test]
+    async fn stop_drains_a_multibatch_backlog_once_and_labels_holdout_and_trimmed_candidates() {
+        use crate::store::recall_ledger::RecallCandidate;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = handle.ctx.lock().await;
+        for _ in 0..129 {
+            record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, vec![]).await;
+        }
+        let candidates = [
+            ("delivered", true, false),
+            ("holdout", true, true),
+            ("trimmed", false, false),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (id, injected, holdout))| RecallCandidate {
+            entry_id: id.into(),
+            rank: u16::try_from(rank).unwrap(),
+            cosine: Some(0.6),
+            entry_type: "decision".into(),
+            age_days: 0,
+            overlap: 1,
+            injected,
+            holdout,
+        })
+        .collect();
+        record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, candidates).await;
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let transcript = tmp.path().join("backlog.jsonl");
+        let lines: Vec<String> = ["delivered", "holdout", "trimmed"]
+            .into_iter()
+            .map(|id| {
+                json!({
+                    "type": "assistant", "timestamp": later,
+                    "message": {"content": [{"type": "tool_use", "id": id,
+                        "name": "mcp__mdkb__get", "input": {"id": id}}]}
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(&transcript, lines.join("\n")).unwrap();
+        let stop = tokio::spawn(settle_session(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "backlog".into(),
+        ));
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recall_prompts WHERE session = 'backlog'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 130, "Stop lost or duplicated queued prompts");
+        let rows: Vec<(String, bool, bool, Option<String>)> = conn
+            .prepare(
+                "SELECT entry_id, injected, holdout, outcome FROM recall_candidates ORDER BY rank",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("delivered".into(), true, false, Some("used".into())),
+                ("holdout".into(), true, true, Some("used".into())),
+                ("trimmed".into(), false, false, Some("missed".into())),
+            ],
+            "Stop labelled candidates before the entire backlog persisted"
+        );
     }
 
     /// Catches: a Stop-hook settle running its integrity probe while holding the
@@ -11413,6 +11498,7 @@ mod tests {
         let body = additional_context(&out);
         assert!(body.contains("hold-a") && body.contains("hold-b"), "{body}");
         hook_user_prompt_submit_impl(&handle, &format!("* {PROMPT}")).await;
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
 
         let guard = handle.ctx.lock().await;
         let conn = &guard.as_ref().unwrap().conn;
@@ -17439,6 +17525,59 @@ mod tests {
             handle.ctx.lock().await.is_some(),
             "the write did not open the slot"
         );
+    }
+
+    /// Catches (#215-ef2e): a warm tokenless prompt writing its recall ledger
+    /// inline, so another process writer blocks the runtime past the deadline.
+    #[tokio::test]
+    async fn tokenless_recall_answers_before_foreign_writer_releases_and_keeps_its_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_deadline_ms = 100;
+        });
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db_path, "foreign writer").unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            // Bound the pre-fix failure: inline admission cannot return until
+            // this watchdog releases the real OS lock. No CPU load is generated.
+            let answered_first = released
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_ok();
+            drop(writer);
+            answered_first
+        });
+        let out = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": "???", "session_id": "foreign-writer"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let _ = release.send(());
+        let answered_first = holder.join().unwrap();
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+
+        assert!(
+            answered_first,
+            "the response waited for foreign writer admission"
+        );
+        assert_eq!(out, json!({}));
+        let guard = handle.ctx.lock().await;
+        let sessions: Vec<String> = guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .prepare("SELECT session FROM recall_prompts ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(sessions, vec!["foreign-writer"]);
     }
 
     /// Catches (#209-bc4b): the hook's recall leg waiting for the reindex that
