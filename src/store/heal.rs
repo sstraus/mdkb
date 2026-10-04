@@ -2398,6 +2398,85 @@ mod tests {
         )
     }
 
+    // Catches: a first callsite registration publishing stale `never` interest
+    // after a transient capture subscriber has rebuilt the interest cache.
+    #[test]
+    fn capture_retains_warning_when_callsite_registration_overlaps_capture() {
+        use tracing::subscriber::Interest;
+
+        struct RegisteringSubscriber {
+            entered: std::sync::mpsc::Sender<()>,
+            resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            blocked: std::sync::atomic::AtomicBool,
+        }
+
+        impl tracing::Subscriber for RegisteringSubscriber {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+
+            fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+                if metadata
+                    .fields()
+                    .field("capture_registration_probe")
+                    .is_some()
+                    && !self.blocked.swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.entered.send(()).unwrap();
+                    self.resume.lock().unwrap().recv().unwrap();
+                }
+                Interest::never()
+            }
+
+            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+                Some(tracing::level_filters::LevelFilter::WARN)
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        fn emit_warning() {
+            tracing::warn!(
+                capture_registration_probe = true,
+                "capture registration warning"
+            );
+        }
+
+        // Initialize the real capture infrastructure without registering the
+        // probe callsite. A transient capture has already dropped its dispatch.
+        assert!(captured_logs(|| {}).is_empty());
+        let (entered, registration) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let dispatch = tracing::Dispatch::new(RegisteringSubscriber {
+            entered,
+            resume: std::sync::Mutex::new(resumed),
+            blocked: std::sync::atomic::AtomicBool::new(false),
+        });
+        std::thread::scope(|scope| {
+            let registering = scope.spawn(move || {
+                tracing::dispatcher::with_default(&dispatch, emit_warning);
+            });
+            registration
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the first callsite registration must reach the subscriber");
+            let logs = captured_logs(|| {
+                // Capture has installed its subscriber before the older
+                // registration publishes its cached interest.
+                resume.send(()).unwrap();
+                registering.join().unwrap();
+                emit_warning();
+            });
+            assert!(logs.contains("capture registration warning"), "{logs}");
+        });
+    }
+
     /// Run `f` with a tracing subscriber that captures what was logged.
     ///
     /// A dropped column has to be provable, not taken on faith: the defect this
