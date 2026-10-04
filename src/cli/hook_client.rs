@@ -617,7 +617,7 @@ async fn call_daemon_phased(
     params: &Value,
     timeout: Duration,
 ) -> std::result::Result<Value, MutationFailure> {
-    use MutationFailure::{Undetermined, Unstarted};
+    use MutationFailure::Unstarted;
 
     ensure_daemon_running(socket_path)
         .await

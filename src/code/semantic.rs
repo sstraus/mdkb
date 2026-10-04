@@ -263,8 +263,8 @@ fn push_header(buf: &mut Vec<u8>, count: u32) {
     buf.extend_from_slice(&count.to_le_bytes());
 }
 
-/// Rewrites of the vector store on this thread, so a test can tell one pass
-/// from one rewrite per file.
+// Rewrites of the vector store on this thread, so a test can tell one pass
+// from one rewrite per file.
 #[cfg(test)]
 thread_local! {
     pub(crate) static STORE_REWRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
