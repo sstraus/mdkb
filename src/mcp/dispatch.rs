@@ -755,14 +755,9 @@ impl SlotOpener {
         };
         let ctx = match opened {
             Ok(ctx) => ctx,
-            Err(e) if e.is_not_found() => {
+            Err(e) if e.is_not_found() && !admitted => {
                 tracing::info!("Auto-initializing mdkb at {}", self.root.display());
-                let initialized = if admitted {
-                    Context::init_writer_admitted(&self.root)
-                } else {
-                    Context::init(&self.root)
-                };
-                initialized
+                Context::init(&self.root)
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -18693,6 +18688,64 @@ mod tests {
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Catches (#266-e5c5): detached prompt telemetry waits for a busy slot,
+    /// but the one-shot join returns and runtime shutdown cancels its count.
+    #[test]
+    fn one_shot_prompt_persists_hook_call_held_until_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.block_on(async {
+            make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = true;
+                config.hooks.user_prompt_submit_deadline_ms = 0;
+                config.telemetry.query_events = false;
+            })
+        });
+        *handle.ctx.try_lock().unwrap() = Some(Context::init(tmp.path()).unwrap());
+        let held = runtime.block_on(Arc::clone(&handle.ctx).lock_owned());
+        let dctx = make_collecting_dctx();
+        runtime.block_on(async {
+            dispatch_call(
+                "hook.user_prompt_submit",
+                json!({"prompt": "ordinary prompt", "session_id": "counted-prompt"}),
+                Arc::clone(&handle),
+                &dctx,
+            )
+            .await
+            .expect("hook");
+        });
+
+        // The real slot prevents either implementation from writing early.
+        // Like the CLI, shut down as soon as collected background work ends.
+        // Release the slot only if that join actually waits for the count.
+        let mut join = Box::pin(dctx.join_background());
+        let waited = runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(1), join.as_mut())
+                .await
+                .is_err()
+        });
+        let held = if waited {
+            drop(held);
+            runtime.block_on(join.as_mut());
+            None
+        } else {
+            Some(held)
+        };
+        drop(join);
+        drop(runtime);
+        drop(held);
+
+        // Reopen real persisted state after shutdown; no scheduler timing oracle.
+        let ctx = Context::open(tmp.path()).unwrap();
+        let calls: i64 = ctx.conn.query_row(
+            "SELECT COUNT(*) FROM call_log c JOIN sessions s ON s.id = c.session_id WHERE s.agent = 'hooks' AND c.tool_name = 'user_prompt_submit'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(calls, 1, "shutdown lost the held prompt hook call");
     }
 
     /// Catches (#265-0caa): a one-shot `user_prompt_submit` whose query event is

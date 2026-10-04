@@ -634,15 +634,7 @@ impl Context {
 
     /// Initialize a new mdkb directory.
     pub fn init(root: impl AsRef<Path>) -> Result<Self> {
-        Self::init_impl(root.as_ref(), false)
-    }
-
-    /// Initialize under the caller's existing writer admission.
-    pub(crate) fn init_writer_admitted(root: &Path) -> Result<Self> {
-        Self::init_impl(root, true)
-    }
-
-    fn init_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
+        let root = root.as_ref();
         let mdkb_dir = namespace::store_dir(root)?;
         ensure_store_layout(&mdkb_dir)?;
 
@@ -657,14 +649,7 @@ impl Context {
         })?;
         let config_path = mdkb_dir.join("config.toml");
         let db_path = mdkb_dir.join("index.sqlite");
-        let _writer_guard = if writer_admitted {
-            None
-        } else {
-            Some(crate::store::mutation_lock::acquire_writer(
-                &db_path,
-                "init-schema",
-            )?)
-        };
+        let _writer_guard = crate::store::mutation_lock::acquire_writer(&db_path, "init-schema")?;
         let _init_guard = crate::store::mutation_lock::acquire(&db_path, "init-schema")?;
 
         // Write the defaults commented out, so they stay discoverable without
