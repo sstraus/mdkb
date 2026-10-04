@@ -308,3 +308,74 @@ fn hooks_e2e_session_start_names_undetected_relation_keys() {
         "the undetected `org` key must be named in the body: {stdout}"
     );
 }
+
+// Catches: one-shot shutdown waits for a blocking writer-lock admission after
+// the prompt deadline, even though stdout has already been emitted.
+#[test]
+fn one_shot_prompt_exits_before_foreign_writer_releases() {
+    let temp = tempfile::tempdir().unwrap();
+    handle_init(temp.path()).unwrap();
+    let cfg = temp.path().join(".mdkb/config.toml");
+    let mut config = std::fs::read_to_string(&cfg).unwrap();
+    config.push_str("\n[hooks]\nuser_prompt_submit_require_sigil = false\nuser_prompt_submit_deadline_ms = 300\n[telemetry]\nquery_events = true\n");
+    std::fs::write(cfg, config).unwrap();
+    let ctx = Context::open(temp.path()).unwrap();
+    let writer =
+        mdkb::store::mutation_lock::acquire_writer(&ctx.db_path, "foreign update").unwrap();
+    drop(ctx);
+    let (release, released) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let exited_first = released
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
+        drop(writer);
+        exited_first
+    });
+    let start = std::time::Instant::now();
+    let (stdout, stderr, code) = run_hook(
+        "user-prompt-submit",
+        temp.path(),
+        r#"{"prompt":"???","session_id":"foreign-update"}"#,
+    );
+    let elapsed = start.elapsed();
+    let _ = release.send(());
+    let exited_first = holder.join().unwrap();
+    assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+    assert!(
+        exited_first,
+        "one-shot waited for the foreign writer: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "prompt exit exceeded its deadline allowance: {elapsed:?}"
+    );
+}
+
+// Catches: detached prompt telemetry is cancelled at one-shot process exit.
+#[test]
+fn one_shot_prompt_persists_its_hook_call() {
+    for deadline in [0, 60000] {
+        let temp = tempfile::tempdir().unwrap();
+        handle_init(temp.path()).unwrap();
+        let cfg = temp.path().join(".mdkb/config.toml");
+        let mut config = std::fs::read_to_string(&cfg).unwrap();
+        config.push_str(&format!(
+            "\n[hooks]\nuser_prompt_submit_deadline_ms = {deadline}\n"
+        ));
+        std::fs::write(cfg, config).unwrap();
+        let (stdout, stderr, code) = run_hook(
+            "user-prompt-submit",
+            temp.path(),
+            r#"{"prompt":"ordinary prompt","session_id":"counted-prompt"}"#,
+        );
+        assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        let ctx = Context::open(temp.path()).unwrap();
+        let calls: i64 = ctx.conn.query_row(
+        "SELECT COUNT(*) FROM call_log c JOIN sessions s ON s.id = c.session_id WHERE s.agent = 'hooks' AND c.tool_name = 'user_prompt_submit'",
+        [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            calls, 1,
+            "the completed one-shot must persist exactly one hook call"
+        );
+    }
+}

@@ -741,14 +741,28 @@ impl SlotOpener {
     /// Open the context into the locked, empty slot: initializes a store that is
     /// not there, and heals one that is damaged.
     fn open(&self, ctx_guard: &mut Option<Context>) -> Result<(), McpError> {
+        self.open_impl(ctx_guard, false)
+    }
+
+    fn open_impl(&self, ctx_guard: &mut Option<Context>, admitted: bool) -> Result<(), McpError> {
         if self.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open_reusing_process_probe(&self.root) {
+        let opened = if admitted {
+            Context::open_writer_admitted_reusing_process_probe(&self.root)
+        } else {
+            Context::open_reusing_process_probe(&self.root)
+        };
+        let ctx = match opened {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
                 tracing::info!("Auto-initializing mdkb at {}", self.root.display());
-                Context::init(&self.root)
+                let initialized = if admitted {
+                    Context::init_writer_admitted(&self.root)
+                } else {
+                    Context::init(&self.root)
+                };
+                initialized
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -765,6 +779,22 @@ impl SlotOpener {
         }
         *ctx_guard = Some(ctx);
         Ok(())
+    }
+}
+
+/// Wait cooperatively for writer admission, including a cold slot's open.
+/// A cancelled hook must not leave an OS lock waiter on a blocking thread.
+async fn admit_slot_writer(
+    opener: &SlotOpener,
+) -> crate::error::Result<crate::store::mutation_lock::MutationGuard> {
+    let dir = crate::store::namespace::store_dir(&opener.root)?;
+    std::fs::create_dir_all(&dir)?;
+    let db = crate::domain::canonicalize_plain(&dir)?.join("index.sqlite");
+    loop {
+        if let Some(admission) = crate::store::mutation_lock::try_acquire_writer(&db)? {
+            return Ok(admission);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
 
@@ -786,9 +816,17 @@ fn warm_slot_in_background(handle: &RepoHandle) {
         if guard.is_some() {
             return;
         }
+        let admission = match admit_slot_writer(&opener).await {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!("warm open admission failed: {error}");
+                return;
+            }
+        };
         let opened = tokio::task::spawn_blocking(move || {
+            let _admission = admission;
             let _hold = crate::core::SlotHold::start("warm open");
-            opener.open(&mut guard)
+            opener.open_impl(&mut guard, true)
         })
         .await;
         match opened {
@@ -1111,6 +1149,21 @@ fn write_behind_slot(
         }
         loop {
             let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+            {
+                let mut queues = deferred_writes();
+                if queues.get(&key).is_none_or(|queue| queue.writes.is_empty()) {
+                    queues.remove(&key);
+                    return;
+                }
+            }
+            let admission = match admit_slot_writer(&opener).await {
+                Ok(admission) => admission,
+                Err(error) => {
+                    tracing::warn!("deferred writer admission failed: {error}");
+                    deferred_writes().remove(&key);
+                    return;
+                }
+            };
             let batch = {
                 let mut queues = deferred_writes();
                 let writes = queues
@@ -1129,31 +1182,13 @@ fn write_behind_slot(
             let opener = SlotOpener::clone(&opener);
             let written = tokio::task::spawn_blocking(move || {
                 if guard.is_none() {
-                    if let Err(error) = opener.open(&mut guard) {
+                    if let Err(error) = opener.open_impl(&mut guard, true) {
                         for (what, _) in &batch {
                             tracing::warn!("{what} dropped: {}", error.message);
                         }
                         return;
                     }
                 }
-                let Some(ctx) = guard.as_ref() else {
-                    for (what, _) in &batch {
-                        log_slot_write(what, None);
-                    }
-                    return;
-                };
-                let admission = match crate::store::mutation_lock::acquire_writer(
-                    &ctx.db_path,
-                    "deferred write batch",
-                ) {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        for (what, _) in &batch {
-                            tracing::warn!("{what} dropped: writer admission failed: {error}");
-                        }
-                        return;
-                    }
-                };
                 for (what, f) in batch {
                     let outcome =
                         crate::core::run_admitted_write(&mut guard, what, &admission, |ctx| {
@@ -1200,6 +1235,28 @@ async fn settle_deferred_writes(key: usize) {
             return;
         };
         let _ = task.await;
+    }
+}
+
+/// Settle one-shot telemetry using the prompt's remaining deadline budget.
+async fn settle_prompt_writes(key: usize, deadline: Option<tokio::time::Instant>) {
+    let Some(deadline) = deadline else {
+        settle_deferred_writes(key).await;
+        return;
+    };
+    loop {
+        let task = deferred_writes()
+            .get_mut(&key)
+            .and_then(|queue| queue.waiting.take());
+        let Some(mut task) = task else {
+            return;
+        };
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+            tracing::warn!("prompt telemetry settlement exceeded the hook deadline");
+            return;
+        }
     }
 }
 
@@ -8147,6 +8204,9 @@ pub async fn dispatch_call(
             // hook answers with nothing. Dropping the future releases the
             // store lock; `phases` keeps what the run reached.
             let deadline = handle.config.hooks.user_prompt_submit_deadline_ms;
+            let exit_deadline = (deadline != 0).then(|| {
+                tokio::time::Instant::from_std(t0) + std::time::Duration::from_millis(deadline)
+            });
             let (result, timed_out) = if deadline == 0 {
                 (run.await, false)
             } else {
@@ -8190,18 +8250,18 @@ pub async fn dispatch_call(
                     budget,
                 ),
             });
-            // A recall that bypassed a busy slot queued its query event behind
-            // it. The one-shot caller joins that drain after emitting.
-            if dctx.background.is_some() {
-                dctx.spawn_background(settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize));
-            }
-            // Telemetry takes the same store lock the stalled recall waited
-            // on; awaiting it here would hold the answer past the deadline.
-            let telemetry_handle = Arc::clone(&handle);
-            let telemetry_method = tool_name.to_string();
-            tokio::spawn(async move {
-                record_hook_call(&telemetry_handle, &telemetry_method).await;
+            // Counts and recall ledger rows share the same drain. The daemon
+            // keeps it running; a one-shot joins only within the prompt budget.
+            write_behind_slot(SlotOpener::of(&handle), "hook telemetry", |ctx| {
+                let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
+                stats::record_call(&ctx.conn, sid, "user_prompt_submit", 0, 0, false)
             });
+            if dctx.background.is_some() {
+                dctx.spawn_background(settle_prompt_writes(
+                    Arc::as_ptr(&handle.ctx) as usize,
+                    exit_deadline,
+                ));
+            }
             Ok(result)
         }
         "hook.post_tool_use" => {

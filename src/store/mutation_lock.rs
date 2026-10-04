@@ -186,6 +186,20 @@ pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> 
     Ok(MutationGuard { file })
 }
 
+/// Probe writer admission without leaving a blocking lock waiter at shutdown.
+pub(crate) fn try_acquire_writer(db_path: &Path) -> Result<Option<MutationGuard>> {
+    let path = writer_lock_path(db_path);
+    let file = open_lock_file(&path)?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(MutationGuard { file })),
+        Err(e) if is_lock_contention(&e) => Ok(None),
+        Err(e) => Err(Error::from(ErrorKind::Io {
+            path,
+            operation: format!("probe writer lock: {e}"),
+        })),
+    }
+}
+
 /// Admit a direct CLI writer using the same lock as daemon-owned writers.
 ///
 /// The lock lives in the store the write goes to, so a namespaced writer never
