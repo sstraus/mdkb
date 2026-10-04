@@ -215,8 +215,8 @@ mod tests {
         assert!(cfg.recall_rerank_min_score_it > cfg.recall_rerank_min_score_en);
         assert_eq!(prompt_language("src/mcp/dispatch.rs"), Language::It);
         assert_eq!(
-            min_score_for(&cfg, "src/mcp/dispatch.rs"),
-            cfg.recall_rerank_min_score_it
+            min_score_for(&cfg, "src/mcp/dispatch.rs").to_bits(),
+            cfg.recall_rerank_min_score_it.to_bits()
         );
         assert_eq!(prompt_language(""), Language::It);
     }
@@ -247,8 +247,10 @@ mod tests {
 
     #[test]
     fn a_short_hook_deadline_clamps_the_budget() {
-        let mut cfg = HooksConfig::default();
-        cfg.user_prompt_submit_deadline_ms = 500;
+        let cfg = HooksConfig {
+            user_prompt_submit_deadline_ms: 500,
+            ..HooksConfig::default()
+        };
         assert_eq!(
             rerank_budget(&cfg, 100),
             Some(Duration::from_millis(500 - 100 - RESERVE_AFTER_RERANK_MS))
@@ -259,8 +261,10 @@ mod tests {
     fn hook_deadline_zero_still_stops_at_the_default_deadline() {
         // Catches: `deadline = 0` read as "no limit", so a slow reranker runs
         // past the wait the hook client keeps and the host gets nothing.
-        let mut cfg = HooksConfig::default();
-        cfg.user_prompt_submit_deadline_ms = 0;
+        let cfg = HooksConfig {
+            user_prompt_submit_deadline_ms: 0,
+            ..HooksConfig::default()
+        };
         assert_eq!(rerank_budget(&cfg, 0), Some(Duration::from_millis(700)));
         assert_eq!(rerank_budget(&cfg, 60_000), None);
     }

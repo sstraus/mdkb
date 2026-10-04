@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- **Strict Clippy accepts the current stable Rust baseline.** Apply behavior-neutral
+  lint fixes while retaining hook lock guards and exact test assertions. Found by
+  the maintainer's strict Clippy gate on Rust 1.98.1. Story 269-8e28.
+
 - **One-shot prompt hooks bound their telemetry settlement by the existing
   prompt deadline.** Writer admission yields while another process holds the
   store, so runtime shutdown cannot wait indefinitely. Prompt call counts share

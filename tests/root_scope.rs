@@ -233,8 +233,12 @@ fn a_repo_with_no_scope_is_always_in_star() {
         );
     }
 
-    let unscoped =
-        resolve_root_selector(&registry, Some("*"), &[world.free_store.clone()]).expect("resolve");
+    let unscoped = resolve_root_selector(
+        &registry,
+        Some("*"),
+        std::slice::from_ref(&world.free_store),
+    )
+    .expect("resolve");
     assert_eq!(
         sorted(unscoped.roots),
         sorted(vec![
@@ -260,8 +264,12 @@ fn a_repos_json_scope_overrides_the_prefix_rule() {
     .expect("write repos.json");
     let registry = registry(&world);
 
-    let resolved =
-        resolve_root_selector(&registry, Some("*"), &[world.work_store.clone()]).expect("resolve");
+    let resolved = resolve_root_selector(
+        &registry,
+        Some("*"),
+        std::slice::from_ref(&world.work_store),
+    )
+    .expect("resolve");
     assert!(resolved.roots.contains(&moved), "override ignored");
     assert!(!resolved.roots.contains(&world.home_store));
     assert_eq!(resolved.excluded_by_scope, 1);

@@ -6178,10 +6178,10 @@ mod tests {
         let mut e = make_entry_at(0, 0, 0, None, SourceType::UserStatement);
         e.entry_type = EntryType::Prior;
         // No accesses: strength 1, so 180 days is e^-2 of 0.425.
-        assert!((e.confidence_at(180 * day) - 0.0575174953755604).abs() < 1e-9);
+        assert!((e.confidence_at(180 * day) - 0.057_517_495_375_560_4).abs() < 1e-9);
         // Three accesses: strength 1 + ln 4 stretches the same 90 days.
         e.access_count = 3;
-        assert!((e.confidence_at(90 * day) - 0.27950757235370893).abs() < 1e-9);
+        assert!((e.confidence_at(90 * day) - 0.279_507_572_353_708_93).abs() < 1e-9);
         // A clock behind the reference never lifts confidence over its start.
         assert!((e.confidence_at(-10 * day) - 0.425).abs() < 1e-12);
     }
@@ -6523,19 +6523,23 @@ mod tests {
         let now = 1_000_000;
         let ln4 = 4.0_f64.ln();
         assert_eq!(
-            access_recency_score(0, Some(now), now, 100),
-            0.0,
+            access_recency_score(0, Some(now), now, 100).to_bits(),
+            0.0_f64.to_bits(),
             "never accessed"
         );
-        assert_eq!(access_recency_score(5, None, now, 100), 0.0, "no timestamp");
         assert_eq!(
-            access_recency_score(5, Some(now - 100), now, -10),
-            0.0,
+            access_recency_score(5, None, now, 100).to_bits(),
+            0.0_f64.to_bits(),
+            "no timestamp"
+        );
+        assert_eq!(
+            access_recency_score(5, Some(now - 100), now, -10).to_bits(),
+            0.0_f64.to_bits(),
             "negative half-life"
         );
         assert_eq!(
-            access_recency_score(5, Some(now - 100), now, 0),
-            0.0,
+            access_recency_score(5, Some(now - 100), now, 0).to_bits(),
+            0.0_f64.to_bits(),
             "zero half-life"
         );
         assert!(

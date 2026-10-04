@@ -59,9 +59,11 @@ fn each_language_reads_only_its_own_switch() {
         (false, false, false, false, false),
     ];
     for (it, en, want_it, want_en, want_unknown) in cases {
-        let mut cfg = HooksConfig::default();
-        cfg.recall_rerank_it = it;
-        cfg.recall_rerank_en = en;
+        let cfg = HooksConfig {
+            recall_rerank_it: it,
+            recall_rerank_en: en,
+            ..HooksConfig::default()
+        };
         let label = format!("it={it} en={en}");
         assert_eq!(
             enabled_for(&cfg, ITALIAN),
@@ -111,12 +113,16 @@ fn budget_boundary_is_inclusive_at_the_minimum_and_never_underflows() {
     assert_eq!(rerank_budget(&cfg, at_minimum + 1), None);
     assert_eq!(rerank_budget(&cfg, u64::MAX), None);
 
-    let mut tiny = HooksConfig::default();
-    tiny.user_prompt_submit_deadline_ms = 1;
+    let tiny = HooksConfig {
+        user_prompt_submit_deadline_ms: 1,
+        ..HooksConfig::default()
+    };
     assert_eq!(rerank_budget(&tiny, 0), None);
 
-    let mut zero = HooksConfig::default();
-    zero.recall_rerank_deadline_ms = 0;
+    let zero = HooksConfig {
+        recall_rerank_deadline_ms: 0,
+        ..HooksConfig::default()
+    };
     assert_eq!(
         rerank_budget(&zero, 0),
         None,
@@ -129,7 +135,8 @@ async fn every_failure_has_its_own_logged_outcome_and_keeps_minilm() {
     // Catches: two failure kinds sharing one `rerank_outcome` (the log can no
     // longer say whether the weights are missing, loading, busy or broken), or a
     // new variant (`one_shot`) falling into a catch-all.
-    let cases: [(fn() -> RerankError, &str); 6] = [
+    type FailureCase = (fn() -> RerankError, &'static str);
+    let cases: [FailureCase; 6] = [
         (|| RerankError::Loading, "loading"),
         (|| RerankError::NotCached(PathBuf::from("x")), "not_cached"),
         (|| RerankError::LoadFailed("x".into()), "load_failed"),

@@ -1163,7 +1163,7 @@ pub(crate) fn ensure_sound_locked(db_path: &Path, trust_process_probe: bool) -> 
     let heal = ensure_sound_at_locked(db_path, CHECK_INTERVAL, now)?;
     match heal {
         Heal::Sound if db_path.exists() => {
-            set_process_verified(db_path, Some(fresh_marker.unwrap_or(now)))
+            set_process_verified(db_path, Some(fresh_marker.unwrap_or(now)));
         }
         _ => forget_process_probe(db_path),
     }
@@ -1910,7 +1910,7 @@ mod tests {
 
         match is_structurally_sound(&conn) {
             Soundness::Corrupt { reason } => {
-                assert!(reason.contains("CHECK constraint failed"), "{reason}")
+                assert!(reason.contains("CHECK constraint failed"), "{reason}");
             }
             other => panic!("a broken CHECK must be corrupt, got {other:?}"),
         }

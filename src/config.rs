@@ -1471,7 +1471,10 @@ mod tests {
         assert_eq!(cfg.recall_limit, 5);
         // Documents leg on by default; 0 would make recall memory-only.
         assert_eq!(cfg.recall_docs_limit, 3);
-        assert_eq!(cfg.recall_docs_min_cosine, RECALL_DOCS_MIN_COSINE_DEFAULT);
+        assert_eq!(
+            cfg.recall_docs_min_cosine.to_bits(),
+            RECALL_DOCS_MIN_COSINE_DEFAULT.to_bits()
+        );
         // Confidence floor on by default so low-signal entries stay out of warmup.
         assert!((cfg.warmup_min_confidence - 0.25).abs() < f64::EPSILON);
     }

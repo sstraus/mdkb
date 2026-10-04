@@ -1205,8 +1205,10 @@ mod tests {
         // Catches: a fixed client wait that ignores a raised deadline, and
         // `deadline = 0` turned into a zero or unbounded wait.
         let margin = crate::config::USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS;
-        let mut hooks = HooksConfig::default();
-        hooks.user_prompt_submit_deadline_ms = 1500;
+        let mut hooks = HooksConfig {
+            user_prompt_submit_deadline_ms: 1500,
+            ..HooksConfig::default()
+        };
         assert_eq!(
             user_prompt_submit_timeout(&hooks),
             Duration::from_millis(1500 + margin)
@@ -1308,8 +1310,10 @@ mod tests {
                 .unwrap();
             stream.write_all(&response).await.unwrap();
         });
-        let mut hooks = HooksConfig::default();
-        hooks.user_prompt_submit_deadline_ms = 1500;
+        let hooks = HooksConfig {
+            user_prompt_submit_deadline_ms: 1500,
+            ..HooksConfig::default()
+        };
 
         let client = tokio::spawn(async move {
             call_daemon_with_timeout(
