@@ -419,83 +419,96 @@ mod tests {
     }
 
     /// Catches: disconnect closing host stdio or replaying an application request
-    /// instead of only initialization. OS scheduling is not a protocol deadline.
+    /// instead of only initialization, or delaying exit beyond 2 s after stdin EOF.
     #[tokio::test(start_paused = true)]
     async fn daemon_disconnect_keeps_stdio_open_and_replays_handshake() {
-        let _clock = crate::test_support::ManualClock::new();
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
-
-        let fake_daemon = tokio::spawn(async move {
-            let (first, _) = listener.accept().await.unwrap();
-            let (first_read, mut first_write) = first.into_split();
-            let mut first_read = BufReader::new(first_read);
-            assert_method(&mut first_read, "initialize").await;
-            first_write
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
-                .await
-                .unwrap();
-            assert_method(&mut first_read, "notifications/initialized").await;
-            assert_method(&mut first_read, "tools/list").await;
-            drop(first_write);
-            drop(first_read);
-
-            let (second, _) = listener.accept().await.unwrap();
-            let (second_read, mut second_write) = second.into_split();
-            let mut second_read = BufReader::new(second_read);
-            assert_method(&mut second_read, "initialize").await;
-            second_write
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
-                .await
-                .unwrap();
-            assert_method(&mut second_read, "notifications/initialized").await;
-            assert_method(&mut second_read, "tools/call").await;
-            second_write
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n")
-                .await
-                .unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let watchdog = tokio::task::spawn_blocking(move || {
+            wait.recv_timeout(std::time::Duration::from_secs(15))
         });
+        let protocol = async {
+            let _clock = crate::test_support::ManualClock::new();
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("daemon.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
 
-        let (client_input, proxy_input) = tokio::io::duplex(8 * 1024);
-        let (proxy_output, client_output) = tokio::io::duplex(8 * 1024);
-        let proxy = tokio::spawn(run_proxy_io(socket_path, proxy_input, proxy_output));
-        let mut client_input = client_input;
-        let mut client_output = BufReader::new(client_output);
+            let fake_daemon = tokio::spawn(async move {
+                let (first, _) = listener.accept().await.unwrap();
+                let (first_read, mut first_write) = first.into_split();
+                let mut first_read = BufReader::new(first_read);
+                assert_method(&mut first_read, "initialize").await;
+                first_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                    .await
+                    .unwrap();
+                assert_method(&mut first_read, "notifications/initialized").await;
+                assert_method(&mut first_read, "tools/list").await;
+                drop(first_write);
+                drop(first_read);
 
-        client_input
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
-            .await
-            .unwrap();
-        assert_eq!(read_json_line(&mut client_output).await["id"], 1);
-        client_input
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
-            .await
-            .unwrap();
-        client_input
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
-            .await
-            .unwrap();
+                let (second, _) = listener.accept().await.unwrap();
+                let (second_read, mut second_write) = second.into_split();
+                let mut second_read = BufReader::new(second_read);
+                assert_method(&mut second_read, "initialize").await;
+                second_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                    .await
+                    .unwrap();
+                assert_method(&mut second_read, "notifications/initialized").await;
+                assert_method(&mut second_read, "tools/call").await;
+                second_write
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n")
+                    .await
+                    .unwrap();
+            });
 
-        let disconnect = read_json_line(&mut client_output).await;
-        assert_eq!(disconnect["id"], 2);
-        assert_eq!(disconnect["error"]["code"], -32603);
+            let (client_input, proxy_input) = tokio::io::duplex(8 * 1024);
+            let (proxy_output, client_output) = tokio::io::duplex(8 * 1024);
+            let proxy = tokio::spawn(run_proxy_io(socket_path, proxy_input, proxy_output));
+            let mut client_input = client_input;
+            let mut client_output = BufReader::new(client_output);
 
-        client_input
-            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"}\n")
-            .await
-            .unwrap();
-        let response = read_json_line(&mut client_output).await;
-        assert_eq!(response["id"], 3);
-        assert_eq!(response["result"]["ok"], true);
+            client_input
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n")
+                .await
+                .unwrap();
+            assert_eq!(read_json_line(&mut client_output).await["id"], 1);
+            client_input
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+                .await
+                .unwrap();
+            client_input
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n")
+                .await
+                .unwrap();
 
-        drop(client_input);
-        tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
-            .await
-            .expect("proxy must exit when its stdio input closes")
-            .unwrap()
-            .unwrap();
-        fake_daemon.await.unwrap();
+            let disconnect = read_json_line(&mut client_output).await;
+            assert_eq!(disconnect["id"], 2);
+            assert_eq!(disconnect["error"]["code"], -32603);
+
+            client_input
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\"}\n")
+                .await
+                .unwrap();
+            let response = read_json_line(&mut client_output).await;
+            assert_eq!(response["id"], 3);
+            assert_eq!(response["result"]["ok"], true);
+
+            // Real time must drive the exit guard; the protocol phase stays paused.
+            tokio::time::resume();
+            drop(client_input);
+            tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
+                .await
+                .expect("proxy must exit when its stdio input closes")
+                .unwrap()
+                .unwrap();
+            fake_daemon.await.unwrap();
+        };
+        tokio::select! {
+            () = protocol => {}
+            result = watchdog => panic!("real-time proxy protocol watchdog fired: {result:?}"),
+        }
+        drop(release);
     }
 
     async fn assert_method<R>(reader: &mut BufReader<R>, expected: &str)

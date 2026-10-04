@@ -1322,7 +1322,14 @@ mod tests {
         });
         ready.await.unwrap();
         assert!(!client.is_finished(), "the delayed reply has not arrived");
-        tokio::time::advance(Duration::from_millis(1200)).await;
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        // Poll the client after the former fixed 1 s deadline, before the reply.
+        tokio::task::yield_now().await;
+        assert!(
+            !client.is_finished(),
+            "the client must still wait past 1 s while its reply is withheld"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
         let result = client
             .await
             .unwrap()
