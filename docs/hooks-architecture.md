@@ -267,7 +267,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
 | `user_prompt_submit_deadline_ms` | u64 | `1000` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. The hook client waits this plus 250 ms, so a raised value is honoured on the daemon path. `0` disables the daemon cut; the client then waits the default plus 250 ms |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
-| `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
+| `recall_auto_min_cosine` | f32 | `0.55` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
 | `recall_rerank_it` | bool | `true` | Rerank MiniLM's top five with jina-reranker-v2 int8 on non-sigil Italian prompts; falls back to the MiniLM result on any failure |
 | `recall_rerank_en` | bool | `false` | The same for English prompts; off until a floor is fitted on a real English store |
 | `recall_rerank_deadline_ms` | u64 | `700` | Reranker's own deadline, clamped to the nearer of the hook deadline and the 1 s hook-client socket timeout, minus the time already spent and 150 ms |

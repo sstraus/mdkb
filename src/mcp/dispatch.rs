@@ -4916,6 +4916,11 @@ async fn record_recall(
 /// the absolute floor drops some.
 const DOC_RECALL_POOL_FACTOR: usize = 4;
 
+/// File-stem corroboration measured on the orchestrator store (2026-10-02):
+/// unrelated follow-up prompts scored at most 0.437, the relevant one 0.514.
+/// Independent of the automatic memory floor, which uses memory labels.
+const DOC_STEM_MIN_COSINE: f32 = 0.50;
+
 /// The documents recall may inject: those with absolute evidence of relevance,
 /// in rank order.
 ///
@@ -4925,7 +4930,7 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// store without embeddings, or an identifier-shaped query, from losing the
 /// leg. A prompt word that is the document's file stem
 /// ([`crate::store::hybrid::names_file_stem`]) also counts, but only with the
-/// automatic-recall cosine floor behind it (`RECALL_AUTO_MIN_COSINE_DEFAULT`:
+/// file-stem cosine floor behind it (`DOC_STEM_MIN_COSINE`:
 /// measured 2026-10-02 on the orchestrator store, `followups.md` scored 0.245 –
 /// 0.437 on test-method prompts that say "follow-up" and 0.514 on the Italian
 /// question that really names follow-ups). Being in the BM25 result set is not
@@ -4966,8 +4971,7 @@ fn admit_doc_hits(
                 "recall doc candidate"
             );
             cosine.is_some_and(|c| c >= f64::from(min_cosine)) && !is_foreign(&hit.path)
-                || cosine
-                    .is_some_and(|c| c >= f64::from(crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT))
+                || cosine.is_some_and(|c| c >= f64::from(DOC_STEM_MIN_COSINE))
                     && crate::store::hybrid::names_file_stem(prompt, &hit.path)
                 || crate::store::hybrid::strong_lexical_match(
                     prompt,
@@ -5881,13 +5885,23 @@ enum RecallMode {
 }
 
 impl RecallMode {
-    // Regression baseline: the store's lexical gate is the only admission gate.
+    /// Automatic recall cannot buy semantic relevance with incidental words.
+    /// Sigil recall and the no-embedding fallback keep lexical admission;
+    /// successful cross-encoder reranking remains a separate semantic gate.
     fn admit_memories(
         self,
-        entries: Vec<memory::ScoredMemoryEntry>,
-        _has_embedding: bool,
-        _floor: f32,
+        mut entries: Vec<memory::ScoredMemoryEntry>,
+        has_embedding: bool,
+        floor: f32,
     ) -> Vec<memory::ScoredMemoryEntry> {
+        if matches!(self, Self::Automatic | Self::Shadow)
+            && has_embedding
+            && entries.iter().any(|entry| entry.distance.is_some())
+            && floor > 0.0
+        {
+            let bound = crate::store::hybrid::distance_bound(floor);
+            entries.retain(|entry| entry.distance.is_some_and(|distance| distance <= bound));
+        }
         entries
     }
 
@@ -19564,7 +19578,7 @@ mod file_stem_admission_critic_tests {
     /// f64, so the floor itself admits and the next f32 below it does not.
     #[test]
     fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
-        let floor = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
+        let floor = DOC_STEM_MIN_COSINE;
         let below = f32::from_bits(floor.to_bits() - 1);
         let prompt = "i followups aperti";
         let admit = |c: f32| {

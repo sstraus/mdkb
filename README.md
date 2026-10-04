@@ -213,7 +213,7 @@ and opt-out behavior are in [docs/hooks.md](docs/hooks.md).
 Session start includes a compact power-feature reminder and points to
 `mdkb cheatsheet`. Per-prompt recall is automatic: every prompt is searched and
 matching memory, documents, and graph hints are injected when they clear the
-`0.50` floor. Prefix a prompt with `*` to search at the lower `0.40` floor. MDKB
+`0.55` floor. Prefix a prompt with `*` to search at the lower `0.40` floor. MDKB
 removes the asterisk before search and before telemetry; it is not part of the
 query. Set `user_prompt_submit_require_sigil = true` under `[hooks]` to opt out:
 a prompt without `*` then passes through unchanged. Session warmup and the
@@ -229,8 +229,8 @@ it while a miss on a sigil prompt costs one search.
 | `[hooks]` / `[search.memory]` key | Default | What it gates |
 | --- | --- | --- |
 | `search.memory.min_recall_cosine` | `0.40` | The floor for a `*`-prefixed prompt. Lowest floor admitting no labelled negative on the eval fixture. |
-| `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. The recall plateau above `0.40` — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
-| `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
+| `hooks.recall_auto_min_cosine` | `0.55` | The floor for a prompt with no sigil. Calibrated from live recall labels — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
+| `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.55` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
 
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
