@@ -150,7 +150,10 @@ fn an_absolute_entry_that_resolves_to_root_is_kept() {
 
     let paths = config.ignored_paths();
 
-    assert_eq!(paths, vec![PathBuf::from("/")]);
+    // The platform root of the same volume the tempdir lives on: `/` on unix,
+    // `C:\` (or whichever drive holds the temp dir) on Windows.
+    let root = dir.path().ancestors().last().unwrap().to_path_buf();
+    assert_eq!(paths, vec![root]);
 }
 
 /// Catches: the warning fired on every discovery call. The daemon asks
