@@ -258,6 +258,58 @@ mod tests {
         assert!(result.is_ok(), "Should receive event within timeout");
     }
 
+    /// Catches: the native callback using a different filter from set_filter,
+    /// so ignored build changes reach the consumer despite helper tests passing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_native_callback_applies_installed_filter_and_delivers_source() {
+        let temp = setup_temp_dir();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let rejected = target.join("build.o");
+        let source = temp.path().join("lib.rs");
+        let (observed, mut observations) = mpsc::unbounded_channel();
+        let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms: 50 }).unwrap();
+        let rejected_for_filter = rejected.clone();
+        watcher.set_filter(move |path| {
+            if path == rejected_for_filter {
+                let _ = observed.send(());
+                return false;
+            }
+            path.extension().is_some_and(|extension| extension == "rs")
+        });
+        watcher.watch(&temp.path().to_path_buf()).unwrap();
+
+        // Observe actual registration and delivery; retry this one write rather
+        // than assume a fixed sleep is sufficient for native watch registration.
+        timeout(Duration::from_secs(10), async {
+            let mut revision = 0;
+            loop {
+                fs::write(&rejected, revision.to_string()).unwrap();
+                revision += 1;
+                tokio::select! {
+                    signal = observations.recv() => {
+                        signal.expect("native filter observation channel closed");
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the installed filter must observe the native target event");
+
+        fs::write(&source, "fn source() {}\n").unwrap();
+        let change = timeout(Duration::from_secs(10), watcher.recv())
+            .await
+            .expect("the source event must reach the public receiver")
+            .expect("native watcher must remain open");
+        assert_eq!(change.path, source, "rejected target must not reach recv");
+        assert!(
+            !watcher.take_missed_events(),
+            "one source edit must not overflow"
+        );
+    }
+
     #[tokio::test]
     async fn watcher_ignores_target_churn_without_overflow() {
         // Catches: target/** consuming bounded capacity before filtering, losing
