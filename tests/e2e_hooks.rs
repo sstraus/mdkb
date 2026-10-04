@@ -22,6 +22,85 @@ fn mdkb_bin() -> &'static str {
     env!("CARGO_BIN_EXE_mdkb")
 }
 
+// Catches: treating deadline 0 as an immediate timeout drops a queued hook
+// call under foreign admission; retaining the detached count path doubles it.
+#[test]
+fn critic_266_unlimited_settlement_waits_for_writer_and_counts_each_prompt_once() {
+    use std::time::{Duration, Instant};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path();
+    handle_init(root).expect("init");
+    let config = root.join(".mdkb/config.toml");
+    let mut text = std::fs::read_to_string(&config).expect("read config");
+    text.push_str("\n[hooks]\nuser_prompt_submit_deadline_ms = 0\n");
+    std::fs::write(config, text).expect("write config");
+    let ctx = Context::open(root).expect("open store");
+    let writer = mdkb::store::mutation_lock::acquire_writer(&ctx.db_path, "critic foreign writer")
+        .expect("hold admission");
+    let mut child = Command::new(mdkb_bin())
+        .args(["hook", "user-prompt-submit"])
+        .current_dir(root)
+        .env("MDKB_NO_DAEMON", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn hook");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"prompt":"ordinary prompt"}"#)
+        .unwrap();
+    // Ordinary prompts intentionally emit no stdout. The production event
+    // log signals that dispatch reached settlement, rather than timing startup.
+    let dispatch_limit = Instant::now() + Duration::from_secs(10);
+    while !root.join(".mdkb/hook-events.jsonl").exists()
+        && child.try_wait().expect("poll dispatch").is_none()
+        && Instant::now() < dispatch_limit
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(150));
+    let premature_exit = child.try_wait().expect("poll child");
+    drop(writer);
+    let limit = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll released child") {
+            break status;
+        }
+        if Instant::now() >= limit {
+            child.kill().expect("kill own stuck hook");
+            child.wait().expect("reap own hook");
+            panic!("admitted cold open reacquired the non-reentrant writer lock");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(
+        premature_exit.is_none(),
+        "deadline zero discarded pending telemetry"
+    );
+    assert!(status.success());
+    for _ in 0..2 {
+        let (_, stderr, code) = run_hook(
+            "user-prompt-submit",
+            root,
+            r#"{"prompt":"ordinary prompt"}"#,
+        );
+        assert_eq!(code, 0, "{stderr}");
+    }
+    let calls: i64 = ctx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM call_log WHERE tool_name = 'user_prompt_submit'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count persisted calls");
+    assert_eq!(calls, 3, "lost or double-counted one-shot hook calls");
+}
+
 /// Run `mdkb hook <event>` with the given stdin payload and return stdout.
 fn run_hook(event: &str, cwd: &Path, stdin_payload: &str) -> (String, String, i32) {
     run_hook_with_home(event, cwd, stdin_payload, None)
