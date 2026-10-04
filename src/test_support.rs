@@ -135,3 +135,20 @@ impl Stub<'_> {
         )
     }
 }
+
+/// Keep a paused Tokio clock under explicit control while real sockets are idle.
+/// A blocking task inhibits Tokio's automatic jump to the next timeout without
+/// consuming CPU. Dropping the guard releases it, including during a panic.
+pub(crate) struct ManualClock {
+    _release: std::sync::mpsc::Sender<()>,
+}
+
+impl ManualClock {
+    pub(crate) fn new() -> Self {
+        let (release, wait) = std::sync::mpsc::channel();
+        tokio::task::spawn_blocking(move || {
+            let _ = wait.recv();
+        });
+        Self { _release: release }
+    }
+}

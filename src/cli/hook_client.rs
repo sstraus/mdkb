@@ -1265,8 +1265,9 @@ mod tests {
     /// Catches: the host receiving no recall while the hook deadline has not
     /// fired — the client gave up at a fixed 1 s although the daemon, under a
     /// 1500 ms deadline, still had 300 ms to answer (story 203-353e).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_reply_inside_the_configured_deadline_reaches_the_host() {
+        let _clock = crate::test_support::ManualClock::new();
         let tmp = TempDir::new().unwrap();
         let sock = tmp.path().join("hook.sock");
         let envelope = json!({
@@ -1275,22 +1276,65 @@ mod tests {
                 "additionalContext": "recall",
             }
         });
-        let _srv = spawn_slow_hook_server(
-            sock.clone(),
-            json!({"jsonrpc":"2.0","result": envelope}),
-            Duration::from_millis(1200),
-        );
+        let listener = UnixListener::bind(&sock).expect("bind hook sock");
+        let (waiting, ready) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            // ensure_daemon_running probes with an empty connection before the
+            // client opens the connection carrying the framed request.
+            let (mut probe, _) = listener.accept().await.unwrap();
+            let mut probe_bytes = Vec::new();
+            probe.read_to_end(&mut probe_bytes).await.unwrap();
+            assert!(
+                probe_bytes.is_empty(),
+                "the reachability probe sends no RPC"
+            );
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).await.unwrap();
+            let mut body = vec![0; u32::from_le_bytes(header) as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let delay = tokio::time::sleep(Duration::from_millis(1200));
+            // Fix the reply deadline before telling the test to advance time.
+            waiting.send(()).unwrap();
+            delay.await;
+            let response = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": envelope,
+            }))
+            .unwrap();
+            stream
+                .write_all(&u32::try_from(response.len()).unwrap().to_le_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&response).await.unwrap();
+        });
         let mut hooks = HooksConfig::default();
         hooks.user_prompt_submit_deadline_ms = 1500;
 
-        let result = call_daemon_with_timeout(
-            &sock,
-            "hook.user_prompt_submit",
-            &json!({"root": "/tmp", "prompt": "anything"}),
-            hook_timeout("hook.user_prompt_submit", &hooks),
-        )
-        .await
-        .expect("a 1.2 s answer under a 1.5 s deadline must arrive");
+        let client = tokio::spawn(async move {
+            call_daemon_with_timeout(
+                &sock,
+                "hook.user_prompt_submit",
+                &json!({"root": "/tmp", "prompt": "anything"}),
+                hook_timeout("hook.user_prompt_submit", &hooks),
+            )
+            .await
+        });
+        ready.await.unwrap();
+        assert!(!client.is_finished(), "the delayed reply has not arrived");
+        tokio::time::advance(Duration::from_millis(1100)).await;
+        // Poll the client after the former fixed 1 s deadline, before the reply.
+        tokio::task::yield_now().await;
+        assert!(
+            !client.is_finished(),
+            "the client must still wait past 1 s while its reply is withheld"
+        );
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = client
+            .await
+            .unwrap()
+            .expect("a 1.2 s answer under a 1.5 s deadline must arrive");
+        server.await.unwrap();
 
         assert!(
             result.get("hookSpecificOutput").is_some(),

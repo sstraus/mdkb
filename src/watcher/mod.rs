@@ -90,34 +90,16 @@ impl FileWatcher {
             move |result: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
                 if let Ok(events) = result {
                     for event in events {
-                        if filter_for_closure
-                            .get()
-                            .is_some_and(|keep| !keep(&event.path))
-                        {
-                            continue;
-                        }
-                        let change = FileChange {
-                            path: event.path,
-                            kind: ChangeKind::CreateOrModify,
-                        };
-
-                        // Non-blocking send from a non-tokio thread. On a full
-                        // channel (burst > buffer while the consumer flushes) the
-                        // event would be silently lost, leaving files stale; flag
-                        // it so the consumer forces a full rescan, and warn (rate-
-                        // limited) so the drop is visible.
-                        if tx.try_send(change).is_err() {
-                            missed_for_closure.store(true, Ordering::Release);
-                            let now = std::time::Instant::now();
-                            if last_warn.is_none_or(|t| now.duration_since(t) >= DROP_WARN_INTERVAL)
-                            {
-                                tracing::warn!(
-                                    "File watcher channel full — dropped change event(s); \
-                                     scheduling a full rescan to recover. (Rate-limited warning.)"
-                                );
-                                last_warn = Some(now);
-                            }
-                        }
+                        deliver_change(
+                            &tx,
+                            &missed_for_closure,
+                            &filter_for_closure,
+                            &mut last_warn,
+                            FileChange {
+                                path: event.path,
+                                kind: ChangeKind::CreateOrModify,
+                            },
+                        );
                     }
                 }
             },
@@ -168,6 +150,32 @@ impl FileWatcher {
     /// Receive the next file change event.
     pub async fn recv(&mut self) -> Option<FileChange> {
         self.receiver.recv().await
+    }
+}
+
+/// Admit only relevant changes, preserving the rescan signal on backpressure.
+fn deliver_change(
+    tx: &mpsc::Sender<FileChange>,
+    missed_events: &AtomicBool,
+    filter: &OnceLock<PathFilter>,
+    last_warn: &mut Option<std::time::Instant>,
+    change: FileChange,
+) {
+    if filter.get().is_some_and(|keep| !keep(&change.path)) {
+        return;
+    }
+    // Non-blocking send from the debouncer thread. A dropped relevant change
+    // requires a rescan; rejected paths never consume bounded channel capacity.
+    if tx.try_send(change).is_err() {
+        missed_events.store(true, Ordering::Release);
+        let now = std::time::Instant::now();
+        if last_warn.is_none_or(|t| now.duration_since(t) >= DROP_WARN_INTERVAL) {
+            tracing::warn!(
+                "File watcher channel full — dropped change event(s); \
+                 scheduling a full rescan to recover. (Rate-limited warning.)"
+            );
+            *last_warn = Some(now);
+        }
     }
 }
 
@@ -250,35 +258,105 @@ mod tests {
         assert!(result.is_ok(), "Should receive event within timeout");
     }
 
+    /// Catches: the native callback using a different filter from set_filter,
+    /// so ignored build changes reach the consumer despite helper tests passing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn watcher_ignores_target_churn_without_overflow() {
-        // Catches: a burst of target/** events filling the 100-slot channel and
-        // forcing a full rescan, while the real source edit is lost in it.
+    async fn critic_native_callback_applies_installed_filter_and_delivers_source() {
         let temp = setup_temp_dir();
-        let mut watcher =
-            FileWatcher::new(WatcherConfig { debounce_ms: 50 }).expect("watcher creation");
-        watcher.set_filter(|p| !p.components().any(|c| c.as_os_str() == "target"));
-        watcher
-            .watch(&temp.path().to_path_buf())
-            .expect("watch should succeed");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let rejected = target.join("build.o");
+        let source = temp.path().join("lib.rs");
+        let (observed, mut observations) = mpsc::unbounded_channel();
+        let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms: 50 }).unwrap();
+        let rejected_for_filter = rejected.clone();
+        watcher.set_filter(move |path| {
+            if path == rejected_for_filter {
+                let _ = observed.send(());
+                return false;
+            }
+            path.extension().is_some_and(|extension| extension == "rs")
+        });
+        watcher.watch(&temp.path().to_path_buf()).unwrap();
 
-        let target = temp.path().join("target/debug");
-        fs::create_dir_all(&target).expect("mkdir");
+        // Observe actual registration and delivery; retry this one write rather
+        // than assume a fixed sleep is sufficient for native watch registration.
+        timeout(Duration::from_secs(10), async {
+            let mut revision = 0;
+            loop {
+                fs::write(&rejected, revision.to_string()).unwrap();
+                revision += 1;
+                tokio::select! {
+                    signal = observations.recv() => {
+                        signal.expect("native filter observation channel closed");
+                        break;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .expect("the installed filter must observe the native target event");
+
+        fs::write(&source, "fn source() {}\n").unwrap();
+        let change = timeout(Duration::from_secs(10), watcher.recv())
+            .await
+            .expect("the source event must reach the public receiver")
+            .expect("native watcher must remain open");
+        assert_eq!(change.path, source, "rejected target must not reach recv");
+        assert!(
+            !watcher.take_missed_events(),
+            "one source edit must not overflow"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_target_churn_without_overflow() {
+        // Catches: target/** consuming bounded capacity before filtering, losing
+        // a source edit or forcing an unnecessary rescan. Exercise admission,
+        // not FSEvents registration latency or the time to create 10,000 files.
+        let (tx, mut rx) = mpsc::channel(100);
+        let filter = OnceLock::<PathFilter>::new();
+        assert!(
+            filter
+                .set(Box::new(|p| {
+                    !p.components().any(|c| c.as_os_str() == "target")
+                }))
+                .is_ok()
+        );
+        let missed = AtomicBool::new(false);
+        let mut last_warn = None;
         for i in 0..10_000 {
-            fs::write(target.join(format!("f{i}.o")), "x").expect("write");
+            deliver_change(
+                &tx,
+                &missed,
+                &filter,
+                &mut last_warn,
+                FileChange {
+                    path: PathBuf::from(format!("target/debug/f{i}.o")),
+                    kind: ChangeKind::CreateOrModify,
+                },
+            );
         }
-        let src = temp.path().join("lib.rs");
-        fs::write(&src, "fn main() {}").expect("write");
-
+        let src = PathBuf::from("lib.rs");
+        deliver_change(
+            &tx,
+            &missed,
+            &filter,
+            &mut last_warn,
+            FileChange {
+                path: src.clone(),
+                kind: ChangeKind::CreateOrModify,
+            },
+        );
         let seen = timeout(Duration::from_secs(10), async {
-            while let Some(change) = watcher.recv().await {
+            while let Some(change) = rx.recv().await {
                 assert!(
                     !change.path.components().any(|c| c.as_os_str() == "target"),
                     "target churn reached the channel: {:?}",
                     change.path
                 );
-                if change.path.file_name() == src.file_name() {
+                if change.path == src {
                     return true;
                 }
             }
@@ -290,8 +368,12 @@ mod tests {
             "the source edit must be delivered"
         );
         assert!(
-            !watcher.take_missed_events(),
+            !missed.swap(false, Ordering::AcqRel),
             "no overflow, so no full rescan"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "only the source edit reached the channel"
         );
     }
 
