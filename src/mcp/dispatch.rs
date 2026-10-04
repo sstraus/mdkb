@@ -5886,7 +5886,7 @@ enum RecallMode {
 
 impl RecallMode {
     /// Automatic recall cannot buy semantic relevance with incidental words.
-    /// Sigil recall and the no-embedding fallback keep lexical admission;
+    /// Sigil recall and candidates without vector evidence keep lexical admission;
     /// successful cross-encoder reranking remains a separate semantic gate.
     fn admit_memories(
         self,
@@ -5900,7 +5900,9 @@ impl RecallMode {
             && floor > 0.0
         {
             let bound = crate::store::hybrid::distance_bound(floor);
-            entries.retain(|entry| entry.distance.is_some_and(|distance| distance <= bound));
+            // None covers pending embeddings and entries outside the bounded
+            // vector pool. Preserve their existing lexical admission in both cases.
+            entries.retain(|entry| entry.distance.is_none_or(|distance| distance <= bound));
         }
         entries
     }
@@ -11116,50 +11118,71 @@ mod tests {
         );
     }
 
-    /// Catches: dropping the inclusive floor boundary, or letting BM25-only
-    /// candidates evade it when a query embedding is available.
-    #[test]
-    fn automatic_recall_keeps_the_floor_boundary_and_rejects_missing_distance() {
-        let floor = 0.50; // Independent oracle: normalized L2 1.0 means cosine 0.50.
-        let fixture: Value =
-            serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
-        let entry: memory::MemoryEntry =
-            serde_json::from_value(fixture["memories"][0]["entry"].clone()).unwrap();
-        let boundary = memory::ScoredMemoryEntry {
-            entry,
-            score: 1.0,
-            distance: Some(1.0),
-            strong_lexical: true,
-        };
-        let mut missing = memory::ScoredMemoryEntry {
-            distance: None,
-            ..boundary.clone()
-        };
-        missing.entry.id = "missing-distance".into();
-        let mut below = memory::ScoredMemoryEntry {
-            distance: Some(1.001),
-            ..boundary.clone()
-        };
-        below.entry.id = "below-floor".into();
-        let expected_id = boundary.entry.id.clone();
-        let admitted =
-            RecallMode::Automatic.admit_memories(vec![missing, boundary, below], true, floor);
-        assert_eq!(
-            admitted.iter().map(|hit| &hit.entry.id).collect::<Vec<_>>(),
-            vec![&expected_id]
-        );
-        assert_eq!(admitted[0].distance, Some(1.0));
-        let bm25_only = memory::ScoredMemoryEntry {
-            distance: None,
-            ..admitted[0].clone()
-        };
-        assert_eq!(
-            RecallMode::Automatic
-                .admit_memories(vec![bm25_only], true, floor)
-                .len(),
-            1,
-            "an available embedder does not imply the store has memory vectors"
-        );
+    /// Catches: excluding the inclusive floor boundary or pending lexical
+    /// memories, and admitting a known sub-floor vector through lexical overlap.
+    #[tokio::test]
+    #[ignore = "requires the production ONNX embedding model"]
+    async fn automatic_recall_keeps_the_floor_boundary_and_pending_lexical_fallback() {
+        let prompt = "what do we know about the recall_gate_fixture topic content";
+        let embedding = crate::llm::get_cached_service()
+            .expect("production embedding service")
+            .embed_query(prompt)
+            .expect("embed the hook prompt");
+        let opposite: Vec<f32> = embedding.iter().map(|value| -value).collect();
+        // Independent oracle: an identical vector has L2 distance zero and
+        // cosine 1.0, exactly at the configured floor; its opposite is below it.
+        for (shadow_mode, floor) in [(false, 1.0), (true, 1.0), (false, 0.0)] {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = shadow_mode;
+                config.hooks.user_prompt_submit_shadow = shadow_mode;
+                config.hooks.recall_auto_min_cosine = floor;
+                config.hooks.recall_docs_limit = 0;
+                config.hooks.recall_holdout_rate = 0.0;
+                config.hooks.recall_limit = 10;
+            });
+            for id in ["boundary-memory", "pending-memory", "below-floor-memory"] {
+                seed_memory_entry(&handle, id).await;
+            }
+            {
+                let guard = handle.ctx.lock().await;
+                let conn = &guard.as_ref().unwrap().conn;
+                memory::store_entry_embedding(conn, "boundary-memory", &embedding).unwrap();
+                memory::store_entry_embedding(conn, "below-floor-memory", &opposite).unwrap();
+            }
+            let mut shadow = None;
+            let output = hook_user_prompt_submit_impl_with_dedup(
+                &handle,
+                prompt,
+                UNKNOWN_SESSION,
+                None,
+                &mut shadow,
+                &mut Vec::new(),
+            )
+            .await;
+            if shadow_mode {
+                assert_eq!(output, json!({}), "shadow must not inject: {output}");
+                let row = shadow.expect("shadow output must record the admitted memories");
+                assert!(row.entries.iter().any(|id| id == "boundary-memory"));
+                assert!(row.entries.iter().any(|id| id == "pending-memory"));
+                assert!(!row.entries.iter().any(|id| id == "below-floor-memory"));
+            } else {
+                let body = additional_context(&output);
+                assert!(
+                    body.contains("boundary-memory"),
+                    "inclusive boundary: {output}"
+                );
+                assert!(
+                    body.contains("pending-memory"),
+                    "pending lexical fallback: {output}"
+                );
+                assert_eq!(
+                    body.contains("below-floor-memory"),
+                    floor == 0.0,
+                    "{output}"
+                );
+            }
+        }
     }
 
     /// Criterion: two thresholds, the automatic one the higher. The floor is
