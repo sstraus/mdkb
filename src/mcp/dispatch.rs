@@ -11139,6 +11139,93 @@ mod tests {
         assert_eq!(outcome.as_deref(), Some("used"));
     }
 
+    /// Catches (#215-ef2e): Stop settling after only the first telemetry batch,
+    /// losing or duplicating later prompts or leaving their candidates unlabelled.
+    #[tokio::test]
+    async fn stop_drains_a_multibatch_backlog_once_and_labels_holdout_and_trimmed_candidates() {
+        use crate::store::recall_ledger::RecallCandidate;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let held = handle.ctx.lock().await;
+        for _ in 0..129 {
+            record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, vec![]).await;
+        }
+        let candidates = [
+            ("delivered", true, false),
+            ("holdout", true, true),
+            ("trimmed", false, false),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (id, injected, holdout))| RecallCandidate {
+            entry_id: id.into(),
+            rank: u16::try_from(rank).unwrap(),
+            cosine: Some(0.6),
+            entry_type: "decision".into(),
+            age_days: 0,
+            overlap: 1,
+            injected,
+            holdout,
+        })
+        .collect();
+        record_recall(&handle, "backlog", RecallMode::Automatic, 0.5, candidates).await;
+        let later = (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339();
+        let transcript = tmp.path().join("backlog.jsonl");
+        let lines: Vec<String> = ["delivered", "holdout", "trimmed"]
+            .into_iter()
+            .map(|id| {
+                json!({
+                    "type": "assistant", "timestamp": later,
+                    "message": {"content": [{"type": "tool_use", "id": id,
+                        "name": "mcp__mdkb__get", "input": {"id": id}}]}
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(&transcript, lines.join("\n")).unwrap();
+        let stop = tokio::spawn(settle_session(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "backlog".into(),
+        ));
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM recall_prompts WHERE session = 'backlog'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 130, "Stop lost or duplicated queued prompts");
+        let rows: Vec<(String, bool, bool, Option<String>)> = conn
+            .prepare(
+                "SELECT entry_id, injected, holdout, outcome FROM recall_candidates ORDER BY rank",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("delivered".into(), true, false, Some("used".into())),
+                ("holdout".into(), true, true, Some("used".into())),
+                ("trimmed".into(), false, false, Some("missed".into())),
+            ],
+            "Stop labelled candidates before the entire backlog persisted"
+        );
+    }
+
     /// Catches: a Stop-hook settle running its integrity probe while holding the
     /// repo's store slot, so the next prompt waits out a full-file scan in its
     /// context phase (#201-481e: every Stop hook invalidates the marker).
