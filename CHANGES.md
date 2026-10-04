@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Four release-gate regressions use deterministic test synchronization.**
+  Keep salvage log capture on one persistent subscriber, control IPC test time
+  independently of OS scheduling, and check watcher filtering at bounded
+  admission. Found by the repeated library release gate on 2026-10-03.
+  Stories 255-41a0, 256-9401, 257-3163, and 258-896f.
+
 - **Recall-options evaluation example builds on Windows.** Same platform guard
   for its Unix resource usage; CPU/RSS fields are JSON null elsewhere. Found by
   `Test Windows` CI (run 37159661208). Story 267-36db.

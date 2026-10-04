@@ -2420,12 +2420,24 @@ mod tests {
                 self.clone()
             }
         }
-        let buf = Buf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
+        // Register once: rebuilding process-wide callsite interest for every
+        // capture can race another test's first use of the same salvage callsite.
+        // The writer stays thread-local, so concurrent captures remain separate.
+        thread_local! {
+            static BUFFER: Buf = Buf::default();
+        }
+        static DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        let dispatch = DISPATCH.get_or_init(|| {
+            tracing::Dispatch::new(
+                tracing_subscriber::fmt()
+                    .with_writer(|| BUFFER.with(Clone::clone))
+                    .with_ansi(false)
+                    .finish(),
+            )
+        });
+        let buf = BUFFER.with(Clone::clone);
+        buf.0.lock().unwrap().clear();
+        tracing::dispatcher::with_default(dispatch, f);
         let bytes = buf.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()
     }

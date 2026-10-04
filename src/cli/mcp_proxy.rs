@@ -418,8 +418,11 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    /// Catches: disconnect closing host stdio or replaying an application request
+    /// instead of only initialization. OS scheduling is not a protocol deadline.
+    #[tokio::test(start_paused = true)]
     async fn daemon_disconnect_keeps_stdio_open_and_replays_handshake() {
+        let _clock = crate::test_support::ManualClock::new();
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
