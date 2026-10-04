@@ -15,6 +15,15 @@
   admission. Found by the repeated library release gate on 2026-10-03.
   Stories 255-41a0, 256-9401, 257-3163, and 258-896f.
 
+- **Automatic memory recall enforces its semantic floor.** Incidental rare-term
+  overlap cannot bypass the cosine gate when an embedding is available. The
+  default remains 0.50, preserving the calibrated positive recall; explicit
+  recall and lexical
+  fallback for memories without vector evidence keep their admission behavior,
+  including pending memories in partially embedded stores (regression found by
+  the round-2 critic, story 273-87ae). Found by the maintainer’s recall watch: two unrelated memories repeatedly injected despite
+  cosine 0.493 and 0.319, with no access-recency bonus. Story 260-9f26.
+
 - **Recall-options evaluation example builds on Windows.** Same platform guard
   for its Unix resource usage; CPU/RSS fields are JSON null elsewhere. Found by
   `Test Windows` CI (run 37159661208). Story 267-36db.

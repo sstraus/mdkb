@@ -153,8 +153,11 @@ at `search.memory.min_recall_cosine` (0.40) and — while
 `user_prompt_submit_require_sigil` is `false`, the default — a plain one at
 `hooks.recall_auto_min_cosine` (0.50), because an injection nobody asked for is
 charged on every turn after it. The floor is absolute, measured against the
-query embedding; a strong lexical match (an identifier, a rare phrase) is the
-second admission arm. Confidence orders results and never admits them. When
+query embedding. Automatic memory recall with an embedding must clear it;
+incidental lexical overlap cannot bypass it. Explicit sigil recall and recall
+without an embedding retain the strong lexical admission arm. A successful
+cross-encoder rerank uses its own semantic floor. Confidence orders results
+and never admits them. When
 nothing clears the floor, nothing is injected.
 
 Output (when matches are found):

@@ -186,18 +186,11 @@ impl Default for SearchMemoryConfig {
 /// the choice still follows the rule, so a fixture change reopens it.
 pub const MIN_RECALL_COSINE_DEFAULT: f32 = 0.40;
 
-/// Default cosine floor for recall on a prompt that carries no sigil, read off
-/// the same curve.
+/// Default cosine floor for automatic memory recall.
 ///
-/// The rule above stops discriminating at 0.40: every floor from there up
-/// admits none of the 40 negatives, so precision cannot choose between them.
-/// The second rule, for the case nobody asked for, is the cheapest margin above
-/// it — the floor where the recall curve flattens before falling again.
-/// Measured: 0.40→0.45 costs 0.139 recall@5, 0.45→0.50 costs 0.027, 0.50→0.55
-/// costs 0.111. 0.50 is that plateau.
-///
-/// Both floors are asserted against the fixture by
-/// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`.
+/// The eval curve retains more relevant answers at 0.50 than 0.55.
+/// The recorded recall-watch false positives scored 0.493 and 0.319, so
+/// enforcing 0.50 rejects them without raising the floor (stories 260, 271).
 pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 
 /// Default absolute cosine floor for the documents leg of recall.
@@ -833,15 +826,11 @@ pub struct HooksConfig {
     /// enrich, and a wrong entry there is paid on every turn after it. So the
     /// automatic floor is the stricter one.
     ///
-    /// Read off the same curve as [`MIN_RECALL_COSINE_DEFAULT`], which cannot
-    /// separate the two on precision — every floor at or above 0.40 admits none
-    /// of the 40 labelled negatives. What the curve does show is where recall
-    /// stops paying for strictness: 0.40→0.45 costs 0.139 recall@5, 0.45→0.50
-    /// costs 0.027, and 0.50→0.55 costs 0.111 again. 0.50 is that plateau — the
-    /// cheapest extra margin on the measured curve.
+    /// Calibrated from the eval recall curve at 0.50. With a query embedding,
+    /// incidental lexical overlap cannot bypass it; without one, lexical fallback remains. A successful
+    /// cross-encoder rerank uses its own semantic score floor.
     ///
-    /// Unused while the sigil is required except in shadow mode, which is what
-    /// will decide whether it is right.
+    /// Unused while the sigil is required except in shadow mode.
     pub recall_auto_min_cosine: f32,
 
     /// Run recall on the prompts the sigil gate currently skips, record what

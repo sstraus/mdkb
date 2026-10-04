@@ -229,7 +229,7 @@ it while a miss on a sigil prompt costs one search.
 | `[hooks]` / `[search.memory]` key | Default | What it gates |
 | --- | --- | --- |
 | `search.memory.min_recall_cosine` | `0.40` | The floor for a `*`-prefixed prompt. Lowest floor admitting no labelled negative on the eval fixture. |
-| `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. The recall plateau above `0.40` — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
+| `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. Calibrated from the positive recall curve — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
 | `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
 

@@ -4916,6 +4916,11 @@ async fn record_recall(
 /// the absolute floor drops some.
 const DOC_RECALL_POOL_FACTOR: usize = 4;
 
+/// File-stem corroboration measured on the orchestrator store (2026-10-02):
+/// unrelated follow-up prompts scored at most 0.437, the relevant one 0.514.
+/// Independent of the automatic memory floor, which uses memory labels.
+const DOC_STEM_MIN_COSINE: f32 = 0.50;
+
 /// The documents recall may inject: those with absolute evidence of relevance,
 /// in rank order.
 ///
@@ -4925,7 +4930,7 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// store without embeddings, or an identifier-shaped query, from losing the
 /// leg. A prompt word that is the document's file stem
 /// ([`crate::store::hybrid::names_file_stem`]) also counts, but only with the
-/// automatic-recall cosine floor behind it (`RECALL_AUTO_MIN_COSINE_DEFAULT`:
+/// file-stem cosine floor behind it (`DOC_STEM_MIN_COSINE`:
 /// measured 2026-10-02 on the orchestrator store, `followups.md` scored 0.245 –
 /// 0.437 on test-method prompts that say "follow-up" and 0.514 on the Italian
 /// question that really names follow-ups). Being in the BM25 result set is not
@@ -4966,8 +4971,7 @@ fn admit_doc_hits(
                 "recall doc candidate"
             );
             cosine.is_some_and(|c| c >= f64::from(min_cosine)) && !is_foreign(&hit.path)
-                || cosine
-                    .is_some_and(|c| c >= f64::from(crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT))
+                || cosine.is_some_and(|c| c >= f64::from(DOC_STEM_MIN_COSINE))
                     && crate::store::hybrid::names_file_stem(prompt, &hit.path)
                 || crate::store::hybrid::strong_lexical_match(
                     prompt,
@@ -5881,6 +5885,28 @@ enum RecallMode {
 }
 
 impl RecallMode {
+    /// Automatic recall cannot buy semantic relevance with incidental words.
+    /// Sigil recall and candidates without vector evidence keep lexical admission;
+    /// successful cross-encoder reranking remains a separate semantic gate.
+    fn admit_memories(
+        self,
+        mut entries: Vec<memory::ScoredMemoryEntry>,
+        has_embedding: bool,
+        floor: f32,
+    ) -> Vec<memory::ScoredMemoryEntry> {
+        if matches!(self, Self::Automatic | Self::Shadow)
+            && has_embedding
+            && entries.iter().any(|entry| entry.distance.is_some())
+            && floor > 0.0
+        {
+            let bound = crate::store::hybrid::distance_bound(floor);
+            // None covers pending embeddings and entries outside the bounded
+            // vector pool. Preserve their existing lexical admission in both cases.
+            entries.retain(|entry| entry.distance.is_none_or(|distance| distance <= bound));
+        }
+        entries
+    }
+
     /// The name the recall ledger stores. `Off` never reaches it.
     fn as_str(self) -> &'static str {
         match self {
@@ -6305,6 +6331,11 @@ async fn hook_user_prompt_submit_impl_timed(
         // The best absolute score in the result, read before `injectable` drops
         // it. `score` cannot stand in: it is max-normalized, so the top hit is
         // 1.0 for every prompt including the ones nothing in the store answers.
+        scored_results = mode.admit_memories(
+            scored_results,
+            query_embedding.is_some(),
+            search_cfg.min_recall_cosine,
+        );
         top_cosine = scored_results
             .iter()
             .filter_map(|e| e.distance)
@@ -9241,6 +9272,52 @@ mod tests {
         assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
     }
 
+    /// Catches: embedding a peer silently removes lexical recall of a relevant
+    /// newly inserted memory that is still awaiting its own embedding.
+    #[tokio::test]
+    #[ignore = "requires the production ONNX embedding model"]
+    async fn critic_260_partial_embedding_preserves_pending_relevant_memory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 0;
+            config.hooks.recall_holdout_rate = 0.0;
+            config.hooks.recall_limit = 10;
+        });
+        let prompt = "what do we know about the recall_gate_fixture topic content";
+        seed_memory_entry(&handle, "pending-relevant-memory").await;
+        seed_memory_entry(&handle, "embedded-relevant-memory").await;
+
+        let before = hook_user_prompt_submit_impl(&handle, prompt).await;
+        assert!(
+            additional_context(&before).contains("pending-relevant-memory"),
+            "lexical fallback must recall the named pending memory: {before}"
+        );
+        let embedding = crate::llm::get_cached_service()
+            .expect("production embedding service")
+            .embed_query("Some content about the topic: the recall_gate_fixture knob.")
+            .expect("embed the real peer content");
+        {
+            let guard = handle.ctx.lock().await;
+            memory::store_entry_embedding(
+                &guard.as_ref().unwrap().conn,
+                "embedded-relevant-memory",
+                &embedding,
+            )
+            .expect("store the peer embedding");
+        }
+        let after = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&after);
+        assert!(
+            body.contains("embedded-relevant-memory"),
+            "positive control: the embedded peer remains relevant: {body}"
+        );
+        assert!(
+            body.contains("pending-relevant-memory"),
+            "embedding a peer must not erase the pending memory's lexical fallback: {body}"
+        );
+    }
+
     async fn seed_memory_entry(handle: &RepoHandle, id: &str) {
         seed_memory_entry_titled(handle, id, &format!("Title for {id}")).await;
     }
@@ -10798,6 +10875,329 @@ mod tests {
             (RecallMode::Sigil, "where is the parser"),
             "the sigil still selects the lower floor, and still never reaches the query"
         );
+    }
+
+    /// Catches: tightening automatic admission silently drops known relevant
+    /// answers that the previous automatic floor retrieved from the eval corpus.
+    #[test]
+    #[ignore = "requires ONNX model download"]
+    fn critic_260_automatic_floor_preserves_previously_recalled_expected_memories() {
+        let fixture = crate::eval::fixture::Fixture::bundled().unwrap();
+        let store = fixture.open_store().unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        fixture.embed(&store.ctx.conn).unwrap();
+        let old_cfg = crate::config::SearchMemoryConfig {
+            min_recall_cosine: 0.50,
+            ..Default::default()
+        };
+        let new_cfg = crate::config::SearchMemoryConfig {
+            min_recall_cosine: crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT,
+            ..old_cfg.clone()
+        };
+        let mut lost = Vec::new();
+        for case in &fixture.recall {
+            let Some(fts) = crate::store::search::build_recall_query(&case.query) else {
+                continue;
+            };
+            let embedding = svc.embed_query(&case.query).unwrap();
+            let search = |cfg: &crate::config::SearchMemoryConfig| {
+                memory::search_entries_hybrid_fts(
+                    &store.ctx.conn,
+                    &fts,
+                    &case.query,
+                    Some(&embedding),
+                    5,
+                    None,
+                    cfg,
+                )
+                .unwrap()
+            };
+            let old = search(&old_cfg);
+            let new = RecallMode::Automatic.admit_memories(
+                search(&new_cfg),
+                true,
+                new_cfg.min_recall_cosine,
+            );
+            for expected in &case.expected_ids {
+                if old.iter().any(|entry| &entry.id == expected)
+                    && !new.iter().any(|entry| &entry.id == expected)
+                {
+                    lost.push(format!("{} => {}", case.query, expected));
+                }
+            }
+        }
+        assert!(
+            lost.is_empty(),
+            "automatic recall lost known relevant answers: {lost:#?}"
+        );
+    }
+
+    /// Catches: calibrating the floor without separating its recall cost from
+    /// removal of lexical admission on the same production candidates.
+    #[test]
+    #[ignore = "requires ONNX model download"]
+    fn automatic_recall_measures_floor_and_lexical_losses_separately() {
+        let fixture = crate::eval::fixture::Fixture::bundled().unwrap();
+        let store = fixture.open_store().unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        fixture.embed(&store.ctx.conn).unwrap();
+        let mut totals = [0; 4];
+        for case in &fixture.recall {
+            let Some(fts) = crate::store::search::build_recall_query(&case.query) else {
+                continue;
+            };
+            let embedding = svc.embed_query(&case.query).unwrap();
+            for (index, (floor, strict)) in
+                [(0.50, false), (0.55, false), (0.50, true), (0.55, true)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let cfg = crate::config::SearchMemoryConfig {
+                    min_recall_cosine: floor,
+                    ..Default::default()
+                };
+                let mut hits = memory::search_entries_hybrid_fts(
+                    &store.ctx.conn,
+                    &fts,
+                    &case.query,
+                    Some(&embedding),
+                    5,
+                    None,
+                    &cfg,
+                )
+                .unwrap();
+                if index == 0 {
+                    for hit in &hits {
+                        if case.expected_ids.contains(&hit.id) {
+                            println!(
+                                "expected {}: cosine={:?} lexical={} query={}",
+                                hit.id,
+                                hit.distance.map(crate::store::hybrid::cosine_from_distance),
+                                hit.strong_lexical,
+                                case.query
+                            );
+                        }
+                    }
+                }
+                if strict {
+                    let bound = crate::store::hybrid::distance_bound(floor);
+                    hits.retain(|hit| hit.distance.is_some_and(|distance| distance <= bound));
+                }
+                totals[index] +=
+                    usize::from(hits.iter().any(|hit| case.expected_ids.contains(&hit.id)));
+            }
+        }
+        println!(
+            "floor/lexical matrix: 0.50 lexical={}, 0.55 lexical={}, 0.50 strict={}, 0.55 strict={}",
+            totals[0], totals[1], totals[2], totals[3]
+        );
+        assert!(totals[0] > 0, "measurement must include relevant answers");
+    }
+
+    /// Catches: incidental rare-term overlap bypassing the automatic cosine
+    /// floor, so fresh unrelated memories from the live recall watch inject.
+    #[tokio::test]
+    #[ignore = "requires ONNX model download"]
+    async fn automatic_recall_rejects_recorded_subfloor_memories_despite_lexical_overlap() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
+        let prompt = fixture["prompt"].as_str().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 5;
+            config.hooks.recall_holdout_rate = 0.0;
+        });
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            for row in fixture["memories"].as_array().unwrap() {
+                let entry: memory::MemoryEntry =
+                    serde_json::from_value(row["entry"].clone()).unwrap();
+                memory::add_entry(&ctx.conn, &entry).unwrap();
+            }
+            memory::backfill_memory_embeddings(&ctx.conn).unwrap();
+        }
+        seed_document(
+            &handle,
+            "recall-watch.md",
+            "Recall watch",
+            "Recall watch records hook events and recall stats.",
+        )
+        .await;
+        let output = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&output);
+        for row in fixture["memories"].as_array().unwrap() {
+            assert!(
+                !body.contains(row["entry"]["id"].as_str().unwrap()),
+                "recorded unrelated memory reached hook additionalContext: {output}"
+            );
+        }
+        assert!(
+            body.contains("recall-watch.md"),
+            "relevant document must inject: {output}"
+        );
+        let asked = hook_user_prompt_submit_impl(&handle, &format!("* {prompt}")).await;
+        for row in fixture["memories"].as_array().unwrap() {
+            assert!(
+                additional_context(&asked).contains(row["entry"]["id"].as_str().unwrap()),
+                "sigil control must retrieve recorded memory: {asked}"
+            );
+        }
+        let scored: Vec<memory::ScoredMemoryEntry> = fixture["memories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let entry: memory::MemoryEntry =
+                    serde_json::from_value(row["entry"].clone()).unwrap();
+                let lexical = crate::store::hybrid::strong_lexical_match(
+                    prompt,
+                    &format!("{}\n{}", entry.title, entry.content),
+                );
+                assert!(
+                    lexical,
+                    "control: recorded incidental overlap opens the store gate"
+                );
+                assert_eq!(entry.access_count, 0, "recency was not the cause");
+                memory::ScoredMemoryEntry {
+                    entry,
+                    score: 1.0,
+                    distance: Some((2.0 * (1.0 - row["cosine"].as_f64().unwrap())).sqrt() as f32),
+                    strong_lexical: lexical,
+                }
+            })
+            .collect();
+        let floor = crate::config::HooksConfig::default().recall_auto_min_cosine;
+        for mode in [RecallMode::Automatic, RecallMode::Shadow] {
+            assert!(injectable(mode.admit_memories(scored.clone(), true, floor)).is_empty());
+        }
+        assert_eq!(
+            injectable(RecallMode::Sigil.admit_memories(scored.clone(), true, floor)).len(),
+            2,
+            "explicit recall keeps its lexical admission arm"
+        );
+        assert_eq!(
+            injectable(RecallMode::Automatic.admit_memories(scored.clone(), false, floor)).len(),
+            2,
+            "without an embedding, lexical evidence remains the fallback"
+        );
+        assert_eq!(
+            injectable(RecallMode::Automatic.admit_memories(scored, true, 0.0)).len(),
+            2,
+            "a disabled floor stays disabled"
+        );
+
+        let docs = fixture["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    crate::domain::SearchResult {
+                        id: 0,
+                        collection: "docs".into(),
+                        path: row["path"].as_str().unwrap().into(),
+                        title: Some(row["title"].as_str().unwrap().into()),
+                        score: 1.0,
+                        snippets: vec![],
+                        status: None,
+                        superseded_by: None,
+                        repo_root: None,
+                    },
+                    None,
+                )
+            })
+            .collect();
+        let admitted_docs = admit_doc_hits(docs, prompt, 0.55);
+        assert!(
+            admitted_docs
+                .iter()
+                .any(|hit| hit.path == "recall-watch.md")
+        );
+    }
+
+    /// Catches: excluding the inclusive floor boundary or pending lexical
+    /// memories, and admitting a known sub-floor vector through lexical overlap.
+    #[tokio::test]
+    #[ignore = "requires the production ONNX embedding model"]
+    async fn automatic_recall_keeps_the_floor_boundary_and_pending_lexical_fallback() {
+        let prompt = "what do we know about the recall_gate_fixture topic content";
+        let embedding = crate::llm::get_cached_service()
+            .expect("production embedding service")
+            .embed_query(prompt)
+            .expect("embed the hook prompt");
+        let opposite: Vec<f32> = embedding.iter().map(|value| -value).collect();
+        // Independent oracle: an identical vector has L2 distance zero and
+        // cosine 1.0, exactly at the configured floor; its opposite is below it.
+        for (shadow_mode, floor) in [(false, 1.0), (true, 1.0), (false, 0.0)] {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = shadow_mode;
+                config.hooks.user_prompt_submit_shadow = shadow_mode;
+                config.hooks.recall_auto_min_cosine = floor;
+                config.hooks.recall_docs_limit = 0;
+                config.hooks.recall_holdout_rate = 0.0;
+                config.hooks.recall_limit = 10;
+            });
+            for id in ["boundary-memory", "pending-memory", "below-floor-memory"] {
+                seed_memory_entry(&handle, id).await;
+            }
+            {
+                let guard = handle.ctx.lock().await;
+                let conn = &guard.as_ref().unwrap().conn;
+                memory::store_entry_embedding(conn, "boundary-memory", &embedding).unwrap();
+                memory::store_entry_embedding(conn, "below-floor-memory", &opposite).unwrap();
+            }
+            let mut shadow = None;
+            let output = hook_user_prompt_submit_impl_with_dedup(
+                &handle,
+                prompt,
+                UNKNOWN_SESSION,
+                None,
+                &mut shadow,
+                &mut Vec::new(),
+            )
+            .await;
+            let rows = ledger_rows(&handle).await;
+            for (id, injected) in [
+                ("boundary-memory", true),
+                ("pending-memory", true),
+                ("below-floor-memory", floor == 0.0),
+            ] {
+                assert!(
+                    rows.iter().any(|(mode, entry_id, delivered)| {
+                        mode == if shadow_mode { "shadow" } else { "automatic" }
+                            && entry_id.as_deref() == Some(id)
+                            && *delivered == Some(injected)
+                    }),
+                    "ledger must record {id} with injected={injected}: {rows:?}"
+                );
+            }
+            if shadow_mode {
+                assert_eq!(output, json!({}), "shadow must not inject: {output}");
+                let row = shadow.expect("shadow output must record the admitted memories");
+                assert!(row.entries.iter().any(|id| id == "boundary-memory"));
+                assert!(row.entries.iter().any(|id| id == "pending-memory"));
+                assert!(!row.entries.iter().any(|id| id == "below-floor-memory"));
+            } else {
+                let body = additional_context(&output);
+                assert!(
+                    body.contains("boundary-memory"),
+                    "inclusive boundary: {output}"
+                );
+                assert!(
+                    body.contains("pending-memory"),
+                    "pending lexical fallback: {output}"
+                );
+                assert_eq!(
+                    body.contains("below-floor-memory"),
+                    floor == 0.0,
+                    "{output}"
+                );
+            }
+        }
     }
 
     /// Criterion: two thresholds, the automatic one the higher. The floor is
@@ -19426,7 +19826,7 @@ mod file_stem_admission_critic_tests {
     /// f64, so the floor itself admits and the next f32 below it does not.
     #[test]
     fn the_stem_arm_floor_is_inclusive_at_the_f32_boundary() {
-        let floor = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
+        let floor = DOC_STEM_MIN_COSINE;
         let below = f32::from_bits(floor.to_bits() - 1);
         let prompt = "i followups aperti";
         let admit = |c: f32| {

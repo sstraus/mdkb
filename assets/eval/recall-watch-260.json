@@ -1,0 +1,72 @@
+{
+  "source": "orchestrator .claude/scheduled_tasks.json and live mdkb hook replay, 2026-10-04; recall ledger prompt 1327",
+  "prompt": "Recall watch (Boss, 30/09): for each repo with recent activity (orchestrator, tuicommander, ego, mdkb, wiz-agents, itview, cerebro, brainstorming) read the user_prompt_submit rows of .mdkb/hook-events.jsonl since the last recall-watch.md log row: count fired/skipped, payload bytes, elapsed_ms; run `mdkb stats` Recall section in orchestrator; review the injections seen in coordinator turns for relevance. Append rows to ~/Gits/personal/orchestrator/recall-watch.md and commit. Problems (unrelated/stale entry, payload >2 KB, latency >300 ms, missed relevant entry) become mdkb stories via stories-cli with evidence. Stay silent to Boss unless a problem is found.",
+  "memories": [
+    {
+      "entry": {
+        "id": "coord-mdkb-before-rg",
+        "title": "Coordinator: MDKB before rg, every time",
+        "content": "2026-10-03 Boss angrily corrected me for using rg on tuicommander source (sidebar toggle, dictation button) instead of the repo MDKB, a rule in boss-operating-rules.md since 2026-09-26. Prevention: for any lookup in a repo, run mdkb search/code in that repo first; rg only if MDKB cannot answer, and report the gap. Same for agent briefs: state it explicitly.",
+        "entry_type": "problem",
+        "tags": [
+          "mdkb",
+          "rule",
+          "boss-correction"
+        ],
+        "status": "active",
+        "created_at": 1791018862,
+        "updated_at": 1791018862,
+        "superseded_by": null,
+        "access_count": 0,
+        "last_accessed": null,
+        "source_path": null,
+        "confirmations": 5,
+        "corrections": 0,
+        "last_confirmed_at": 1791049982,
+        "last_refuted_at": null,
+        "source_type": "user_statement",
+        "expires_at": null,
+        "due_at": null
+      },
+      "cosine": 0.4929161071777344
+    },
+    {
+      "entry": {
+        "id": "test-janitor-aws-only",
+        "title": "Test Janitor: AWS-only mutation evidence",
+        "content": "Boss 2026-10-03 authorized constructing Test Janitor and applying it to TUICommander. Production code must not change. Mutations must never execute locally: use existing AWS rb gates. Improve the skill incrementally from observed batch feedback. Canonical skill: orchestrator/.agents/skills/test-janitor/SKILL.md; Codex and Claude discover it through symlinks. Initial managed batch: tuic-test-janitor, existing clean analysis worktree; no Git mutation authorized.",
+        "entry_type": "decision",
+        "tags": [
+          "testing",
+          "mutation",
+          "janitor"
+        ],
+        "status": "active",
+        "created_at": 1791023482,
+        "updated_at": 1791023482,
+        "superseded_by": null,
+        "access_count": 0,
+        "last_accessed": null,
+        "source_path": null,
+        "confirmations": 2,
+        "corrections": 0,
+        "last_confirmed_at": 1791035266,
+        "last_refuted_at": null,
+        "source_type": "user_statement",
+        "expires_at": null,
+        "due_at": null
+      },
+      "cosine": 0.3189118504524231
+    }
+  ],
+  "docs": [
+    {
+      "path": "recall-watch.md",
+      "title": "Automatic recall watch"
+    },
+    {
+      "path": "gate-queue.md",
+      "title": "Gate queue"
+    }
+  ]
+}
