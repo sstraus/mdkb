@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Automatic recall checks embedded lexical hits outside the vector pool.**
+  Use their stored-vector distance before admission, so unrelated entries cannot
+  pass as pending embeddings. Pending memories keep lexical fallback and explicit
+  recall keeps its existing admission. Found by the maintainer's deployed recall
+  watch: `test-janitor-aws-only` injected at cosine 0.318912 with a 0.50 floor.
+  Story 274-b9a8.
+
 - **Strict Clippy accepts the current stable Rust baseline.** Apply behavior-neutral
   lint fixes while retaining hook lock guards and exact test assertions. Found by
   the maintainer's strict Clippy gate on Rust 1.98.1. Story 269-8e28.

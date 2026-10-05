@@ -1659,9 +1659,28 @@ pub fn search_entries_hybrid_fts(
     // both are query-relative: after normalization the best candidate scores
     // 1.0 whatever the query was, and `final_hybrid_score` then adds
     // confidence, so a well-confirmed entry about something else clears any
-    // floor. The distances are already in `vector_results` — this costs no
-    // extra SQL on the UserPromptSubmit path.
-    let distances: HashMap<i64, f32> = vector_results.iter().copied().collect();
+    // floor. KNN supplies most distances; stored embeddings supply the rest.
+    let mut distances: HashMap<i64, f32> = vector_results.iter().copied().collect();
+    // A BM25 hit outside the bounded KNN pool can still have an embedding.
+    // Recover that evidence before admission: None must mean pending, not distant.
+    // Only fused candidates missing KNN evidence need this indexed lookup.
+    {
+        use zerocopy::AsBytes;
+        let mut distance = conn.prepare(
+            "SELECT vec_distance_L2(embedding, ?1) FROM memory_embeddings WHERE memory_rowid = ?2",
+        )?;
+        for (rowid, _) in &fused {
+            if !distances.contains_key(rowid)
+                && let Some(value) = distance
+                    .query_row(params![query_embedding.as_bytes(), rowid], |row| {
+                        row.get::<_, f32>(0)
+                    })
+                    .optional()?
+            {
+                distances.insert(*rowid, value);
+            }
+        }
+    }
     let mut evidence: HashMap<i64, (Option<f32>, bool)> = HashMap::new();
     for (rowid, _) in &fused {
         let Some(entry) = entry_map.get(rowid).or_else(|| vector_entries.get(rowid)) else {

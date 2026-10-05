@@ -5940,8 +5940,8 @@ impl RecallMode {
             && floor > 0.0
         {
             let bound = crate::store::hybrid::distance_bound(floor);
-            // None covers pending embeddings and entries outside the bounded
-            // vector pool. Preserve their existing lexical admission in both cases.
+            // Hybrid recall resolves stored vectors outside the KNN pool too;
+            // None retains lexical admission for pending embeddings.
             entries.retain(|entry| entry.distance.is_none_or(|distance| distance <= bound));
         }
         entries
@@ -11020,6 +11020,78 @@ mod tests {
             totals[0], totals[1], totals[2], totals[3]
         );
         assert!(totals[0] > 0, "measurement must include relevant answers");
+    }
+
+    /// Catches: an embedded lexical hit outside the KNN pool passing automatic
+    /// admission as if its embedding were still pending.
+    #[tokio::test]
+    #[ignore = "requires ONNX model download"]
+    async fn automatic_recall_rejects_recorded_memory_outside_knn_pool() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/eval/recall-watch-260.json")).unwrap();
+        let prompt = fixture["prompt"].as_str().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 5;
+            config.hooks.recall_holdout_rate = 0.0;
+        });
+        ensure_handle_context(&handle).await.unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        let query_vector = svc.embed_query(prompt).unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            for row in fixture["memories"].as_array().unwrap() {
+                let entry: memory::MemoryEntry =
+                    serde_json::from_value(row["entry"].clone()).unwrap();
+                memory::add_entry(&ctx.conn, &entry).unwrap();
+            }
+            memory::backfill_memory_embeddings(&ctx.conn).unwrap();
+            // More semantic neighbors than the injection query's ten KNN slots.
+            // Identical query vectors provide an independent nearest-neighbor oracle.
+            for index in 0..12 {
+                let mut entry: memory::MemoryEntry =
+                    serde_json::from_value(fixture["memories"][0]["entry"].clone()).unwrap();
+                entry.id = format!("semantic-neighbor-{index}");
+                entry.title = "Semantic neighbor".into();
+                entry.content = "Neighbor fixture".into();
+                entry.entry_type = memory::EntryType::Topic;
+                memory::add_entry(&ctx.conn, &entry).unwrap();
+                let rowid: i64 = ctx
+                    .conn
+                    .query_row(
+                        "SELECT rowid FROM memory_entries WHERE id = ?1",
+                        [&entry.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                crate::store::vectors::store_memory_embedding(
+                    &ctx.conn,
+                    rowid,
+                    &query_vector,
+                    "fixture",
+                )
+                .unwrap();
+            }
+        }
+        let output = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&output);
+        for row in fixture["memories"].as_array().unwrap() {
+            assert!(
+                !body.contains(row["entry"]["id"].as_str().unwrap()),
+                "unrelated embedded memory outside KNN reached hook: {output}"
+            );
+        }
+        assert!(
+            body.contains("semantic-neighbor-"),
+            "positive control: {output}"
+        );
+        let asked = hook_user_prompt_submit_impl(&handle, &format!("* {prompt}")).await;
+        assert!(
+            additional_context(&asked).contains("test-janitor-aws-only"),
+            "sigil retains explicit lexical recall: {asked}"
+        );
     }
 
     /// Catches: incidental rare-term overlap bypassing the automatic cosine
