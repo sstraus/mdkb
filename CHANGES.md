@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Writer-queue boundary regressions await drain completion.** Join the actual
+  drain before asserting exact row counts, order and 64-row admission boundaries,
+  instead of imposing a 10-second filesystem throughput budget. Found by two
+  full-suite rb runs; isolated runs passed. Story 275-bb30.
+
 - **Automatic recall checks embedded lexical hits outside the vector pool.**
   Use their stored-vector distance before admission, so unrelated entries cannot
   pass as pending embeddings. Pending memories keep lexical fallback and explicit

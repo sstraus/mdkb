@@ -18303,10 +18303,15 @@ mod tests {
             });
         }
         drop(held);
-        wait_until("all 130 bounded-batch rows ran", || {
-            ran.load(Ordering::SeqCst) == 130
-        })
-        .await;
+        // Catches (#275-bb30): a fixed wall-clock polling deadline makes
+        // correct admission fail under suite load. Join the actual drain;
+        // its completion must still account for every row and batch boundary.
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            130,
+            "rows were lost or duplicated"
+        );
         assert_eq!(*starts.lock().unwrap(), [0, 64, 128]);
     }
 
@@ -19865,10 +19870,9 @@ mod tests {
                 });
             }
             drop(held);
-            wait_until("every boundary row ran", || {
-                order.lock().unwrap().len() == rows
-            })
-            .await;
+            // Join completion rather than imposing a filesystem throughput
+            // budget on the exact cap/order contract (#275-bb30).
+            settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
             assert_eq!(
                 *order.lock().unwrap(),
                 (0..rows).collect::<Vec<_>>(),
