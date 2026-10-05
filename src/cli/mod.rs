@@ -196,8 +196,8 @@ pub enum Command {
         #[arg(long, num_args = 1..)]
         files: Vec<String>,
 
-        /// Reindex every file regardless of modification time (applies config changes
-        /// such as graph relations to already-indexed documents)
+        /// Force document reindexing regardless of modification time; source code
+        /// remains incremental (use `mdkb code index --force` for a full code rebuild)
         #[arg(long)]
         force: bool,
     },

@@ -417,6 +417,7 @@ fn smoke_namespaced_hook_logs_telemetry_into_its_own_store() {
 #[test]
 fn smoke_session_start_reports_doctor_findings_and_is_silent_when_healthy() {
     let repo = Repo::new();
+    assert_ok(&run(&["code", "index"], &repo.root), "healthy code index");
     let env = [("MDKB_NO_DAEMON", "1")];
     assert_ok(
         &run(&["setup", "hooks", "claude"], &repo.root),
@@ -572,6 +573,56 @@ fn smoke_update() {
     let repo = Repo::new();
     let out = run(&["update"], &repo.root);
     assert_ok(&out, "update");
+}
+
+/// Catches: a failed code write printed as a warning with a successful exit.
+#[test]
+fn smoke_update_failed_code_reindex_exits_nonzero() {
+    let repo = Repo::new();
+    assert_ok(&run(&["code", "index"], &repo.root), "initial code index");
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/code.sqlite")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_code_symbol BEFORE INSERT ON code_symbols BEGIN
+         SELECT RAISE(ABORT, 'code write rejected'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    std::fs::write(repo.root.join("src/lib.rs"), "pub fn changed() {}\n").unwrap();
+    let out = run(&["--format", "json", "update"], &repo.root);
+    assert!(!out.status.success(), "code failure must fail update");
+    let outcome: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        outcome["code_error"]
+            .as_str()
+            .unwrap()
+            .contains("code write rejected")
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("code reindexing failed"));
+}
+
+/// Catches: doctor overlooking supported source files whose code index is empty.
+#[test]
+fn smoke_doctor_reports_empty_code_index_and_clears_after_indexing() {
+    let repo = Repo::new();
+    let out = run(&["--format", "json", "doctor"], &repo.root);
+    let findings: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        findings["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "code.index")
+    );
+    assert_ok(&run(&["code", "index"], &repo.root), "populate code index");
+    let out = run(&["--format", "json", "doctor"], &repo.root);
+    let findings: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert!(
+        !findings["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["id"] == "code.index")
+    );
 }
 
 #[test]
@@ -2505,6 +2556,7 @@ fn priors_failing(message: &str) -> String {
 #[test]
 fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
     let repo = Repo::new();
+    assert_ok(&run(&["code", "index"], &repo.root), "healthy code index");
 
     let out = run(&["doctor"], &repo.root);
     assert!(!out.status.success(), "unregistered hooks are an error");

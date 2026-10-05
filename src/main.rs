@@ -605,7 +605,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             report_unreadable_config(&ctx.config_path);
             let request = UpdateRequest { files, force };
             let outcome = run_update_in_process(&ctx, &cwd, &request)?;
-            format_update_outcome(&outcome, cli.format);
+            format_update_outcome(&outcome, cli.format)?;
         }
         Command::Embed { collection } => {
             let ctx = open_writer(&cwd)?;
@@ -2328,7 +2328,7 @@ fn index_sessions_in_process(ctx: &Context, root: &Path) -> Option<mdkb::domain:
 /// headers between them and `--format csv` two tables plus a sentence — output
 /// that reads fine to a human and cannot be parsed by anything else, which is
 /// the entire point of asking for those formats.
-fn format_update_outcome(outcome: &UpdateOutcome, format: OutputFormat) {
+fn format_update_outcome(outcome: &UpdateOutcome, format: OutputFormat) -> Result<()> {
     match format {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(outcome).unwrap()),
         OutputFormat::Csv => print_update_outcome_csv(outcome),
@@ -2349,8 +2349,9 @@ fn format_update_outcome(outcome: &UpdateOutcome, format: OutputFormat) {
     // On stderr in every format, so a machine-readable run on stdout stays
     // machine-readable and a failed code phase is still impossible to miss.
     if let Some(e) = &outcome.code_error {
-        eprintln!("Warning: code reindexing failed: {e}");
+        return Err(mdkb::Error::other(format!("code reindexing failed: {e}")));
     }
+    Ok(())
 }
 
 /// One header, one row, every phase — a phase that did not run leaves its cells
@@ -2405,7 +2406,7 @@ fn print_routed_result(
 ) -> Result<()> {
     use mdkb::core::cli_mutation::{CliMutationResult as R, MemoryImportOutcome};
     match (command, result) {
-        (Command::Update { .. }, R::Update { outcome }) => format_update_outcome(outcome, format),
+        (Command::Update { .. }, R::Update { outcome }) => format_update_outcome(outcome, format)?,
         (
             Command::Embed { .. },
             R::Embed {

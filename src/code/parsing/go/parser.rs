@@ -110,6 +110,7 @@ impl GoParser {
                     }
                     self.context.exit_scope();
                     let _ = fn_name;
+                    return; // The body was walked above; a second walk duplicates its locals.
                 }
             }
 
@@ -157,6 +158,7 @@ impl GoParser {
                         }
                     }
                     self.context.exit_scope();
+                    return; // The body was walked above; a second walk duplicates its locals.
                 }
             }
 
@@ -905,9 +907,6 @@ impl GoParser {
                             range_vars.push(&code[expr_child.byte_range()]);
                         }
                     }
-                }
-                "identifier" => {
-                    range_vars.push(&code[child.byte_range()]);
                 }
                 _ => {
                     self.extract_symbols_from_node(
@@ -1734,6 +1733,42 @@ var privateVariable = 42
                 .iter()
                 .any(|s| s.name.as_ref() == "privateVariable" && s.kind == SymbolKind::Variable)
         );
+    }
+
+    /// A function or method body is walked once: each local declaration
+    /// yields one symbol. A second walk emits a twin with the same name and
+    /// line, which the index stores as one row and so loses an id.
+    #[test]
+    fn function_and_method_locals_are_emitted_once() {
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package main
+
+func run(items []int) int {
+	var total int
+	count := 0
+	for _, it := range items {
+		total += it
+	}
+	return total + count
+}
+
+type S struct{}
+
+func (s S) Do() {
+	var inner string
+	_ = inner
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        for name in ["items", "total", "count", "it", "s", "inner"] {
+            let n = symbols.iter().filter(|s| s.name.as_ref() == name).count();
+            assert_eq!(n, 1, "`{name}` declared once, emitted {n} times");
+        }
     }
 
     #[test]

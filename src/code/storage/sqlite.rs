@@ -355,12 +355,25 @@ impl CodeDb {
         // index — `LIKE '%"class_name":"X"%'` cannot use one, and would turn
         // every edge resolution into a full scan of `code_symbols`. Projecting
         // it here is what keeps the two from ever disagreeing.
-        self.conn.execute(
-            "INSERT OR REPLACE INTO code_symbols \
+        //
+        // A second symbol with the same `(name, file_id, line_start)` updates the
+        // row in place. `INSERT OR REPLACE` would delete it and insert a new id,
+        // leaving the id already returned for the first symbol dangling — the
+        // next relationship written with it fails its foreign key.
+        self.conn.query_row(
+            "INSERT INTO code_symbols \
              (name, kind, file_id, file_path, line_start, col_start, line_end, col_end, \
               visibility, signature, doc_comment, module_path, scope_context, owner_name) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                     json_extract(?13, '$.ClassMember.class_name'))",
+                     json_extract(?13, '$.ClassMember.class_name')) \
+             ON CONFLICT(name, file_id, line_start) DO UPDATE SET \
+              kind = excluded.kind, file_path = excluded.file_path, \
+              col_start = excluded.col_start, line_end = excluded.line_end, \
+              col_end = excluded.col_end, visibility = excluded.visibility, \
+              signature = excluded.signature, doc_comment = excluded.doc_comment, \
+              module_path = excluded.module_path, scope_context = excluded.scope_context, \
+              owner_name = excluded.owner_name \
+             RETURNING id",
             params![
                 name,
                 kind,
@@ -376,8 +389,8 @@ impl CodeDb {
                 module_path,
                 scope_context,
             ],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+            |row| row.get(0),
+        )
     }
 
     // --- Relationship operations ---
@@ -1651,6 +1664,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(remaining, 0, "legacy symbols should be cleaned up");
+    }
+
+    /// Two symbols with the same `(name, file_id, line_start)` share one row.
+    /// The id returned for the first must still name a row after the second
+    /// insert, or a relationship written with it violates the foreign key.
+    #[test]
+    fn insert_symbol_with_same_key_keeps_the_first_id_valid() {
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        let insert = |sig: &str| {
+            db.insert_symbol(
+                "f",
+                "Function",
+                file_id,
+                "test.rs",
+                3,
+                None,
+                None,
+                None,
+                0,
+                Some(sig),
+                None,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = insert("fn f()");
+        db.insert_relationship(
+            Some(first),
+            "f",
+            "g",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
+        let vectors =
+            crate::code::semantic::VectorStore::open(_dir.path().join("vectors.bin")).unwrap();
+        let embedding = vec![0.5; crate::code::semantic::EMBEDDING_DIM];
+        vectors
+            .write_all(&[(u32::try_from(first).unwrap(), embedding.clone())])
+            .unwrap();
+
+        let second = insert("fn f(x)");
+        assert_eq!(first, second, "same key must resolve to one row id");
+        assert_eq!(
+            db.relationship_count().unwrap(),
+            1,
+            "upsert must not cascade-delete child relationships"
+        );
+        let live = db.all_symbol_ids().unwrap();
+        vectors.retain(|id| live.contains(&id)).unwrap();
+        assert_eq!(
+            vectors.load().unwrap(),
+            vec![(u32::try_from(first).unwrap(), embedding)],
+            "upsert must not orphan a symbol's stored embedding"
+        );
+        let signature: String = db
+            .conn()
+            .query_row(
+                "SELECT signature FROM code_symbols WHERE id = ?1",
+                [first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(signature, "fn f(x)", "upsert must refresh symbol data");
+        db.insert_relationship(
+            Some(first),
+            "f",
+            "g",
+            &CallSite::default(),
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .expect("the first id must still reference a row");
     }
 
     #[test]
