@@ -10306,6 +10306,45 @@ mod tests {
         )
     }
 
+    /// Catches: the document cosine floor admitting the recorded unrelated
+    /// gate queue on the scheduled recall-watch prompt.
+    #[tokio::test]
+    #[ignore = "requires the cached production ONNX embedding model"]
+    async fn recall_watch_rejects_recorded_gate_queue_and_keeps_watch_document() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../assets/eval/recall-watch-277.json")).unwrap();
+        let prompt = fixture["prompt"].as_str().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 0;
+            config.hooks.recall_docs_limit = 3;
+        });
+        for row in fixture["docs"].as_array().unwrap() {
+            seed_document(
+                &handle,
+                row["path"].as_str().unwrap(),
+                row["title"].as_str().unwrap(),
+                row["content"].as_str().unwrap(),
+            )
+            .await;
+        }
+        {
+            let guard = handle.ctx.lock().await;
+            crate::core::ops::handle_embed(guard.as_ref().unwrap(), None).unwrap();
+        }
+        let output = hook_user_prompt_submit_impl(&handle, prompt).await;
+        let body = additional_context(&output);
+        assert!(
+            body.contains("recall-watch.md"),
+            "relevant watch document must inject: {output}"
+        );
+        assert!(
+            !body.contains("gate-queue.md"),
+            "unrelated gate queue must not inject: {output}"
+        );
+    }
+
     /// The oracle is the measurement in `RECALL_DOCS_MIN_COSINE_DEFAULT`, not
     /// the constant: the lowest English match measured 0.585, the highest
     /// Italian-over-English negative 0.522 (0.496 for an unrelated hub doc).
@@ -10323,6 +10362,10 @@ mod tests {
         assert!(admitted(0.585), "lowest measured English match");
         assert!(admitted(0.716), "highest measured English match");
         assert!(!admitted(0.522), "highest measured Italian negative");
+        assert!(
+            !admitted(0.5618612906689293),
+            "recorded recall-watch gate queue negative"
+        );
         assert!(!admitted(0.496), "unrelated hub document");
     }
 

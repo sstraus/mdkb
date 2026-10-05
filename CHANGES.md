@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Document recall excludes the unrelated gate queue on recall-watch prompts.**
+  Raise the default document cosine floor from 0.55 to 0.57, above the measured
+  false positive (0.561861) and below the lowest measured positive (0.585).
+  Explicitly configured floors and quoted-document admission remain unchanged.
+  Found by the maintainer’s deployed recall watch (story 277-f9cf).
+
 - **Go code indexing preserves local declarations and relationship identities.**
   Visit function and method bodies once and update duplicate symbol rows in place,
   preserving relationships and stored embedding IDs. A failed code reindex now

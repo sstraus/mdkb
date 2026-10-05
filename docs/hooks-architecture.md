@@ -263,7 +263,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `warmup_min_confidence` | f64 | `0.25` | Confidence floor for warmup entries; `0` disables it |
 | `recall_limit` | usize | `5` | Max hybrid memory results in UserPromptSubmit |
 | `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
-| `recall_docs_min_cosine` | f32 | `0.55` | Absolute cosine floor for a recalled document (best chunk vs prompt), or the prompt must quote its title/path. Measured on one repo: English matches 0.585–0.716, Italian-over-English negatives up to 0.522 |
+| `recall_docs_min_cosine` | f32 | `0.57` | Absolute cosine floor for a recalled document (best chunk vs prompt), or the prompt must quote its title/path. Measured on one repo: English matches 0.585–0.716, Italian-over-English negatives up to 0.522; orchestrator recall-watch negative 0.562 |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
 | `user_prompt_submit_deadline_ms` | u64 | `1000` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. The hook client waits this plus 250 ms, so a raised value is honoured on the daemon path. `0` disables the daemon cut; the client then waits the default plus 250 ms |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
