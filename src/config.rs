@@ -207,10 +207,11 @@ pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 ///   0.496 for a real question, 0.426 – 0.441 for a recipe and Roman history.
 /// * English off-topic prompts: 0.235 – 0.277.
 ///
-/// 0.55 sits between the highest measured negative (0.522) and the lowest
-/// measured positive (0.585). The sample is one repository; the key exists so
-/// a corpus that measures differently can move it.
-pub const RECALL_DOCS_MIN_COSINE_DEFAULT: f32 = 0.55;
+/// The orchestrator recall-watch prompt scored an unrelated gate queue at
+/// 0.561861 (2026-10-05, story 277-f9cf). A 0.57 floor excludes that negative
+/// while retaining the lowest measured positive (0.585). These samples cover two
+/// repositories; the key lets a corpus that measures differently move the floor.
+pub const RECALL_DOCS_MIN_COSINE_DEFAULT: f32 = 0.57;
 
 /// Hard deadline for a `UserPromptSubmit` hook, in milliseconds.
 ///
