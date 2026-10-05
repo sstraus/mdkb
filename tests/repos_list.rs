@@ -148,7 +148,12 @@ fn head_newer_than_the_index_is_stale_without_a_recorded_commit() {
     let fresh = store(tmp.path(), "fresh", 1, FAR_FUTURE);
     commit_all(&fresh);
 
-    assert!(row_of(&stale).stale);
+    let stale_row = row_of(&stale);
+    assert!(stale_row.stale);
+    assert!(
+        mdkb::daemon::repo_listing::render_text(&[stale_row])
+            .contains("STALE (index differs from or predates local HEAD)")
+    );
     assert!(!row_of(&fresh).stale);
     assert_eq!(row_of(&stale).head_at, Some(1_767_225_600));
 }

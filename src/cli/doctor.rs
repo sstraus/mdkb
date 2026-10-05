@@ -56,6 +56,36 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
         facts.ledger_prompts_7d =
             crate::store::recall_ledger::prompts_since(&ctx.conn, week_ago).unwrap_or(0);
     }
+    if config.code.enabled {
+        let code_path = root.join(".mdkb/code.sqlite");
+        let count = if code_path.is_file() {
+            crate::code::storage::CodeDb::open_read_only(&code_path)
+                .and_then(|db| db.symbol_count())
+                .map(Some)
+        } else {
+            Ok(None)
+        };
+        match count {
+            Err(e) => facts.code_index_problem = Some(format!("code index cannot be read: {e}")),
+            Ok(None | Some(0)) => {
+                let indexing = &config.code.indexing;
+                let sources = crate::code::indexing::walker::walk_files(
+                    crate::code::indexing::walker::WalkOptions {
+                        root,
+                        ignore_patterns: &indexing.ignore_patterns,
+                        respect_gitignore: indexing.respect_gitignore,
+                    },
+                    |path| crate::code::parsing::language::Language::from_path(path).is_some(),
+                );
+                if !sources.is_empty() {
+                    facts.code_index_problem = Some(
+                        "code index has no symbols despite supported source files".to_string(),
+                    );
+                }
+            }
+            Ok(Some(_)) => {}
+        }
+    }
     if full
         && let crate::cli::setup::DistillerCheck::Fail { program, detail } =
             crate::cli::setup::check_distiller(root)

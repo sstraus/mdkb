@@ -46,6 +46,8 @@ pub struct Facts {
     pub hooks_duplicated_fix: Option<String>,
     /// Why `.mdkb/config.toml` does not load.
     pub config_error: Option<String>,
+    /// Why the enabled code index cannot serve supported source files.
+    pub code_index_problem: Option<String>,
     pub quarantine: Vec<Quarantine>,
     pub doc_count: i64,
     /// `(entry files, active rows)` of the memory projection.
@@ -119,6 +121,14 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
                 ".mdkb/config.toml does not load ({error}); the last config that did is still in use"
             ),
             None,
+        );
+    }
+    if let Some(problem) = &facts.code_index_problem {
+        push(
+            "code.index",
+            Severity::Error,
+            problem.clone(),
+            Some("mdkb code index"),
         );
     }
     if let Some(failure) = &facts.distiller_failure {

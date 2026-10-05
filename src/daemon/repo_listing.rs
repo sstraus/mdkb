@@ -242,7 +242,7 @@ pub fn render_text(rows: &[RepoRow]) -> String {
             r.schema.map_or_else(|| "-".to_string(), |v| v.to_string()),
         );
         if r.stale {
-            out.push_str("  STALE");
+            out.push_str("  STALE (index differs from or predates local HEAD)");
         }
         let _ = write!(out, "  {}", r.path.display());
         if let Some(detail) = &r.detail {

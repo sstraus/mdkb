@@ -6,7 +6,10 @@
 
 - **Go code indexing preserves local declarations and relationship identities.**
   Visit function and method bodies once and update duplicate symbol rows in place,
-  preserving relationships and stored embedding IDs. Found by the maintainer
+  preserving relationships and stored embedding IDs. A failed code reindex now
+  fails `mdkb update`; doctor reports an empty code index when supported source
+  files exist. Update help clarifies that `--force` applies to documents, and
+  repository staleness names its local HEAD comparison. Found by the maintainer
   on gate-os and devstracker (story 276-18eb).
 
 - **Writer-queue boundary regressions await drain completion.** Join the actual
