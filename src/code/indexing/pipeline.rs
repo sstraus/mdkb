@@ -1249,6 +1249,48 @@ fn callee() {}
         assert_eq!(stats.symbols_indexed, 0);
     }
 
+    /// A Go function-local that is also the caller of a relationship. Its
+    /// symbol row and the relationship's `from_symbol_id` must agree, or the
+    /// relationship insert fails `code_relationships.from_symbol_id` and the
+    /// whole code index rolls back (story 276: devstracker, gate-os).
+    #[test]
+    fn go_function_local_with_relationship_indexes_without_fk_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.go"),
+            "package main\n\nimport \"example.com/jira\"\n\nfunc collect() []jira.Worklog {\n\tvar out []jira.Worklog\n\treturn out\n}\n",
+        )
+        .unwrap();
+
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config())
+            .expect("a Go function with a typed local must index");
+
+        assert!(stats.symbols_indexed > 0);
+        let locals: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols WHERE name = 'out'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(locals, 1, "the local `out` is one declaration");
+        let relationships: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM code_relationships r JOIN code_symbols s
+             ON s.id = r.from_symbol_id WHERE s.name = 'out' AND r.to_name = 'jira.Worklog'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            relationships > 0,
+            "the typed local's relationship must survive indexing"
+        );
+    }
+
     /// Regression test: incremental index_files after deleting stale entries
     /// must not trigger FOREIGN KEY constraint failures. The pipeline assigns
     /// sequential IDs (1,2,3...) but after delete + re-insert, SQLite rowids

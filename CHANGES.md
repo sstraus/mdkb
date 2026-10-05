@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Go code indexing preserves local declarations and relationship identities.**
+  Visit function and method bodies once and update duplicate symbol rows in place,
+  preserving relationships and stored embedding IDs. Found by the maintainer
+  on gate-os and devstracker (story 276-18eb).
+
 - **Writer-queue boundary regressions await drain completion.** Join the actual
   drain before asserting exact row counts, order and 64-row admission boundaries,
   instead of imposing a 10-second filesystem throughput budget. Found by two
