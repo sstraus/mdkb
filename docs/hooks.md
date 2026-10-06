@@ -513,9 +513,18 @@ budget truncates nothing — the value only decides what gets flagged.
 and logs `outcome = "deadline"`. The hook client waits that deadline plus a fixed
 250 ms margin, so the deadline you set is the one the host sees; the reranker's
 budget is clamped to the same value. `mdkb stats` counts these as deadline hits.
-Its rows carry a `phases` object (`context`, `embed`, `lock_wait`, `search`,
-`enrich`, `prior`, `rerank`, in ms) naming the phases the run reached, so a
-deadline row shows where the time went. With the reranker in play the same
+Its rows carry a `phases` object (`prepare`, `context`, `embed`, `lock_wait`,
+`search`, `enrich`, `prior`, `rerank`, `render`, and `between_phases`, in ms).
+Durations include the open interval when cancellation interrupts work;
+`search` includes blocking-pool queue time and execution, not just SQLite time.
+`between_phases` collects intervals after a completed phase and before the next
+starts. `unaccounted_ms` covers dispatcher overhead and millisecond rounding:
+the numeric phase durations plus this residual equal `elapsed_ms` within 5 ms.
+Deadline rows include `phases.deadline_phase`, the phase active when recall was
+cut, even before the first phase completes. These are daemon wall-clock timings;
+they do not measure the hook client's socket wait. Completed shadow rows retain
+their `shadow` object; interrupted shadow runs carry both `shadow` and `phases`.
+With the reranker in play the same
 object carries `rerank_outcome`: `ok`, `below_gate`, `timeout`, `no_budget`,
 `loading`, `not_cached`, `load_failed`, `busy`, `failed`, `one_shot`,
 `no_candidates`, `off` or `cut` (the hook deadline fired while the reranker ran).

@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Recall deadline logs retain the interrupted phase.** Account for open search
+  waits, preparation and intervals between phases, with an explicit residual and
+  the phase active at cancellation. Found by the maintainer in deployed hook
+  ledgers with about 900 ms absent from completed phases (story 278-5890).
+
 - **Document recall excludes the unrelated gate queue on recall-watch prompts.**
   Raise the default document cosine floor from 0.55 to 0.57, above the measured
   false positive (0.561861) and below the lowest measured positive (0.585).
