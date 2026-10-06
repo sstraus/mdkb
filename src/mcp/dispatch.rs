@@ -932,9 +932,12 @@ async fn run_until_deadline<T>(
     let deadline = {
         let cut = store_stall::cut_signal(root);
         async move {
-            tokio::select! {
-                () = deadline => {}
-                () = store_stall::cut(cut) => {}
+            if cut.is_some() {
+                // An explicitly placed cut must not race setup/embedding against
+                // wall time on a loaded test runner.
+                store_stall::cut(cut).await;
+            } else {
+                deadline.await;
             }
         }
     };
@@ -10423,7 +10426,7 @@ mod tests {
         assert!(admitted(0.716), "highest measured English match");
         assert!(!admitted(0.522), "highest measured Italian negative");
         assert!(
-            !admitted(0.5618612906689293),
+            !admitted(0.561_861_290_668_929_3),
             "recorded recall-watch gate queue negative"
         );
         assert!(!admitted(0.496), "unrelated hub document");
@@ -15340,6 +15343,8 @@ mod tests {
         assert!(row["phases"]["unaccounted_ms"].is_u64(), "{row}");
     }
 
+    // Catches: cancellation omitting the interrupted lock_wait or reporting search
+    // before the first store acquisition completes.
     #[tokio::test]
     async fn deadline_row_names_the_phases_reached_and_not_the_ones_cut() {
         let tmp = TempDir::new().unwrap();
@@ -15349,7 +15354,7 @@ mod tests {
         });
         seed_memory_entry(&handle, "phase-topic").await;
 
-        store_stall::arm_all(&handle.root, std::time::Duration::from_secs(5));
+        store_stall::arm_cut(&handle.root, 0);
         prompt_hook(&handle, &make_dctx(), "phases").await;
 
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
