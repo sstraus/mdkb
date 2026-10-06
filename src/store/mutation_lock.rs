@@ -341,23 +341,26 @@ mod tests {
 
     #[test]
     fn live_lock_and_mutation_lock_never_contend() {
-        // Different sidecars on purpose: the mutation lock is exclusive and
-        // short, the live lock is shared and lasts a whole connection. Sharing
-        // one file would let a live connection block every index-wide write.
+        // Catches: sharing the live and mutation sidecars, so a live connection
+        // blocks every index-wide write. Probe the OS lock without a scheduler
+        // deadline; slow thread startup or metadata sync is not contention.
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.sqlite");
         assert_ne!(lock_path(&db), live_lock_path(&db));
 
         let _live = acquire_live_shared(&db).unwrap();
-        let (tx, rx) = mpsc::channel();
-        let db2 = db.clone();
-        let waiter = std::thread::spawn(move || {
-            let _mutation = acquire(&db2, "update").unwrap();
-            tx.send(()).unwrap();
-        });
-        rx.recv_timeout(Duration::from_secs(2))
+        let probe = open_lock_file(&lock_path(&db)).unwrap();
+        FileExt::try_lock_exclusive(&probe)
             .expect("an index-wide mutation must not wait on live connections");
-        waiter.join().unwrap();
+        FileExt::unlock(&probe).unwrap();
+
+        let mutation = acquire(&db, "update").unwrap();
+        let error = FileExt::try_lock_exclusive(&probe)
+            .expect_err("the probe must observe the actual mutation guard");
+        assert!(is_lock_contention(&error), "{error}");
+        drop(mutation);
+        FileExt::try_lock_exclusive(&probe).expect("mutation release must free the probe");
+        FileExt::unlock(&probe).unwrap();
     }
 
     #[test]

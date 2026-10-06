@@ -151,8 +151,20 @@ fn the_daemon_map_opens_when_the_path_is_a_directory() {
 /// Catches: canonicalizing a missing path (or an empty / relative-gone one)
 /// panicking or leaking it into the list; a gone root under a symlinked parent
 /// must be dropped, and weird spellings of a live root collapse to one.
+/// Catches: an empty root reading the cwd worktree's `.git` and admitting its
+/// main repo, even though that repo was never named in the map.
 #[test]
 fn missing_and_odd_spellings_do_not_panic_and_do_not_duplicate() {
+    const FIXTURE_MAP: &str = "MDKB_CRITIC8_FIXTURE_MAP";
+    if let Some(map) = std::env::var_os(FIXTURE_MAP) {
+        let map = PathBuf::from(map);
+        let real = map.parent().unwrap().join("real");
+        let before = std::fs::read(&map).unwrap();
+        assert_eq!(try_read_known_roots(&map), Ok(vec![real]));
+        assert_eq!(std::fs::read(&map).unwrap(), before);
+        return;
+    }
+
     let tmp = TempDir::new().unwrap();
     let base = plain(tmp.path());
     let real = live(&base, "real");
@@ -173,7 +185,52 @@ fn missing_and_odd_spellings_do_not_panic_and_do_not_duplicate() {
     );
     let before = std::fs::read(&map).unwrap();
 
-    assert_eq!(try_read_known_roots(&map), Ok(vec![real]));
+    // Record a real Git worktree pointer, rather than relying on whichever
+    // repository happens to contain the test runner's cwd.
+    let main = live(&base, "main");
+    let worktree = base.join("worktree");
+    for args in [
+        vec!["init", "-q"],
+        vec!["commit", "-q", "--allow-empty", "-m", "fixture"],
+        vec![
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            worktree.to_str().unwrap(),
+        ],
+    ] {
+        let output = std::process::Command::new("git")
+            .current_dir(&main)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+    assert!(worktree.join(".git").is_file());
+    for cwd in [&base, &main, &worktree] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .current_dir(cwd)
+            .env(FIXTURE_MAP, &map)
+            .args([
+                "--exact",
+                "missing_and_odd_spellings_do_not_panic_and_do_not_duplicate",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "cwd={cwd:?}: {output:?}");
+    }
     assert_eq!(std::fs::read(&map).unwrap(), before);
 }
 
