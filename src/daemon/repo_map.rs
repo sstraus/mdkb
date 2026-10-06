@@ -198,6 +198,11 @@ struct Triage {
 /// classified [`RootHealth::Gone`] and dropped, and the spelling the operator
 /// wrote is the one that belongs in that log line.
 pub(super) fn canonical_key(root: &Path) -> PathBuf {
+    // An empty persisted root is absent, not the current worktree: joining
+    // `.git` to it would read the caller's worktree pointer from the cwd.
+    if root.as_os_str().is_empty() {
+        return root.to_path_buf();
+    }
     let resolved = crate::git::resolve_main_worktree(root);
     // `canonicalize` returns `\\?\C:\...` on Windows, which names the same file
     // and compares equal to nothing. Every key written that way would be a

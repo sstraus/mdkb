@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- **Blank repository-map roots cannot select the caller's worktree.** Leave an
+  empty root absent before worktree resolution, which otherwise reads `.git`
+  from the current directory. The regression uses real Git fixtures, and the
+  live/mutation-lock regression probes OS contention without a timing deadline.
+  Found by the maintainer's full Mac test gate (story 279-4438).
+
 - **Recall deadline logs retain the interrupted phase.** Account for open search
   waits, preparation and intervals between phases, with an explicit residual and
   the phase active at cancellation. Found by the maintainer in deployed hook
