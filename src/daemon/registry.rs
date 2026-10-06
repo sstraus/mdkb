@@ -792,6 +792,9 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
 /// If the path is inside a git worktree, resolves to the main worktree root
 /// so that all worktrees of the same repo share a single `.mdkb/` directory.
 fn canonicalize_root(root: &Path) -> Result<PathBuf> {
+    if root.as_os_str().is_empty() {
+        return Err(Error::other("Repo path must not be empty"));
+    }
     let resolved = crate::git::resolve_main_worktree(root);
     // Plain, not `\\?\C:\...`: the same key `repo_map::canonical_key` writes,
     // and the spelling the MCP "Specify root" error hands back to the caller.
