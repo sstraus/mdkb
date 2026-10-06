@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- **Hook RPCs refuse empty and relative repository roots.** Reject invalid roots
+  before worktree resolution or store admission; registry entry points also
+  refuse empty paths instead of selecting the daemon's current worktree.
+  Found by the maintainer's review of story 279-4438 (story 280-7bbe).
+
 - **Blank repository-map roots cannot select the caller's worktree.** Leave an
   empty root absent before worktree resolution, which otherwise reads `.git`
   from the current directory. The regression uses real Git fixtures, and the

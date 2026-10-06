@@ -135,6 +135,15 @@ pub(crate) async fn dispatch_hook_message(
         return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)");
     };
 
+    let root = Path::new(root);
+    if !root.is_absolute() {
+        return rpc_error(
+            id,
+            -32602,
+            "'params.root' must be a non-empty absolute repo path",
+        );
+    }
+
     // Validate typed mutations before repository acquisition and dispatch so a
     // malformed request remains an admission refusal, safe for local fallback.
     if method == "cli.mutate"
@@ -144,7 +153,7 @@ pub(crate) async fn dispatch_hook_message(
         return rpc_error(id, -32602, &format!("cli.mutate: invalid params: {error}"));
     }
 
-    let handle = match registry.get_or_open(Path::new(root)) {
+    let handle = match registry.get_or_open(root) {
         Ok(handle) => handle,
         Err(error) => return rpc_error(id, -32602, &format!("repo registry: {error}")),
     };
@@ -167,4 +176,139 @@ fn rpc_error(id: Value, code: i32, message: &str) -> String {
         "error": {"code": code, "message": message}
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::config::DaemonConfig;
+    use crate::daemon::registry::RepoHandle;
+    use crate::metrics::UsageMetrics;
+    use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    // Run in a child to keep cwd changes out of parallel tests. Git itself
+    // creates the .git pointer that empty-path worktree resolution follows.
+    fn in_git_worktree(test: &str) -> bool {
+        if std::env::var_os("MDKB_EMPTY_ROOT_CHILD").is_some() {
+            assert!(Path::new(".git").is_file());
+            return true;
+        }
+        let tmp = tempfile::TempDir::new().unwrap();
+        let main = tmp.path().join("main");
+        let worktree = tmp.path().join("worktree");
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init".as_ref(), main.as_os_str()]);
+        git(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "-c".as_ref(),
+            "user.name=Test".as_ref(),
+            "-c".as_ref(),
+            "user.email=test@example.com".as_ref(),
+            "-c".as_ref(),
+            "commit.gpgsign=false".as_ref(),
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-m".as_ref(),
+            "fixture".as_ref(),
+        ]);
+        git(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            worktree.as_os_str(),
+        ]);
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env("MDKB_EMPTY_ROOT_CHILD", "1")
+            .current_dir(&worktree)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn registry() -> Arc<RepoRegistry> {
+        Arc::new(RepoRegistry::new(DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().into_owned()],
+            ..DaemonConfig::default()
+        }))
+    }
+
+    /// Catches: blank or relative RPC roots selecting the daemon cwd repository.
+    #[tokio::test]
+    async fn hook_rejects_empty_and_relative_roots_before_repository_admission() {
+        if !in_git_worktree(
+            "daemon::hook_runtime::tests::hook_rejects_empty_and_relative_roots_before_repository_admission",
+        ) {
+            return;
+        }
+        let registry = registry();
+        let dctx = Arc::new(DispatchContext {
+            metrics: Arc::new(UsageMetrics::new()),
+            session_id: Arc::new(AtomicI64::new(0)),
+            persistent_call_count: Arc::new(AtomicU64::new(0)),
+            optimize_interval_calls: 200,
+            hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
+            background: None,
+        });
+        for root in ["", ".", "..", "relative", " "] {
+            let body =
+                json!({"jsonrpc": "2.0", "id": 7, "method": "status", "params": {"root": root}});
+            let response =
+                dispatch_hook_message(body.to_string().as_bytes(), &registry, &dctx).await;
+            let reply: Value = serde_json::from_str(&response).unwrap();
+            assert_eq!(reply["id"], 7);
+            assert_eq!(reply["error"]["code"], -32602, "root={root:?}: {reply}");
+            assert_eq!(
+                reply["error"]["message"], "'params.root' must be a non-empty absolute repo path",
+                "root={root:?}: {reply}"
+            );
+            assert_eq!(registry.active_count(), 0);
+            assert!(registry.listed_roots().is_empty());
+        }
+    }
+
+    /// Catches: a blank registry root opening or returning the cwd worktree handle.
+    #[test]
+    fn registry_rejects_empty_roots_even_with_a_cached_cwd_repository() {
+        if !in_git_worktree(
+            "daemon::hook_runtime::tests::registry_rejects_empty_roots_even_with_a_cached_cwd_repository",
+        ) {
+            return;
+        }
+        let registry = registry();
+        let cwd = std::env::current_dir().unwrap();
+        registry.get_or_open(&cwd).unwrap();
+        let empty = Path::new("");
+        assert!(registry.get(empty).is_none());
+        assert_eq!(
+            registry.get_or_open(empty).unwrap_err().to_string(),
+            "Repo path must not be empty"
+        );
+        assert_eq!(
+            RepoHandle::open(empty, &toml::Table::new())
+                .unwrap_err()
+                .to_string(),
+            "Repo path must not be empty"
+        );
+        assert_eq!(registry.active_count(), 1);
+    }
 }
