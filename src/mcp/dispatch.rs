@@ -4688,7 +4688,12 @@ fn log_hook_event_with_phases(
         event,
         outcome,
         reason,
-        phases.as_json().map(|value| ("phases", value)),
+        (if event == "user_prompt_submit" {
+            Some(phases.accounted_json(elapsed_ms, outcome == "deadline"))
+        } else {
+            phases.as_json()
+        })
+        .map(|value| serde_json::Map::from_iter([("phases".to_string(), value)])),
         payload,
         elapsed_ms,
         slow_threshold_ms,
@@ -4704,11 +4709,13 @@ fn log_hook_event_with_phases(
 /// answer them, and it exists so the flip is decided on a week of measurement
 /// rather than on the fixture, which scores precision 1.000 at every floor
 /// from 0.40 up and so cannot rank them.
+#[allow(clippy::too_many_arguments)] // thin pass-through to the hook log row
 fn log_hook_event_with_shadow(
     root: std::path::PathBuf,
     event: &str,
     outcome: &str,
     shadow: &ShadowRecall,
+    phases: Option<&PhaseTimings>,
     payload: Option<&HookPayload>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
@@ -4718,24 +4725,30 @@ fn log_hook_event_with_shadow(
         event,
         outcome,
         None,
-        Some(("shadow", shadow.as_json())),
+        Some({
+            let mut extra = serde_json::Map::from_iter([("shadow".to_string(), shadow.as_json())]);
+            if let Some(phases) = phases {
+                extra.insert(
+                    "phases".to_string(),
+                    phases.accounted_json(elapsed_ms, outcome == "deadline"),
+                );
+            }
+            extra
+        }),
         payload,
         elapsed_ms,
         slow_threshold_ms,
     );
 }
 
-/// `extra` is the one field an event type adds to the common row, named by its
-/// caller: `("phases", …)` for SessionStart, `("shadow", …)` for a shadow-mode
-/// UserPromptSubmit. Naming it at the call site keeps a reader of the log able
-/// to tell which event a field belongs to.
+/// `extra` carries event-specific fields: phase timings and shadow observations.
 #[allow(clippy::too_many_arguments)] // one field per element of the common hook-log row
 fn log_hook_event_full(
     root: std::path::PathBuf,
     event: &str,
     outcome: &str,
     reason: Option<&str>,
-    extra: Option<(&'static str, serde_json::Value)>,
+    extra: Option<serde_json::Map<String, Value>>,
     hook_payload: Option<&HookPayload>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
@@ -4750,8 +4763,10 @@ fn log_hook_event_full(
     if let Some(reason) = reason {
         payload["reason"] = serde_json::json!(reason);
     }
-    if let Some((field, value)) = extra {
-        payload[field] = value;
+    if let Some(extra) = extra {
+        for (field, value) in extra {
+            payload[&field] = value;
+        }
     }
     if let Some(hook_payload) = hook_payload {
         payload["payload_bytes"] = serde_json::json!(hook_payload.bytes);
@@ -5366,14 +5381,14 @@ fn fit_warmup_lines(lines: &[String], budget: usize) -> Vec<String> {
 /// would not add up, and a split that does not account for the whole is exactly
 /// how an unattributed 476 ms average survives.
 ///
-/// Phases are recorded as they complete, so a run that returns early carries
-/// only the phases it reached. That is the honest record: the missing names say
-/// where it stopped.
+/// SessionStart records completed segments. Recall also names each segment
+/// before starting it, preserving interrupted work in the deadline snapshot.
 #[derive(Debug)]
 pub struct PhaseTimings {
     started: std::time::Instant,
     last: std::time::Instant,
     phases: Vec<(&'static str, u64)>,
+    active: &'static str,
     /// What a phase decided, where a duration alone does not say it: the
     /// reranker's `rerank_outcome`. Written into the same object as the
     /// durations, so a cut run keeps the last note it made.
@@ -5387,6 +5402,7 @@ impl PhaseTimings {
             started: now,
             last: now,
             phases: Vec::new(),
+            active: "prepare",
             notes: Vec::new(),
         }
     }
@@ -5415,6 +5431,38 @@ impl PhaseTimings {
         self.phases
             .push((phase, now.duration_since(self.last).as_millis() as u64));
         self.last = now;
+        self.active = "between_phases";
+    }
+
+    /// Name work before it starts, so cancellation retains its open interval.
+    fn begin(&mut self, phase: &'static str) {
+        self.mark(self.active);
+        self.active = phase;
+    }
+
+    /// Snapshot at the dispatcher boundary, never at delayed log-write time.
+    fn accounted_json(&self, elapsed_ms: u64, deadline: bool) -> Value {
+        let mut fields = serde_json::Map::new();
+        for &(name, duration) in &self.phases {
+            let previous = fields.get(name).and_then(Value::as_u64).unwrap_or(0);
+            fields.insert(name.to_string(), json!(previous + duration));
+        }
+        let last_ms = self.last.duration_since(self.started).as_millis() as u64;
+        let open_ms = elapsed_ms.saturating_sub(last_ms);
+        let previous = fields.get(self.active).and_then(Value::as_u64).unwrap_or(0);
+        fields.insert(self.active.to_string(), json!(previous + open_ms));
+        let accounted: u64 = fields.values().filter_map(Value::as_u64).sum();
+        fields.insert(
+            "unaccounted_ms".to_string(),
+            json!(elapsed_ms.saturating_sub(accounted)),
+        );
+        for &(key, value) in &self.notes {
+            fields.insert(key.to_string(), json!(value));
+        }
+        if deadline {
+            fields.insert("deadline_phase".to_string(), json!(self.active));
+        }
+        Value::Object(fields)
     }
 
     /// The split as a JSON object, or `None` when nothing was marked — a hook
@@ -6083,6 +6131,7 @@ async fn hook_user_prompt_submit_impl_timed(
 
     let (mode, prompt) = recall_mode(cfg, prompt);
     if mode == RecallMode::Off {
+        phases.begin("prior");
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -6127,6 +6176,7 @@ async fn hook_user_prompt_submit_impl_timed(
             search_cfg.min_recall_cosine,
             Vec::new(),
         );
+        phases.begin("prior");
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -6142,6 +6192,7 @@ async fn hook_user_prompt_submit_impl_timed(
     // reranker is for the prompts nobody asked to enrich.
     let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
     if let Some(ref q) = fts_query {
+        phases.begin("context");
         ensure_handle_context_unless_busy(handle);
         phases.mark("context");
         // Embed the raw prompt off the runtime BEFORE locking — this is the
@@ -6149,6 +6200,7 @@ async fn hook_user_prompt_submit_impl_timed(
         // CPU-bound ONNX inference would stall a worker every turn. `q`
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
+        phases.begin("embed");
         query_embedding = embed_query_off_lock(prompt).await;
         phases.mark("embed");
         let limit = cfg.recall_limit.max(1);
@@ -6168,10 +6220,12 @@ async fn hook_user_prompt_submit_impl_timed(
             min_recall_cosine: 0.0,
             ..search_cfg.clone()
         };
+        phases.begin("lock_wait");
         let Ok(mut store) = hook_store(handle).await else {
             return json!({});
         };
         phases.mark("lock_wait");
+        phases.begin("search");
         let leg = tokio::task::spawn_blocking(move || {
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
             let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
@@ -6390,6 +6444,7 @@ async fn hook_user_prompt_submit_impl_timed(
             // Named before the await, so a run the hook deadline cuts inside
             // the reranker says where it was.
             phases.note("rerank_outcome", "cut");
+            phases.begin("rerank");
             let stage = recall_rerank::rerank_stage(
                 &handle.reranker,
                 cfg,
@@ -6439,6 +6494,7 @@ async fn hook_user_prompt_submit_impl_timed(
     // Post-recall enrichment in a single re-lock (both read-only, capped):
     //  · 1-hop memory-edge expansion — surface active neighbors of the top seeds.
     //  · stale-dependency flags — mark entries whose basis is superseded/refuted.
+    phases.begin("enrich");
     let mut expanded: Vec<String> = Vec::new();
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !results.is_empty()
@@ -6557,6 +6613,7 @@ async fn hook_user_prompt_submit_impl_timed(
             floor: search_cfg.min_recall_cosine,
             rerank: phases.note_of("rerank_outcome"),
         });
+        phases.begin("prior");
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -6564,6 +6621,7 @@ async fn hook_user_prompt_submit_impl_timed(
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
+    phases.begin("prior");
     let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
     phases.mark("prior");
 
@@ -6571,6 +6629,7 @@ async fn hook_user_prompt_submit_impl_timed(
     // until it fits, related docs first, memories last. Trimmed before the
     // delivery is committed, so a dropped line is not recorded as seen and can
     // still surface on a later prompt.
+    phases.begin("render");
     let (mut body, mut parts) = render_recall_body(
         &results,
         &expanded,
@@ -8205,12 +8264,13 @@ pub async fn dispatch_call(
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || match shadow {
                 Some(shadow) => {
-                    // A shadow run the deadline cut is still a deadline hit.
+                    // A cut shadow run retains its observation and deadline timings.
                     log_hook_event_with_shadow(
                         root,
                         "user_prompt_submit",
                         if timed_out { "deadline" } else { "shadow" },
                         &shadow,
+                        timed_out.then_some(&phases),
                         payload.as_ref(),
                         ms,
                         budget,
@@ -15226,6 +15286,60 @@ mod tests {
         );
     }
 
+    // Catches: cancellation discarding the open interval between completed phases.
+    #[tokio::test]
+    async fn recall_deadline_accounts_for_an_injected_between_phase_stall() {
+        for active in ["prepare", "between_phases", "search"] {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir_all(crate::store::namespace::store_dir(tmp.path()).unwrap())
+                .unwrap();
+            let t0 = std::time::Instant::now();
+            let mut phases = PhaseTimings::new();
+            let result = run_until_deadline(tmp.path(), 30, async {
+                if active != "prepare" {
+                    phases.begin("embed");
+                    phases.mark("embed");
+                }
+                if active == "search" {
+                    phases.begin("search");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                phases.begin("search");
+            })
+            .await;
+            assert!(result.is_none());
+            let elapsed = t0.elapsed().as_millis() as u64;
+            log_hook_event_with_phases(
+                tmp.path().to_path_buf(),
+                "user_prompt_submit",
+                "deadline",
+                None,
+                &phases,
+                None,
+                elapsed,
+                200,
+            );
+            let row = hook_event_row(tmp.path(), "user_prompt_submit").await;
+            assert_eq!(row["phases"]["deadline_phase"], active);
+            assert!(row["phases"][active].as_u64().unwrap() >= 20, "{row}");
+            assert_recall_time_accounted(&row);
+        }
+    }
+
+    fn assert_recall_time_accounted(row: &Value) {
+        let sum: u64 = row["phases"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter_map(Value::as_u64)
+            .sum();
+        assert!(
+            sum.abs_diff(row["elapsed_ms"].as_u64().unwrap()) <= 5,
+            "{row}"
+        );
+        assert!(row["phases"]["unaccounted_ms"].is_u64(), "{row}");
+    }
+
     #[tokio::test]
     async fn deadline_row_names_the_phases_reached_and_not_the_ones_cut() {
         let tmp = TempDir::new().unwrap();
@@ -15240,6 +15354,8 @@ mod tests {
 
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert_eq!(row["outcome"], "deadline");
+        assert_eq!(row["phases"]["deadline_phase"], "lock_wait");
+        assert_recall_time_accounted(&row);
         let phases = row.get("phases");
         assert!(
             phases.is_none_or(|p| p.get("search").is_none()),
@@ -15257,6 +15373,8 @@ mod tests {
         assert!(additional_context(&result).contains("split-topic"));
 
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_recall_time_accounted(&row);
+        assert!(row["phases"].get("deadline_phase").is_none());
         for phase in ["embed", "search"] {
             assert!(
                 row["phases"][phase].is_u64(),
@@ -15590,6 +15708,8 @@ mod tests {
             let row = hook_event_row(&handle.root, "user_prompt_submit").await;
             if row["shadow"].is_object() {
                 assert_eq!(row["outcome"], "deadline", "stall at link {later}: {row}");
+                assert_eq!(row["phases"]["deadline_phase"], "prior");
+                assert_recall_time_accounted(&row);
                 return;
             }
         }
