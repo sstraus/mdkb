@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- **`mdkb stats` labels the real hook-log window.** When rotation leaves the
+  oldest `hook-events.jsonl` row newer than 7 days, the Recall docs line and the
+  mining outcomes read `since <date> UTC` instead of `7d` (story 281-16ef).
+
 - **Hook RPCs refuse empty and relative repository roots.** Reject invalid roots
   before worktree resolution or store admission; registry entry points also
   refuse empty paths instead of selecting the daemon's current worktree.
