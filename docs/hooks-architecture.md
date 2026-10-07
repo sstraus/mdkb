@@ -296,7 +296,11 @@ From most to least granular:
 - **`mdkb stats`** — shows `HooksSummary` with `slow_events_7d` (hooks
   that exceeded latency budget in last 7 days).
 - **`.mdkb/hook-events.jsonl`** — one line per hook invocation, with event
-  name, outcome (ok/empty/error), elapsed time, and latency budget.
+  name, outcome (ok/empty/error), elapsed time, and latency budget. The file
+  is capped at 1 MiB (`HOOK_LOG_CAP_BYTES`); rotation drops the oldest half, so
+  a busy repo may retain well under 7 days. When the oldest retained row is
+  newer than the 7-day cutoff, `mdkb stats` labels the hook-event counts
+  `since <date> UTC` instead of `7d`. `hook-slow.jsonl` keeps the `7d` label.
 - **stderr** — all internal errors are logged via `tracing::warn`.
 
 ## Security

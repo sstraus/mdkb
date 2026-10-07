@@ -296,6 +296,14 @@ fn render_sessions(out: &mut String, s: &SessionsSummary) {
     out.push_str(&frame("Sessions", &lines.join("\n"), WIDTH));
 }
 
+/// "7d" when the log covers the whole window, else the real start of coverage.
+fn window_label(since: Option<i64>) -> String {
+    match since.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)) {
+        Some(t) => format!("since {} UTC", t.format("%Y-%m-%d %H:%M")),
+        None => "7d".to_string(),
+    }
+}
+
 fn render_hooks(out: &mut String, h: &HooksSummary) {
     let mut body = format!("  slow events (7d)  {:>4}", h.slow_events_7d);
 
@@ -341,7 +349,13 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
     // "enabled" only means the switch is on. These counts are what distinguishes
     // a distiller that works from one that is rejected on every call.
     for o in &h.mining.outcomes_7d {
-        let _ = write!(body, "\n    {:<14} {} (7d)", o.outcome, o.count);
+        let _ = write!(
+            body,
+            "\n    {:<14} {} ({})",
+            o.outcome,
+            o.count,
+            window_label(h.events_since)
+        );
         if let Some(reason) = &o.last_reason {
             // Its own line, because the useful part of a distiller error is at
             // the end ("...stream error: 400") and sharing the count's line left
@@ -417,8 +431,10 @@ fn render_recall(out: &mut String, r: &RecallReport) {
     if r.docs.prompts > 0 {
         let _ = write!(
             body,
-            "\n  docs injected    {} of {} prompts (7d)",
-            r.docs.with_docs, r.docs.prompts
+            "\n  docs injected    {} of {} prompts ({})",
+            r.docs.with_docs,
+            r.docs.prompts,
+            window_label(r.docs.since)
         );
     }
     table(&mut body, "Band", &r.bands);
@@ -528,6 +544,7 @@ mod tests {
             },
             hooks: HooksSummary {
                 slow_events_7d: 3,
+                events_since: None,
                 events: vec![],
                 drift: crate::cli::setup::HookDrift::default(),
                 mining: crate::cli::stats_report::MiningStatus {
@@ -620,9 +637,18 @@ mod tests {
         report.recall.docs = DocsAdmissions {
             prompts: 9,
             with_docs: 2,
+            since: None,
         };
         let out = render(&report, false);
-        assert!(out.contains("docs injected    2 of 9 prompts"), "{out}");
+        assert!(
+            out.contains("docs injected    2 of 9 prompts (7d)"),
+            "{out}"
+        );
+
+        // 2026-10-05 13:52:03 UTC
+        report.recall.docs.since = Some(1_791_208_323);
+        let out = render(&report, false);
+        assert!(out.contains("(since 2026-10-05 13:52 UTC)"), "{out}");
     }
 
     #[test]

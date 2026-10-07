@@ -63,6 +63,9 @@ pub struct RecallReport {
 pub struct DocsAdmissions {
     pub prompts: u32,
     pub with_docs: u32,
+    /// Oldest retained log row when it is newer than the 7-day cutoff (the log
+    /// rotated); `None` when the log covers the whole window.
+    pub since: Option<i64>,
 }
 
 /// Read the documents leg off the hook log: a `user_prompt_submit` row whose
@@ -233,6 +236,9 @@ pub struct ToolRow {
 pub struct HooksSummary {
     /// Slow hook events in the last 7 days (from hook-slow.jsonl).
     pub slow_events_7d: usize,
+    /// Oldest retained `hook-events.jsonl` row when it is newer than the 7-day
+    /// cutoff (the log rotated); `None` when the log covers the whole window.
+    pub events_since: Option<i64>,
     /// Per-event invocation stats (last 7 days, from hook-events.jsonl).
     pub events: Vec<HookEventStats>,
     /// Divergence of the live settings.json hook registrations from the
@@ -320,7 +326,9 @@ fn collect_recall(ctx: &Context, mdkb_dir: &Path) -> RecallReport {
     match (band_counts(&ctx.conn), prompts_by_mode(&ctx.conn)) {
         (Ok(counts), Ok(prompts)) => {
             let mut report = build_recall_report(counts, prompts);
-            report.docs = docs_admissions(&read_hook_events(mdkb_dir, hook_window_start()));
+            let log = read_hook_events(mdkb_dir, hook_window_start());
+            report.docs = docs_admissions(&log.events);
+            report.docs.since = log.since;
             report
         }
         (Err(error), _) | (_, Err(error)) => {
@@ -612,13 +620,14 @@ fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mut mining: MiningStatus) ->
     let cutoff = hook_window_start();
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
-    let recent = read_hook_events(mdkb_dir, cutoff);
-    let events = collect_hook_event_stats(&recent);
-    mining.outcomes_7d = collect_mining_outcomes(&recent);
+    let log = read_hook_events(mdkb_dir, cutoff);
+    let events = collect_hook_event_stats(&log.events);
+    mining.outcomes_7d = collect_mining_outcomes(&log.events);
     let drift = crate::cli::setup::detect_hook_drift_for_repo(repo_root, None);
 
     HooksSummary {
         slow_events_7d,
+        events_since: log.since,
         events,
         drift,
         mining,
@@ -630,16 +639,41 @@ fn hook_window_start() -> i64 {
     chrono::Utc::now().timestamp() - 7 * 86_400
 }
 
-/// Every parseable `hook-events.jsonl` line at or after `since_ts`.
-fn read_hook_events(mdkb_dir: &Path, since_ts: i64) -> Vec<serde_json::Value> {
+/// The parseable `hook-events.jsonl` lines inside the window.
+struct HookLog {
+    events: Vec<serde_json::Value>,
+    /// Oldest retained row's ts when it is newer than the window start:
+    /// rotation (`HOOK_LOG_CAP_BYTES`) drops the oldest half, so the log can
+    /// cover far less than 7 days.
+    since: Option<i64>,
+}
+
+fn read_hook_events(mdkb_dir: &Path, since_ts: i64) -> HookLog {
     let Ok(content) = std::fs::read_to_string(mdkb_dir.join("hook-events.jsonl")) else {
-        return Vec::new();
+        return HookLog {
+            events: Vec::new(),
+            since: None,
+        };
     };
-    content
+    let rows: Vec<(i64, serde_json::Value)> = content
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|v| v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0) >= since_ts)
-        .collect()
+        .map(|v| (v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0), v))
+        .collect();
+    let since = rows
+        .iter()
+        .map(|(ts, _)| *ts)
+        .filter(|ts| *ts > 0)
+        .min()
+        .filter(|oldest| *oldest > since_ts);
+    HookLog {
+        events: rows
+            .into_iter()
+            .filter(|(ts, _)| *ts >= since_ts)
+            .map(|(_, v)| v)
+            .collect(),
+        since,
+    }
 }
 
 /// Per-outcome counts for the `prior_mining` stream, most frequent first.
@@ -1045,6 +1079,27 @@ mod tests {
         assert!(!report.header.version.is_empty());
     }
 
+    /// A rotated log retains less than 7 days; stats must report the real
+    /// start of coverage, and none when the log reaches back past the cutoff.
+    #[test]
+    fn hook_log_reports_coverage_start_only_when_rotated() {
+        let env = Env::new();
+        let mdkb_dir = env.ctx.db_path.parent().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let row = |ts: i64| format!("{{\"event\":\"user_prompt_submit\",\"ts\":{ts}}}\n");
+        let path = mdkb_dir.join("hook-events.jsonl");
+
+        std::fs::write(&path, row(now - 2 * 86_400) + &row(now - 3600)).unwrap();
+        let log = read_hook_events(mdkb_dir, hook_window_start());
+        assert_eq!(log.since, Some(now - 2 * 86_400));
+        assert_eq!(log.events.len(), 2);
+
+        std::fs::write(&path, row(now - 9 * 86_400) + &row(now - 3600)).unwrap();
+        let log = read_hook_events(mdkb_dir, hook_window_start());
+        assert_eq!(log.since, None);
+        assert_eq!(log.events.len(), 1);
+    }
+
     #[test]
     fn hooks_summary_counts_slow_events() {
         let env = Env::new();
@@ -1223,6 +1278,7 @@ mod tests {
             },
             hooks: HooksSummary {
                 slow_events_7d: 0,
+                events_since: None,
                 events: vec![],
                 drift: crate::cli::setup::HookDrift::default(),
                 mining: MiningStatus {
