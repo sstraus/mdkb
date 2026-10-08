@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 3.11.3 (2026-10-08)
+
 ### Fixed
 
 - **`mdkb stats` labels the real hook-log window.** When rotation leaves the
