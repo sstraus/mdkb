@@ -936,6 +936,13 @@ Keep `.mdkb/*` ignored at the repository root, then re-include
 allows only `memory/entries/*.md` to be tracked; indexes and machine-local state
 remain ignored. See [Team sync (git)](#team-sync-git).
 
+## Community & support
+
+Join [TUICommander & Co on Discord](https://discord.gg/4DQ7Ah6hSh). In the
+**mdkb** category, use **#support** for questions and **#ideas** for suggestions.
+The server is checked once a day. Report reproducible bugs through
+[GitHub issues](https://github.com/sstraus/mdkb/issues).
+
 ## License
 
 MIT
