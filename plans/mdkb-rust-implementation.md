@@ -6,7 +6,7 @@
 
 ## Summary
 
-Rust CLI tool and MCP server for local markdown knowledge base search. A Rust port of [qmd](https://github.com/tobi/qmd) with full parity and beyond:
+Rust CLI tool and MCP server for local markdown knowledge base search. The design includes:
 - Improved platform compatibility (single cross-platform binary)
 - Per-repo storage (`.mdkb/` directory)
 - File watching in MCP mode for auto-updates
@@ -75,40 +75,20 @@ Configurable via `.mdkb/config.toml`
 
 ## Research Findings
 
-### qmd Architecture (Source: tobi/qmd)
-- **Storage**: SQLite with FTS5 + sqlite-vec for vectors
-- **Search modes**: BM25 (fast), vector (semantic), hybrid (query expansion + reranking)
-- **LLM**: node-llama-cpp with GGUF models (EmbeddingGemma, Qwen3-Reranker)
-- **MCP**: 6 tools via @modelcontextprotocol/sdk
-- **Output**: JSON, CSV, MD, XML, files, terminal
+### Retrieval and Storage Requirements
 
-### TypeScript Limitations Addressed
-| Issue | qmd (TS) | mdkb (Rust) |
-|-------|----------|-------------|
-| Platform compat | Windows broken, macOS crashes | Single binary, cross-compile |
-| Runtime deps | Bun-only, sqlite-vec alpha | No runtime, statically linked |
-| Cold start | ~2min LLM load | Lazy loading, faster startup |
-| Embedding batch | 53/53 failures | Robust error handling, retry logic |
-| BM25 scoring | Returns 100% always | Native SQLite FTS5 |
-| No file watching | Manual `update` command | Auto-watch in MCP mode |
-| Global database | `~/.cache/qmd/` | Per-repo `.mdkb/` |
-
-### Improvements Beyond qmd
-| Feature | qmd | mdkb |
-|---------|-----|------|
-| File watching | No | Yes (MCP mode) |
-| Differential indexing | Hash-based | mtime + hash |
-| Skill exclusion | No | Yes (pattern-based) |
-| Per-repo storage | No | Yes (`.mdkb/`) |
-| Config format | YAML | TOML (Rust convention) |
-| Chunking | Fixed 800 tokens | Configurable |
-| Model selection | Hardcoded | Configurable |
+- SQLite with FTS5 for lexical retrieval and sqlite-vec for vector storage in the same database
+- BM25, semantic, and hybrid search with query expansion and reranking
+- Local GGUF inference with lazy model loading
+- Structured CLI output and MCP access
+- A cross-platform binary with per-repository storage
+- File watching, mtime and content-hash indexing, configurable chunking and model selection
 
 ### Rust Stack Decision
 | Component | Crate | Rationale |
 |-----------|-------|-----------|
 | Storage | rusqlite | Sync API, FTS5 built-in, battle-tested |
-| Vector storage | sqlite-vec | Same DB, proven by qmd |
+| Vector storage | sqlite-vec | Vectors and documents in the same DB |
 | CLI | clap | Derive macros, subcommands |
 | MCP | rmcp | Official Anthropic SDK |
 | Async | tokio | Required for MCP server |

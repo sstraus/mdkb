@@ -84,9 +84,9 @@ fn preserves_other_mcp_servers_and_unrelated_sections() {
     let preexisting = r#"# Codex config — do not delete this comment
 model = "gpt-5"
 
-[mcp_servers.serena]
+[mcp_servers.fixture_server]
 command = "uvx"
-args = ["serena", "mcp"]
+args = ["fixture_server", "mcp"]
 
 [experimental]
 feature_flag = true
@@ -107,15 +107,15 @@ feature_flag = true
 
     let doc = raw.parse::<toml_edit::DocumentMut>().expect("valid TOML");
 
-    let serena = doc
+    let fixture_server = doc
         .get("mcp_servers")
-        .and_then(|m| m.get("serena"))
+        .and_then(|m| m.get("fixture_server"))
         .and_then(|v| v.as_table_like())
-        .expect("serena server must survive");
+        .expect("fixture server must survive");
     assert_eq!(
-        serena.get("command").and_then(|v| v.as_str()),
+        fixture_server.get("command").and_then(|v| v.as_str()),
         Some("uvx"),
-        "serena command must be unchanged"
+        "fixture server command must be unchanged"
     );
 
     let mdkb = doc
