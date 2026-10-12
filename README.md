@@ -45,24 +45,15 @@ use and then runs on-device.
   and repair. On Unix, an auto-started local daemon shares indexes and serializes
   writes; there is no separate LLM, vector, or graph service to provision.
 
-## How it differs from other memory systems
+## Repository memory
 
-"AI memory" covers products with very different jobs. mdkb deliberately
-optimizes for software repositories rather than trying to be a general-purpose
-personalization or conversation-memory platform.
+mdkb uses the repository as the memory boundary. It retrieves curated engineering
+knowledge alongside documentation and source code, including symbols and call
+relationships.
 
-| Memory approach | Usually optimized for | mdkb's difference |
-|---|---|---|
-| Conversation-memory SDKs | Extracting user facts and preferences for an application | Works as an installed repository tool; no application integration, extraction LLM, or hosted service is required |
-| Markdown knowledge bases | Portable notes and human-editable knowledge graphs | Adds typed engineering-memory lifecycle, source indexing, symbol search, and a persistent call graph |
-| Session-recording plugins | Capturing tool activity and AI-compressing past conversations | Prioritizes curated project truth and retrieves it alongside docs and code; it does not require a second AI process to summarize memory |
-| Temporal knowledge graphs | Evolving entities, events, and point-in-time facts | Uses a lighter local stack and deterministic project relations; no graph database or ingestion LLM is required |
-
-Choose mdkb when the repository is the memory boundary and source-code impact is
-part of recall. A conversation-memory SDK is a better fit for end-user
-personalization; a temporal graph is a better fit for bi-temporal entity facts;
-and a session recorder is a better fit when automatic transcript compression is
-the primary requirement.
+Durable memory has a typed lifecycle and stays reviewable in Markdown. Search,
+indexing, and project relations run locally in one binary. Choose mdkb when
+source-code impact and project knowledge belong in the same recall workflow.
 
 ## What it does
 

@@ -395,23 +395,19 @@ warmup token is charged on every turn"* as the stated reason; SessionStart injec
 
 **Keep the index. Do not "just give the agent ripgrep."** Agent Retrieval Bench (427 samples, 25
 repos, 392k files) found logged agent trajectories **miss every gold file on 27–35% of samples** —
-the strongest published argument for a pre-built index. Cursor's A/B reports +12.5% accuracy from
-semantic search, concentrated on repos with 1,000+ files.
+evidence that a pre-built index can help recover relevant files.
 
-**But the honest value shape is token efficiency, not peak accuracy.** mdkb's nearest neighbour in
-the field (Codebase-Memory: tree-sitter KG over SQLite, single binary, MCP) measured 83% answer
-quality against 92% for a file-exploration agent, at **10× fewer tokens and 2.1× fewer tool calls**.
+**Measure token efficiency alongside accuracy.** Evaluate answer quality, tokens consumed, and
+tool calls together; retrieval accuracy alone does not measure the cost of finding an answer.
 
-**The cheapest large win available is ranking, not resolution.** Aider's repo-map — tree-sitter
-symbols + personalized PageRank, binary-searched to a token budget, *no precise name resolution at
-all* — won **best budgeted context yield at 8K tokens** in Agent Retrieval Bench. mdkb extracts the
-call graph and ranks with none of it.
+**Prioritize ranking under a token budget.** Rank tree-sitter symbols with personalized PageRank
+and fit the result to the available context. mdkb extracts a call graph but does not use it for
+ranking.
 
-**Do not chase precise resolution formats.** `stack-graphs` — the most elegant technical fit — was
-**archived by GitHub on 2025-09-09**. LSIF is dead (Sourcegraph 4.6 removed read support). *Producing*
-SCIP requires bundling ten build toolchains, because every SCIP indexer is compiler-backed —
-precisely the cost tree-sitter buys you out of. *Importing* SCIP is cheap and would give a
-ground-truth oracle to measure the heuristics against.
+**Do not chase precise resolution formats.** `stack-graphs` was archived on 2025-09-09.
+*Producing* SCIP requires bundling compiler-backed indexers and their toolchains — precisely the
+cost tree-sitter avoids. *Importing* SCIP would provide a ground-truth oracle for measuring the
+heuristics.
 
 **Keep sqlite-vec.** Alternatives mean two storage engines in one binary and a split transaction
 boundary, for a ceiling mdkb is nowhere near. (It shipped experimental ANN in a `0.1.10` alpha with
@@ -420,9 +416,8 @@ IVF disabled and unfinished docs — do not take it.)
 **RRF is weaker than the folklore.** In the one head-to-head code benchmark found, Hybrid-RRF
 (.487 MRR@10) **underperformed embedding-alone** (.518); reranking won (.528).
 
-**Distractors are the dominant harm.** Chroma's context-rot study across 18 models: topically
-related but non-answering content is the most harmful context class, dominates hallucinations, and
-**even one distractor degrades performance — with Claude models showing the largest gap.** An
+**Distractors are the dominant harm.** Topically related but non-answering content can harm
+answer quality. Keep recall focused on evidence that answers the query. An
 unqueried semantic warmup at session start is structurally a distractor generator. The one study on
 memory injection into *coding* agents measured static hybrid retrieval at a **75% false-positive
 rate on hard negatives**.
@@ -482,8 +477,8 @@ auditor liked is corpus and survives, the unqueried semantic pass is the distrac
 
 **Q4 — ceiling, and the bug list gets you there faster. Do both, then change the promise.** Bare-name
 resolution across 13 languages without types cannot be made precise, and receiver typing cost months
-for one language. Aider won budgeted-context yield with *no* precise resolution — precision was not
-what won, **ranking under a token budget was**. New promise: `get_called_functions` returns
+for one language. Prioritize **ranking useful context under a token budget** and measure
+resolution accuracy separately. New promise: `get_called_functions` returns
 `(symbol, tier, is_unique)` and the tool description says tier ≤2 is resolved, tier ≥3 is a candidate
 list to confirm with grep. **Do not narrow the language list** — the parser layer is well factored
 and bare-name is a useful candidate generator everywhere. Narrow the promise, not the surface.

@@ -11,13 +11,13 @@
 
 **Research Performed:** 2026-01-31
 **Agents Deployed:** 7
-**Technologies Researched:** SQLite FTS5, sqlite-vec, vectorlite, LanceDB, RRF, chunking strategies, MCP specification, Serena MCP, journaling systems, knowledge evolution (RFC supersedes pattern), search quality metrics (BEIR, MTEB, nDCG)
+**Technologies Researched:** SQLite FTS5, sqlite-vec, vectorlite, LanceDB, RRF, chunking strategies, MCP specification, journaling systems, knowledge evolution (RFC supersedes pattern), search quality metrics (BEIR, MTEB, nDCG)
 
 ### Key Discoveries
 
 1. **Markdown-aware chunking** significantly improves retrieval quality vs fixed-size chunks
 2. **FTS5 column weighting** (title 10x, body 1x) improves ranking with zero effort
-3. **Serena's warmup pattern** (auto-init on serve, project root discovery) improves UX
+3. **Automatic warmup** (auto-init on serve, project root discovery) improves UX
 4. **MCP tool naming** should be clearer: `vsearch` → `semantic_search`, `query` → `hybrid_search`
 5. **Frontmatter/YAML parsing** and **wiki-link backlinks** are table-stakes for KB tools
 6. **Weighted RRF** is more tunable than plain RRF
@@ -39,7 +39,7 @@
 
 ## Summary
 
-Rust CLI tool and MCP server for local markdown knowledge base search. A Rust port of [qmd](https://github.com/tobi/qmd) with full parity and beyond:
+Rust CLI tool and MCP server for local markdown knowledge base search. The design includes:
 - Improved platform compatibility (single cross-platform binary)
 - Per-repo storage (`.mdkb/` directory)
 - File watching in MCP mode for auto-updates
@@ -105,9 +105,9 @@ PRAGMA temp_store = memory;
 - Auto-reindex on: create, modify, delete, rename
 - Skip indexing for patterns: `**/SKILL.md`, `**/.claude/**`, `**/skills/**`
 
-### Enhancement: Warmup Pattern (from Serena MCP research)
+### Enhancement: Automatic Warmup
 
-**Research Finding:** Serena uses auto-init and project root discovery for seamless warmup.
+**Design:** Use auto-init and project root discovery to prepare the index on startup.
 
 On `mdkb serve`:
 1. Walk up from CWD looking for `.mdkb/config.toml` or `.git`
@@ -257,7 +257,7 @@ DELETE FROM content WHERE hash NOT IN (SELECT hash FROM documents);
 
 **Solution:** Ensure `mdkb collection rename <old> <new>` is implemented.
 
-### Should-Have for Competitive Advantage
+### Additional Capabilities
 
 #### 5. Search Filters (tag:, path:)
 **Gap:** No query syntax for filtering.
@@ -854,7 +854,7 @@ predicates = "3"
 ### Phase 2: MCP Server (with enhancements)
 
 **Additional tasks:**
-- [ ] Implement auto-init on `mdkb serve` (Serena pattern)
+- [ ] Implement auto-init on `mdkb serve`
 - [ ] Implement project root discovery
 - [ ] Add warmup: verify index freshness on startup
 - [ ] Rename tools for clarity
@@ -1497,7 +1497,6 @@ mdkb experiment status "quantization"
 
 - [SQLite FTS5 Documentation](https://sqlite.org/fts5.html)
 - [MCP Specification (Nov 2025)](https://modelcontextprotocol.io/specification/2025-11-25)
-- [Serena MCP Server](https://github.com/oraios/serena)
 - [Weaviate Chunking Strategies](https://weaviate.io/blog/chunking-strategies-for-rag)
 - [Late Chunking Paper](https://arxiv.org/abs/2409.04701)
 - [Azure Hybrid Search Scoring](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking)
@@ -1516,7 +1515,6 @@ When ready to implement, run:
 
 - [SQLite FTS5 Documentation](https://sqlite.org/fts5.html)
 - [MCP Specification (Nov 2025)](https://modelcontextprotocol.io/specification/2025-11-25)
-- [Serena MCP Server](https://github.com/oraios/serena)
 - [Weaviate Chunking Strategies](https://weaviate.io/blog/chunking-strategies-for-rag)
 - [Late Chunking Paper](https://arxiv.org/abs/2409.04701)
 - [Azure Hybrid Search Scoring](https://learn.microsoft.com/en-us/azure/search/hybrid-search-ranking)
@@ -1536,4 +1534,4 @@ When ready to implement, run:
 ---
 
 *Enhanced with Claude Code via Happy*
-*Research agents: indexing-strategies, serena-mcp-research, mcp-skill-integration, gap-analysis, journaling-systems, superseding-patterns, search-quality-metrics*
+*Research agents: indexing-strategies, mcp-skill-integration, gap-analysis, journaling-systems, superseding-patterns, search-quality-metrics*
