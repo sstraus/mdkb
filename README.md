@@ -609,12 +609,12 @@ target is any string, or any list of strings — that is the whole rule. In this
 node, six keys carry a value of that shape and only two of them are relations:
 
 ```yaml
-id: person:arnaud-tauveron          # identity
+id: person:jane-doe                 # identity
 type: person                        # metadata
-name: Arnaud Tauveron               # metadata
-aliases: ["@ArnaudTurn-pro", arnaud.tauveron@lansweeper.com]
-role: Data Scientist (@Lansweeper/cloud)
-org: ["org:lansweeper"]             # relation
+name: Jane Doe                      # metadata
+aliases: ["@janedoe", jane.doe@example.com]
+role: Data Scientist (@acme/cloud)
+org: ["org:acme"]                   # relation
 ```
 
 Nothing about the *value* separates them. What separates them is whether the
