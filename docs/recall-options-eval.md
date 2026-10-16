@@ -171,3 +171,19 @@ Held-out set, written after the fit, four-gram check against the corpus passed: 
 Caveats. The IT positives were written after reading the corpus chunks, so vocabulary overlap likely makes IT recall optimistic. The EN corpus is 12 synthetic memories, so the EN floor was fitted on 40 negatives against a tiny store and did not hold: three held-out EN negatives score -1.45 to -1.68, above -1.95. EN needs a fit on a real English store before the EN floor is trusted.
 
 Latency on this Mac (M4 Max, own daemon, 37 memories of ~1.4 kB, top-5 pool, at host load average 36-65 from other jobs, so contended): unbounded rerank phase p50 972 ms, p95 1513 ms, max 2424 ms (153 reranked hooks); daemon RSS 1.45-2.2 GB with the model loaded (6.6 MB before). At the 700 ms deadline most calls time out (65 timeout, 165 busy, 9 finished of 256) and the hook falls back to the MiniLM result; no hook exceeded 866 ms. An unloaded Mac run was not possible. The hook client then waited a fixed 1 s, not the 1500 ms hook deadline, so the rerank budget was clamped to that. Story 203-353e replaced the fixed wait: the client waits the hook deadline plus 250 ms, the default deadline is 1000 ms, and the rerank budget clamps to the deadline.
+
+## e5-small retriever under the reranker (2026-10-16, plan configurable-embedder Step 1)
+
+Question: does replacing MiniLM with e5-small as the retriever for the jina reranker beat the shipped jina-on-MiniLM path enough to make the embedding model configurable? The gate was fixed before the run: IT recall beats the shipped path with a paired sign test p < 0.05, EN recall >= 0.417, p95 embed+rerank <= 700 ms on the Mac.
+
+Data: the 2026-09-30 fit set (40 IT positives, 38 IT negatives, 36 EN positives, 40 EN negatives), raw scores already on disk (`embed-minilm-l6.json`, `embed-e5-small.json`, `rerank-jina-v2-int8.json`). Script: `scripts/eval-recall-options/a7.py`. It reproduces the shipped IT floor (-1.05) from the same fit rule. Recall counts a positive when an expected id is among the entries the hook would inject (pool entries at or above the floor, best five by reranker score); the older "top5-hit" definition is given for comparison with the tables above.
+
+| Retriever pool | IT floor | IT recall, injected (95% CI) | IT top5-hit | Held-out IT recall / negatives admitted | Paired vs shipped (injected) | EN recall at -1.95 |
+|---|---|---|---|---|---|---|
+| MiniLM top-5 (shipped) | -1.05 | 12/40 = 0.300 (0.18-0.45) | 0.350 | 0.320 / 0.048 | - | 18/36 = 0.500 |
+| e5-small top-5 | -0.75 | 12/40 = 0.300 (0.18-0.45) | 0.325 | 0.319 / 0.046 | +2 -2, p = 1.00 | 18/36 = 0.500 |
+| e5-small top-10 | -0.75 | 15/40 = 0.375 (0.24-0.53) | 0.475 | 0.397 / 0.052 | +4 -1, p = 0.38 (top5-hit: +7 -2, p = 0.18) | 18/36 = 0.500 |
+
+Result: **FAIL.** No e5 configuration separates from the shipped path. e5-small top-5 is a tie. e5-small top-10 is the only gain, and it is not significant; it also doubles the reranker work (0.44 s to 0.88 s on 32 cores, "Latency on the rb box"), and the shipped top-5 path already times out on this Mac under load (p50 972 ms, p95 1513 ms, see the held-out section above). The latency arm of the gate was therefore not re-measured: it cannot change the verdict. The EN arm passes for every pool, because the 12-memory EN store makes the pool almost irrelevant.
+
+Consequence: the Italian-recall problem is not the retriever; it is the reranker's cost and the missing weights in production (`rerank_outcome = not_cached` on every hook of 2026-10-16). n = 40 detects a difference of about 0.25 (see "Sample size"); a 0.075 gain like e5 top-10 needs a much larger labelled IT set to confirm or reject.
