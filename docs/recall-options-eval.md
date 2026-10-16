@@ -186,4 +186,23 @@ Data: the 2026-09-30 fit set (40 IT positives, 38 IT negatives, 36 EN positives,
 
 Result: **FAIL.** No e5 configuration separates from the shipped path. e5-small top-5 is a tie. e5-small top-10 is the only gain, and it is not significant; it also doubles the reranker work (0.44 s to 0.88 s on 32 cores, "Latency on the rb box"), and the shipped top-5 path already times out on this Mac under load (p50 972 ms, p95 1513 ms, see the held-out section above). The latency arm of the gate was therefore not re-measured: it cannot change the verdict. The EN arm passes for every pool, because the 12-memory EN store makes the pool almost irrelevant.
 
+Retrieval is not the weak part. Without any gate, e5-small finds the right chunk far more often than MiniLM for an Italian prompt, and about as often as for the same prompt translated to English, so the multilingual model works:
+
+| Ungated recall@k, 443 doc chunks | k=1 | k=5 | k=10 |
+|---|---|---|---|
+| MiniLM, IT prompt | 0.125 | 0.400 | 0.525 |
+| MiniLM, same prompt in EN | 0.525 | 0.725 | 0.875 |
+| e5-small, IT prompt | 0.300 | 0.475 | 0.700 |
+| e5-small, same prompt in EN | 0.425 | 0.625 | 0.650 |
+
+The loss is in the decision to inject. e5-small top-1 cosines: IT positives median 0.848, IT negatives median 0.804, best negative 0.850, so no cosine floor separates them. Under the reranker the zero-negative rule is what caps recall. IT recall (injected) when the floor admits N of the 38 IT negatives:
+
+| Pool | N=0 | N=2 | N=4 | N=8 |
+|---|---|---|---|---|
+| MiniLM top-5 (shipped) | 0.300 | 0.375 | 0.400 | 0.400 |
+| e5-small top-5 | 0.300 | 0.400 | 0.425 | 0.425 |
+| e5-small top-10 | 0.375 | 0.450 | 0.525 | 0.575 |
+
+The e5 top-10 pool is the only one whose recall keeps rising as the floor drops: the right chunk is in its pool (0.700 at k=10) and the reranker floor is what keeps it out. Whether two to four wrong injections in 38 unrelated Italian prompts is acceptable is a product decision, not a measurement.
+
 Consequence: the Italian-recall problem is not the retriever; it is the reranker's cost and the missing weights in production (`rerank_outcome = not_cached` on every hook of 2026-10-16). n = 40 detects a difference of about 0.25 (see "Sample size"); a 0.075 gain like e5 top-10 needs a much larger labelled IT set to confirm or reject.
