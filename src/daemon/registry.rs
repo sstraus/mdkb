@@ -320,18 +320,15 @@ pub struct RepoRegistry {
     /// Serializes the check-evict-insert triple so concurrent callers cannot
     /// both pass the capacity check before either inserts, which would exceed max_active.
     open_gate: std::sync::Mutex<()>,
-    /// The last nested-store walk, reusable while it is fresh and while the
-    /// set of directories it covered has not changed.
-    discovery: std::sync::Mutex<Option<Discovery>>,
+    /// Independent workspaces retain independent results. Each entry's lock
+    /// coalesces identical misses without serializing unrelated tree walks.
+    discovery: std::sync::Mutex<std::collections::BTreeMap<Vec<PathBuf>, DiscoveryFlight>>,
 }
 
-/// One nested-store walk, and what it is valid for.
-///
-/// `walked` is the key, not the `extra` that was asked for: two calls with
-/// different scopes that both fall inside the same known root walk the same
-/// directories, and the second must not repeat the first.
+type DiscoveryFlight = Arc<std::sync::Mutex<Option<Discovery>>>;
+
+/// One completed nested-store walk.
 struct Discovery {
-    walked: Vec<PathBuf>,
     roots: Vec<PathBuf>,
     at: std::time::Instant,
 }
@@ -363,7 +360,7 @@ impl RepoRegistry {
             last_scope_policy: std::sync::Mutex::new(None),
             repo_map,
             open_gate: std::sync::Mutex::new(()),
-            discovery: std::sync::Mutex::new(None),
+            discovery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -519,14 +516,9 @@ impl RepoRegistry {
         let known = self.known_roots();
         let mut roots: std::collections::BTreeSet<PathBuf> = known.iter().cloned().collect();
         let mut walk: Vec<PathBuf> = known;
-        // A scope already covered by a known root adds nothing but a second
-        // walk of the same tree.
-        let uncovered: Vec<PathBuf> = extra
-            .iter()
-            .filter(|e| !walk.iter().any(|k| e.starts_with(k)))
-            .cloned()
-            .collect();
-        walk.extend(uncovered);
+        // Coverage normalization decides which scopes are redundant. A scope
+        // below an ignored/generated ancestor still needs its explicit walk.
+        walk.extend_from_slice(extra);
         roots.extend(self.walk_for(&walk));
         self.retain_unignored(&mut roots);
         roots.into_iter().collect()
@@ -539,47 +531,41 @@ impl RepoRegistry {
         }
     }
 
-    /// The stores nested under `walk`, from the cache when it is still valid.
-    ///
-    /// Valid means two things, and both are needed. The TTL bounds a store
-    /// created behind the daemon's back. The `walked` comparison bounds the
-    /// other direction: a second client declaring a different workspace asks
-    /// about directories the cached walk never entered, and answering it from
-    /// that walk would report the first client's repos as the second's.
-    ///
-    /// That comparison is also the whole invalidation. Recording a repo
-    /// changes `known_roots`, which changes `walk`, which misses — so a repo
-    /// the daemon itself opens is discoverable on the very next call without
-    /// a second mechanism watching `record`. An explicit drop there was
-    /// written first and removed: both tests stayed green without it, which
-    /// makes it a second path to one transition, not a safety net.
-    /// The lock is NOT held across the walk. Two clients that declared
-    /// different workspaces would then serialize on a tree neither shares, and
-    /// the second would wait out the first's walk before starting its own —
-    /// slower than the uncached code it replaces. A concurrent miss walks
-    /// twice, exactly as before; the last one to finish wins the slot.
+    /// Cache by normalized traversal coverage, with one in-flight walk per key.
+    /// TTL expiry still finds stores created externally; known roots themselves
+    /// are unioned by the caller and therefore never wait for cache expiry.
     fn walk_for(&self, walk: &[PathBuf]) -> Vec<PathBuf> {
+        let walk = super::repo_map::covered_walk_roots(walk);
         let ttl = std::time::Duration::from_secs(self.daemon_config.discovery_cache_secs);
         if ttl.is_zero() {
-            return super::repo_map::discover_nested_stores(walk, &self.ignored)
+            return super::repo_map::discover_nested_stores(&walk, &self.ignored)
                 .into_iter()
                 .collect();
         }
-        let fresh = |d: &Discovery| d.walked == walk && d.at.elapsed() < ttl;
-        if let Some(hit) = self
-            .discovery
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .filter(|d| fresh(d))
-        {
+        let flight = {
+            let mut entries = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
+            // Discard expired, idle entries so transient workspaces do not
+            // accumulate forever. Never remove a lock another caller holds.
+            entries.retain(|_, entry| {
+                Arc::strong_count(entry) > 1
+                    || entry.try_lock().map_or(true, |cached| {
+                        cached.as_ref().is_some_and(|d| d.at.elapsed() < ttl)
+                    })
+            });
+            Arc::clone(
+                entries
+                    .entry(walk.clone())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(None))),
+            )
+        };
+        let mut cached = flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = cached.as_ref().filter(|d| d.at.elapsed() < ttl) {
             return hit.roots.clone();
         }
-        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk, &self.ignored)
+        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(&walk, &self.ignored)
             .into_iter()
             .collect();
-        *self.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery {
-            walked: walk.to_vec(),
+        *cached = Some(Discovery {
             roots: roots.clone(),
             at: std::time::Instant::now(),
         });
@@ -955,13 +941,18 @@ mod tests {
 
         registry.discoverable_roots();
         let nested = plant_store(first.join("nested"));
-        let second = tmp.path().join("second");
-        std::fs::create_dir_all(&second).unwrap();
+        // A disjoint root changes traversal coverage. A descendant does not:
+        // it is unioned immediately, but externally planted siblings retain
+        // the same TTL as every other externally created store.
+        let second_tmp = TempDir::new().unwrap();
+        let second = make_repo(&second_tmp);
         registry.get_or_open(&second).expect("open second");
 
+        let discovered = registry.discoverable_roots();
+        assert!(discovered.contains(&crate::domain::canonicalize_plain(&second).unwrap()));
         assert!(
-            registry.discoverable_roots().contains(&nested),
-            "registering a repo changes the walk set, so the cached walk cannot answer"
+            discovered.contains(&nested),
+            "registering a disjoint repo changes the walk set, so the cached walk cannot answer"
         );
     }
 
@@ -984,6 +975,114 @@ mod tests {
         assert_eq!(seen_alpha, vec![in_alpha.clone()]);
         assert_eq!(seen_beta, vec![in_beta]);
         assert!(!seen_beta.contains(&in_alpha), "no cross-workspace leak");
+    }
+
+    /// Catches overlapping known roots traversing a nested store twice.
+    #[test]
+    fn discovery_io_nested_known_roots_walk_once() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(tmp.path().join("parent"));
+        let child = plant_store(parent.join("child"));
+        let inner = plant_store(child.join("inner"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.repo_map.record(&parent);
+        registry.repo_map.record(&child);
+        assert_eq!(
+            registry.discoverable_roots(),
+            vec![parent, child.clone(), inner]
+        );
+        let visits = super::super::repo_map::TEST_VISITS
+            .lock()
+            .unwrap()
+            .get(&child)
+            .copied();
+        assert_eq!(visits, Some(1));
+    }
+
+    /// Catches equivalent root sets missing the cache because of input order,
+    /// duplicate roots, or a newly known descendant already covered by a walk.
+    #[test]
+    fn discovery_io_equivalent_coverage_reuses_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = plant_store(tmp.path().join("root"));
+        let child = plant_store(root.join("child"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        let first = registry.discoverable_roots_under(std::slice::from_ref(&root));
+        registry.repo_map.record(&child);
+        let later = plant_store(root.join("later"));
+        let second = registry.discoverable_roots_under(&[child, root.clone(), root]);
+        assert_eq!(second, first);
+        assert!(!second.contains(&later));
+    }
+
+    /// Catches a declared workspace below a known root being dropped before
+    /// normalization, even though the ancestor prunes that workspace's tree.
+    #[test]
+    fn discovery_io_declared_scope_overrides_ancestor_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(tmp.path().join("parent"));
+        std::fs::write(parent.join(".gitignore"), "/generated/\n").unwrap();
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.repo_map.record(&parent);
+        for path in [
+            "generated/workspace",
+            "coverage/workspace",
+            "plugins__wt/workspace",
+        ] {
+            let scope = parent.join(path);
+            let nested = plant_store(scope.join("nested"));
+            assert!(!registry.discoverable_roots().contains(&nested));
+            assert!(
+                registry
+                    .discoverable_roots_under(&[scope])
+                    .contains(&nested)
+            );
+        }
+    }
+
+    /// Catches the one-slot cache being evicted by another workspace.
+    #[test]
+    fn discovery_io_alternating_workspaces_reuse_both_walks() {
+        let tmp = TempDir::new().unwrap();
+        let a = plant_store(tmp.path().join("a"));
+        let b = plant_store(tmp.path().join("b"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        let first = registry.discoverable_roots_under(std::slice::from_ref(&a));
+        registry.discoverable_roots_under(&[b]);
+        plant_store(a.join("later"));
+        assert_eq!(registry.discoverable_roots_under(&[a]), first);
+    }
+
+    /// Catches concurrent identical cache misses each traversing the tree.
+    #[test]
+    fn discovery_io_concurrent_misses_share_one_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = plant_store(tmp.path().join("root"));
+        for i in 0..100 {
+            std::fs::create_dir_all(root.join(format!("dir{i}/inner"))).unwrap();
+        }
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let root = &root;
+                let registry = &registry;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(
+                        registry.discoverable_roots_under(std::slice::from_ref(root)),
+                        vec![root.clone()]
+                    );
+                });
+            }
+        });
+        let visits = super::super::repo_map::TEST_VISITS
+            .lock()
+            .unwrap()
+            .get(&root)
+            .copied();
+        assert_eq!(visits, Some(1));
     }
 
     #[test]
