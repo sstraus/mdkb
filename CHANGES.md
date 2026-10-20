@@ -11,6 +11,13 @@
   without blocking the host. Requested by the maintainer while integrating
   ego's session observations (story 014-70ca).
 
+### Fixed
+
+- **No-project lifecycle hooks consume their input before exiting.** Drain the
+  host payload even when no project can hold a store, so a successful no-op
+  does not close the pipe during the host's write. Found by the full rb test
+  gate and reproduced across all five lifecycle events (story 014-70ca).
+
 ## 3.11.3 (2026-10-08)
 
 ### Fixed
