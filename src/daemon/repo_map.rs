@@ -121,13 +121,38 @@ pub fn is_ignored(path: &Path, ignore: &[PathBuf]) -> bool {
 pub(super) static TEST_VISITS: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// Normalize walk coverage, not repository identity: an explicit worktree is
+/// still a directory to explore, even when its store belongs to the main repo.
+pub(super) fn covered_walk_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let sorted: BTreeSet<_> = roots
+        .iter()
+        .map(|root| crate::domain::canonicalize_plain(root).unwrap_or_else(|_| root.clone()))
+        .collect();
+    let mut covered: Vec<PathBuf> = Vec::new();
+    for root in sorted {
+        let already_covered = covered.iter().any(|ancestor| {
+            root.strip_prefix(ancestor).is_ok_and(|relative| {
+                // An explicitly requested root below a pruned directory is not
+                // reached by the ancestor's walk; retain that separate walk.
+                !relative
+                    .components()
+                    .any(|part| SKIPPED_DIRS.iter().any(|name| part.as_os_str() == *name))
+            })
+        });
+        if !already_covered {
+            covered.push(root);
+        }
+    }
+    covered
+}
+
 /// Find stores below roots the daemon already knows, without opening or
 /// registering them. A store is identified by its SQLite file; walking stops
 /// at `.mdkb` so index internals are never traversed, and at every directory
 /// in [`SKIPPED_DIRS`] or under an `ignore` path.
 pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
-    for root in roots {
+    for root in covered_walk_roots(roots) {
         let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             !SKIPPED_DIRS.contains(&name.as_ref()) && !is_ignored(entry.path(), ignore)
@@ -138,7 +163,11 @@ pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet
             }
             #[cfg(test)]
             {
-                *TEST_VISITS.lock().unwrap().entry(entry.path().to_path_buf()).or_default() += 1;
+                *TEST_VISITS
+                    .lock()
+                    .unwrap()
+                    .entry(entry.path().to_path_buf())
+                    .or_default() += 1;
             }
             let candidate = entry.path().join(".mdkb/index.sqlite");
             if candidate.is_file() {
