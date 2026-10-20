@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **Stop hooks accept bounded inline episodes.** Hosts such as ego can send
+  `session_id` and `episode_jsonl` without an ephemeral transcript file. Inline
+  input uses the existing prior and recall settlement and mining paths. Reject
+  malformed input or more than 800 records or 256 KiB with a logged reason,
+  without blocking the host. Requested by the maintainer while integrating
+  ego's session observations (story 014-70ca).
+
 ## 3.11.3 (2026-10-08)
 
 ### Fixed

@@ -144,6 +144,38 @@ fn run_hook_with_home(
     (stdout, stderr, output.status.code().unwrap_or(-1))
 }
 
+// Catches: rejected inline evidence fails the host or silently loses its reason.
+#[test]
+fn hook_stop_inline_refusal_logs_reason_and_exits_zero() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let root = temp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    handle_init(&root).expect("init");
+    for (inline, reason) in [
+        (serde_json::json!("not json"), "record 1"),
+        (
+            serde_json::json!("x".repeat(262_145)),
+            "exceeds 262144 bytes",
+        ),
+        (serde_json::json!("{}\n".repeat(801)), "exceeds 800 records"),
+    ] {
+        let payload = serde_json::json!({"session_id": "ego-session", "episode_jsonl": inline});
+        let (stdout, stderr, code) =
+            run_hook_with_home("stop", &root, &payload.to_string(), Some(&home));
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            stdout.trim().is_empty(),
+            "refusal must not emit host instructions: {stdout}"
+        );
+        assert!(
+            stderr.contains("inline episode refused") && stderr.contains(reason),
+            "missing refusal reason: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn hooks_e2e_warmup_recall_and_reindex() {
     let temp = tempfile::tempdir().expect("tempdir");
