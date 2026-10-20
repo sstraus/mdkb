@@ -377,6 +377,15 @@ pub fn handle_setup_mcp_claude(
 /// 1. Current executable path (if running from cargo or installed binary)
 /// 2. PATH lookup
 pub(super) fn find_mdkb_binary() -> Result<String> {
+    resolve_mdkb_binary(true)
+}
+
+/// Find an installed binary without persisting a temporary build executable.
+pub(super) fn find_installed_mdkb_binary() -> Result<String> {
+    resolve_mdkb_binary(false)
+}
+
+fn resolve_mdkb_binary(allow_current_exe: bool) -> Result<String> {
     #[cfg(any(debug_assertions, test))]
     if let Some(override_path) = env::var_os("MDKB_BINARY_OVERRIDE") {
         let s = override_path.to_string_lossy().to_string();
@@ -385,8 +394,8 @@ pub(super) fn find_mdkb_binary() -> Result<String> {
         }
     }
 
-    // Try current executable first
-    if let Ok(exe) = env::current_exe() {
+    // Existing setup targets can use the current binary; ego requires an installed path.
+    if allow_current_exe && let Ok(exe) = env::current_exe() {
         let exe_name = exe.file_name().map(|n| n.to_string_lossy().to_string());
         if exe_name.as_deref() == Some("mdkb") {
             return Ok(exe.to_string_lossy().to_string());

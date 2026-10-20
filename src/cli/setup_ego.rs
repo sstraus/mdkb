@@ -4,7 +4,7 @@ use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::setup::find_mdkb_binary;
+use super::setup::find_installed_mdkb_binary;
 use crate::error::{Error, ErrorKind, Result};
 
 const KEY: &str = "mdkb_prompt_command";
@@ -59,7 +59,7 @@ fn io_error(path: &Path, operation: String) -> Error {
 /// byte-for-byte. A different existing value is kept unless `force` is set.
 pub fn handle_setup_hooks_ego(force: bool, dry_run: bool) -> Result<EgoSetupResult> {
     let config_path = ego_config_path()?;
-    let binary_path = find_mdkb_binary()?;
+    let binary_path = find_installed_mdkb_binary()?;
 
     let raw = match std::fs::read_to_string(&config_path) {
         Ok(raw) => raw,
@@ -71,7 +71,6 @@ pub fn handle_setup_hooks_ego(force: bool, dry_run: bool) -> Result<EgoSetupResu
         .map_err(|e| cmd_error(format!("failed to parse {}: {e}", config_path.display())))?;
 
     let outcome = match doc.get(KEY) {
-        None => EgoSetupOutcome::Written,
         Some(item) if item.as_str() == Some(binary_path.as_str()) => EgoSetupOutcome::Unchanged,
         Some(_) if !force => {
             let existing = doc[KEY]
@@ -80,7 +79,7 @@ pub fn handle_setup_hooks_ego(force: bool, dry_run: bool) -> Result<EgoSetupResu
                 .unwrap_or_default();
             EgoSetupOutcome::KeptExisting(existing)
         }
-        Some(_) => EgoSetupOutcome::Written,
+        _ => EgoSetupOutcome::Written,
     };
 
     if outcome == EgoSetupOutcome::Written {
