@@ -1680,7 +1680,7 @@ root=\"scope:home\"                                       # the known repos whos
                                 result.config_path.display()
                             ),
                             EgoSetupOutcome::Unchanged => {
-                                println!("Already registered in {}", result.config_path.display())
+                                println!("Already registered in {}", result.config_path.display());
                             }
                             EgoSetupOutcome::KeptExisting(existing) => println!(
                                 "Kept existing mdkb_prompt_command = {existing} in {}; use --force to replace it",
