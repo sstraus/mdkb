@@ -1395,30 +1395,83 @@ fn watched_memory_entries_dir(root: &Path, namespace: Option<&str>) -> PathBuf {
         .join("entries")
 }
 
+/// The same relative glob matcher used by document indexing.
+#[derive(Clone)]
+struct WatchedCollection {
+    path: PathBuf,
+    matcher: globset::GlobMatcher,
+}
+
+impl WatchedCollection {
+    fn new(path: PathBuf, pattern: &str) -> Option<Self> {
+        match crate::core::indexing::compile_collection_matcher(pattern) {
+            Ok(matcher) => Some(Self { path, matcher }),
+            Err(error) => {
+                tracing::warn!(%error, %pattern, "Skipping invalid watcher collection glob");
+                None
+            }
+        }
+    }
+}
+
 fn classify_change(
     path: &Path,
-    collection_paths: &[PathBuf],
+    collections: &[WatchedCollection],
     code_excludes: &globset::GlobSet,
     memory_entries_dir: &Path,
 ) -> ChangeRoutes {
     use crate::code::parsing::language::Language;
+    // Only the active projection is a store input. Database/WAL files and
+    // other stores' projections must never trigger document or code indexing.
+    let memory = path.parent() == Some(memory_entries_dir)
+        && path.extension().and_then(|e| e.to_str()) == Some("md");
+    let internal = path
+        .components()
+        .any(|c| c.as_os_str() == ".mdkb" || c.as_os_str() == ".git");
+    if internal || code_excludes.is_match(path) {
+        return ChangeRoutes {
+            memory,
+            ..Default::default()
+        };
+    }
     ChangeRoutes {
-        code: Language::from_path(path).is_some() && !code_excludes.is_match(path),
-        doc: collection_paths.iter().any(|cp| path.starts_with(cp)),
-        memory: path.starts_with(memory_entries_dir)
-            && path.extension().and_then(|e| e.to_str()) == Some("md"),
+        code: Language::from_path(path).is_some(),
+        doc: collections.iter().any(|collection| {
+            path.strip_prefix(&collection.path)
+                .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel)))
+        }),
+        memory,
     }
 }
 
-/// The watcher's delivery filter: keep exactly the paths [`classify_change`]
-/// routes somewhere, so dropping the rest at the source loses no change the
-/// consumer would have acted on.
+/// Reject unrouted paths on the native callback, before bounded delivery.
 fn routed_path_filter(
-    collection_paths: Vec<PathBuf>,
+    collections: Vec<WatchedCollection>,
     code_excludes: globset::GlobSet,
     memory_entries_dir: PathBuf,
+    code_enabled: bool,
 ) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
-    move |path| classify_change(path, &collection_paths, &code_excludes, &memory_entries_dir).any()
+    move |path| {
+        let routes = classify_change(path, &collections, &code_excludes, &memory_entries_dir);
+        (code_enabled && routes.code) || routes.doc || routes.memory
+    }
+}
+
+// A repository can retain at most this many distinct incremental paths. More
+// changes collapse into one full pass rather than an unbounded in-memory queue.
+const MAX_PENDING_PATHS: usize = 1024;
+const RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn note_code_change(batch: &mut Vec<PathBuf>, rescan: &mut bool, path: PathBuf) {
+    if *rescan || batch.contains(&path) {
+        return;
+    }
+    if batch.len() == MAX_PENDING_PATHS {
+        batch.clear();
+        *rescan = true;
+    } else {
+        batch.push(path);
+    }
 }
 
 /// How long the watcher waits for context initialization before giving up.
@@ -1549,14 +1602,23 @@ pub async fn run_file_watcher_inner(
         }
     };
 
-    // Resolve absolute collection paths for routing
-    let collection_paths: Vec<PathBuf> = collection_list
+    let collection_paths: Vec<WatchedCollection> = collection_list
         .iter()
-        .map(|coll| root.join(&coll.path))
-        .filter(|p| p.exists())
+        .filter_map(|coll| WatchedCollection::new(root.join(&coll.path), &coll.pattern))
         .collect();
-    // Build exclude matcher for code changes (node_modules, dist, target, etc.)
-    let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
+    // Documents and code must both reject build/dependency churn. The document
+    // defaults apply even when code indexing has no configured exclusions.
+    let exclude_patterns: Vec<String> = code_ignore_patterns
+        .iter()
+        .cloned()
+        .chain(
+            crate::core::indexing::DOC_WALKER_DEFAULT_EXCLUDES
+                .iter()
+                .map(|s| (*s).to_string()),
+        )
+        .chain(["**/.tmp/**".to_string()])
+        .collect();
+    let code_excludes = build_code_excludes(&root, &exclude_patterns);
     // The settings every facade this watcher opens must carry — the bootstrap
     // below and every later reopen after corruption closed the slot. One value,
     // so a reopened facade can never index under different rules than the
@@ -1580,6 +1642,7 @@ pub async fn run_file_watcher_inner(
         collection_paths.clone(),
         code_excludes.clone(),
         memory_entries_dir.clone(),
+        code_enabled,
     ));
 
     // Watch root recursively — it covers code, collections inside root, AND the
@@ -1596,9 +1659,10 @@ pub async fn run_file_watcher_inner(
     }
 
     // Only watch collection paths that are OUTSIDE the root (rare edge case)
-    for (coll, abs_path) in collection_list.iter().zip(collection_paths.iter()) {
+    for coll in &collection_list {
+        let abs_path = root.join(&coll.path);
         if !abs_path.starts_with(&root) {
-            if let Err(e) = watcher.watch(&abs_path.to_path_buf()) {
+            if let Err(e) = watcher.watch(&abs_path) {
                 tracing::warn!("Failed to watch {}: {}", abs_path.display(), e);
             } else {
                 tracing::info!(
@@ -1662,6 +1726,8 @@ pub async fn run_file_watcher_inner(
     // leaves the batch empty, and the drop that came with it would never be
     // looked at. The index would stay stale until the daemon restarted.
     let mut needs_rescan = false;
+    let mut flush_deadline = None;
+    let mut recovery_not_before = tokio::time::Instant::now();
 
     loop {
         // Helper: receive from the optional injected-path channel, or block forever if absent.
@@ -1680,6 +1746,22 @@ pub async fn run_file_watcher_inner(
             || needs_doc_update
             || needs_memory_sync.is_pending()
             || needs_rescan;
+        // A fixed deadline, not a fresh sleep after every event: sustained
+        // traffic cannot postpone a flush forever. Recovery waits for its
+        // per-repo cooldown and coalesces all drops in that window.
+        let idle_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(batch_idle_ms);
+        let deadline = if pending {
+            *flush_deadline.get_or_insert(idle_deadline)
+        } else {
+            flush_deadline = None;
+            idle_deadline
+        };
+        let deadline = if needs_rescan {
+            deadline.max(recovery_not_before)
+        } else {
+            deadline
+        };
 
         tokio::select! {
             change = watcher.recv() => {
@@ -1696,7 +1778,7 @@ pub async fn run_file_watcher_inner(
                 needs_rescan |= watcher.take_missed_events();
                 tracing::debug!("File change detected: {:?}", change.path);
                 let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
-                if routes.code { code_batch.push(change.path.clone()); }
+                if code_enabled && routes.code { note_code_change(&mut code_batch, &mut needs_rescan, change.path.clone()); }
                 if routes.doc { needs_doc_update = true; }
                 if routes.memory { needs_memory_sync.note(change.path.clone()); }
                 if !routes.any() {
@@ -1709,14 +1791,16 @@ pub async fn run_file_watcher_inner(
                     // root); a file is a targeted code reindex.
                     if p.is_dir() {
                         full_rebuild_from_heal(&ctx, &code_index, &root, &pipeline_config).await;
-                    } else {
-                        code_batch.push(p);
+                    } else if code_enabled {
+                        note_code_change(&mut code_batch, &mut needs_rescan, p);
                     }
                 }
             }
             // Armed only while work is pending: with nothing to flush the loop
             // blocks on the two event sources rather than waking on a timer.
-            () = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)), if pending => {
+            () = tokio::time::sleep_until(deadline), if pending => {
+                flush_deadline = None;
+                let recovering = needs_rescan;
                 if needs_rescan {
                     needs_rescan = false;
                     tracing::warn!(
@@ -1741,6 +1825,9 @@ pub async fn run_file_watcher_inner(
                 // the flag cleared and skip a redundant second pass.
                 flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
                 flush_memory_sync(&ctx, &mut needs_memory_sync).await;
+                if recovering {
+                    recovery_not_before = tokio::time::Instant::now() + RECOVERY_INTERVAL;
+                }
             }
         }
     }
@@ -1913,7 +2000,15 @@ impl MemorySyncRequest {
     fn note(&mut self, path: PathBuf) {
         match self {
             Self::Idle => *self = Self::Changed(vec![path]),
-            Self::Changed(paths) => paths.push(path),
+            Self::Changed(paths) => {
+                if !paths.contains(&path) {
+                    if paths.len() == MAX_PENDING_PATHS {
+                        *self = Self::Full;
+                    } else {
+                        paths.push(path);
+                    }
+                }
+            }
             Self::Full => {}
         }
     }
@@ -4112,9 +4207,13 @@ if (require.main === module) {
     /// memory route and assert nothing about it. The memory directory is set to
     /// a path none of them touch.
     fn code_doc(path: &Path, collections: &[PathBuf], excludes: &globset::GlobSet) -> (bool, bool) {
+        let collections: Vec<_> = collections
+            .iter()
+            .map(|p| WatchedCollection::new(p.clone(), "**/*").unwrap())
+            .collect();
         let r = classify_change(
             path,
-            collections,
+            &collections,
             excludes,
             Path::new("/project/.mdkb/memory/entries"),
         );
@@ -4124,7 +4223,7 @@ if (require.main === module) {
     #[test]
     fn memory_entry_files_route_to_reconciliation() {
         let entries = Path::new("/project/.mdkb/memory/entries");
-        let collections: Vec<PathBuf> = vec![];
+        let collections: Vec<WatchedCollection> = vec![];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
 
         let r = classify_change(
@@ -4165,7 +4264,7 @@ if (require.main === module) {
     #[test]
     fn watched_memory_entries_dir_follows_the_namespace() {
         let root = Path::new("/project");
-        let collections: Vec<PathBuf> = vec![];
+        let collections: Vec<WatchedCollection> = vec![];
         let excludes = build_code_excludes(root, &[]);
 
         assert_eq!(
@@ -4250,21 +4349,32 @@ if (require.main === module) {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::create_dir_all(&store).unwrap();
         let keep = routed_path_filter(
-            vec![root.clone()],
+            vec![WatchedCollection::new(root.clone(), "**/*.md").unwrap()],
             build_code_excludes(&root, &["**/target/**".to_string()]),
             store.join("memory/entries"),
+            true,
         );
-        let counts = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<String, usize>::new()));
+        let counts = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
+            String,
+            usize,
+        >::new()));
         let observed = counts.clone();
         let root_for_filter = root.clone();
         let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms: 20 }).unwrap();
         watcher.set_filter(move |path| {
-            let prefix = path.strip_prefix(&root_for_filter).unwrap_or(path)
-                .components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+            let prefix = path
+                .strip_prefix(&root_for_filter)
+                .unwrap_or(path)
+                .components()
+                .next()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .unwrap_or_default();
             if keep(path) {
                 *observed.lock().unwrap().entry(prefix).or_default() += 1;
                 true
-            } else { false }
+            } else {
+                false
+            }
         });
         watcher.watch(&root).unwrap();
         // A received real source edit establishes native registration, not a
@@ -4277,7 +4387,9 @@ if (require.main === module) {
                     () = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
         counts.lock().unwrap().clear();
         for i in 0..300 {
             std::fs::write(target.join(format!("{i}.o")), "object").unwrap();
@@ -4285,8 +4397,85 @@ if (require.main === module) {
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
         let counts = counts.lock().unwrap().clone();
-        assert!(!watcher.take_missed_events(), "ignored churn overflowed the 100-slot channel; admitted prefixes: {counts:?}");
-        assert!(counts.keys().all(|p| p != "target" && p != ".mdkb"), "self-generated/build events admitted: {counts:?}");
+        eprintln!("600 ignored writes: admitted prefixes {counts:?}");
+        assert!(
+            !watcher.take_missed_events(),
+            "ignored churn overflowed the 100-slot channel; admitted prefixes: {counts:?}"
+        );
+        assert!(
+            counts.keys().all(|p| p != "target" && p != ".mdkb"),
+            "self-generated/build events admitted: {counts:?}"
+        );
+    }
+
+    /// Catches: a root collection bypassing its nonrecursive glob, build
+    /// exclusions, or store isolation; disabled code must not fill the queue.
+    #[test]
+    fn root_collection_admission_matches_its_glob_and_exclusions() {
+        let root = Path::new("/project");
+        let excludes =
+            build_code_excludes(root, &["**/target/**".into(), "**/node_modules/**".into()]);
+        let keep = routed_path_filter(
+            vec![WatchedCollection::new(root.to_path_buf(), "*.md").unwrap()],
+            excludes,
+            root.join(".mdkb/memory/entries"),
+            false,
+        );
+        for (path, expected) in [
+            ("README.md", true),
+            ("docs/deep.md", false),
+            ("src/main.rs", false),
+            ("target/build.md", false),
+            ("node_modules/readme.md", false),
+            (".git/worktrees/a/HEAD", false),
+            (".mdkb/memory/archive/old.md", false),
+            (".mdkb/memory/entries/entry.md", true),
+            (".mdkb/memory/entries/nested/entry.md", false),
+        ] {
+            assert_eq!(keep(&root.join(path)), expected, "{path}");
+        }
+        let recursive = vec![WatchedCollection::new(root.to_path_buf(), "**/*.md").unwrap()];
+        let excludes = build_code_excludes(root, &["**/target/**".into()]);
+        for path in [
+            "target/readme.md",
+            ".mdkb/notes.md",
+            ".git/worktrees/readme.md",
+        ] {
+            assert!(
+                !classify_change(
+                    &root.join(path),
+                    &recursive,
+                    &excludes,
+                    &root.join(".mdkb/memory/entries")
+                )
+                .any(),
+                "{path}"
+            );
+        }
+    }
+
+    /// Catches: repeated events or a long burst growing pending storage
+    /// without bound instead of collapsing into one recoverable full pass.
+    #[test]
+    fn pending_paths_deduplicate_and_collapse_at_the_bound() {
+        let mut batch = Vec::new();
+        let mut rescan = false;
+        let mut memory = MemorySyncRequest::Idle;
+        for i in 0..2048 {
+            note_code_change(&mut batch, &mut rescan, PathBuf::from(format!("{i}.rs")));
+            memory.note(PathBuf::from(format!("{i}.md")));
+            assert!(batch.len() <= 1024);
+        }
+        assert!(rescan);
+        assert!(batch.is_empty());
+        assert!(matches!(memory, MemorySyncRequest::Full));
+        let mut batch = Vec::new();
+        let mut rescan = false;
+        for _ in 0..2048 {
+            note_code_change(&mut batch, &mut rescan, PathBuf::from("same.rs"));
+        }
+        assert_eq!(batch, vec![PathBuf::from("same.rs")]);
+        assert!(!rescan);
     }
 
     #[test]
@@ -4297,9 +4486,10 @@ if (require.main === module) {
         let root = Path::new("/project");
         let excludes = build_code_excludes(root, &["**/target/**".to_string()]);
         let keep = routed_path_filter(
-            vec![PathBuf::from("/project/docs")],
+            vec![WatchedCollection::new(PathBuf::from("/project/docs"), "**/*.md").unwrap()],
             excludes,
             PathBuf::from("/project/.mdkb/memory/entries"),
+            true,
         );
         assert!(!keep(Path::new("/project/target/debug/deps/foo.rs")));
         assert!(!keep(Path::new("/project/target/debug/foo.o")));
