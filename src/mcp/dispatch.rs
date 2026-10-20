@@ -16498,7 +16498,9 @@ mod tests {
             json!({"transcript_path": transcript_path.to_string_lossy(), "session_id": "s1"})
         };
         let dctx = make_collecting_dctx();
-        hook_stop_impl(Arc::clone(&handle), &event, &dctx);
+        dispatch_call("hook.stop", event, Arc::clone(&handle), &dctx)
+            .await
+            .expect("Stop dispatch");
         dctx.join_background().await;
 
         let (confirmed, refuted) = cluster_belief(&handle, &cluster_id).await;
@@ -16618,25 +16620,59 @@ mod tests {
         }
     }
 
-    /// Catches: off-by-one limits reject valid episodes or count characters
-    /// instead of bytes and admit over-limit UTF-8.
+    /// Catches: off-by-one limits reject valid evidence, truncation loses the
+    /// last failure, or character counting admits oversized UTF-8 input.
     #[tokio::test]
     async fn hook_stop_inline_accepts_exact_record_and_byte_limits() {
-        let record = r#"{"type":"user","message":{"content":""}}"#;
-        let bytes = format!("{record}{}", " ".repeat(262_144 - record.len()));
-        let records = vec![record; 800].join("\n");
-        for jsonl in [bytes, records, String::new()] {
-            let source = stop_episode_source(&json!({"episode_jsonl": jsonl}))
-                .unwrap()
-                .unwrap();
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"last-error","name":"Bash","input":{"command":"cargo build"}}]}}"#;
+        let failure = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"last-error","is_error":true,"content":"error[E0433]: failed to resolve"}]}}"#;
+        let empty = r#"{"type":"user","message":{"content":""}}"#;
+        let mut records = vec![tool];
+        records.extend(std::iter::repeat_n(empty, 798));
+        records.push(failure);
+        let exact_records = records.join("\n");
+        let too_many_records = format!("{empty}\n{exact_records}");
+
+        // Pad a real user message with multibyte text, leaving the decisive
+        // tool result as the final record at the exact byte boundary.
+        let unpadded = format!("{empty}\n{tool}\n{failure}");
+        let padding_bytes = 262_144 - unpadded.len();
+        let padding = format!(
+            "{}{}",
+            "é".repeat(padding_bytes / 2),
+            " ".repeat(padding_bytes % 2)
+        );
+        let prompt = json!({"type": "user", "message": {"content": padding}}).to_string();
+        let exact_bytes = format!("{prompt}\n{tool}\n{failure}");
+        assert_eq!(exact_bytes.len(), 262_144, "fixture byte boundary");
+        let too_many_bytes = format!("{prompt} \n{tool}\n{failure}");
+        assert_eq!(too_many_bytes.len(), 262_145, "fixture byte boundary");
+
+        for (name, episode, expected) in [
+            (
+                "800 records",
+                exact_records,
+                (0, 1, Some("refuted".to_string())),
+            ),
+            (
+                "262144 bytes",
+                exact_bytes,
+                (0, 1, Some("refuted".to_string())),
+            ),
+            ("801 records", too_many_records, (0, 0, None)),
+            ("262145 bytes", too_many_bytes, (0, 0, None)),
+            (
+                "empty episode",
+                String::new(),
+                (0, 0, Some("unrefuted".to_string())),
+            ),
+        ] {
             assert_eq!(
-                source.window().await.unwrap(),
-                jsonl,
-                "never truncate inline evidence"
+                inject_then_stop(&episode, true).await,
+                expected,
+                "{name}: accepted final-record failure must refute the prior; refused evidence must leave its injection open"
             );
         }
-        let multibyte = format!("{record}{}", "é".repeat(131_073));
-        assert!(stop_episode_source(&json!({"episode_jsonl": multibyte})).is_err());
     }
 
     /// A prior nobody was shown has nothing to answer for. Without this, every
