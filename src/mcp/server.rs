@@ -1505,6 +1505,30 @@ fn note_code_change(batch: &mut Vec<PathBuf>, rescan: &mut bool, path: PathBuf) 
     }
 }
 
+/// Accumulate a delivered change into the bounded per-repository requests.
+fn queue_watcher_change(
+    path: &Path,
+    routes: ChangeRoutes,
+    code_enabled: bool,
+    code_batch: &mut Vec<PathBuf>,
+    needs_rescan: &mut bool,
+    docs: &mut FileUpdateRequest,
+    memory: &mut FileUpdateRequest,
+) {
+    if code_enabled && routes.code {
+        note_code_change(code_batch, needs_rescan, path.to_path_buf());
+    }
+    if routes.doc {
+        docs.note(path.to_path_buf());
+        if matches!(docs, FileUpdateRequest::Full) {
+            *needs_rescan = true;
+        }
+    }
+    if routes.memory {
+        memory.note(path.to_path_buf());
+    }
+}
+
 /// How long the watcher waits for context initialization before giving up.
 const CTX_WAIT_SECS: u64 = 60;
 
@@ -1820,15 +1844,7 @@ pub async fn run_file_watcher_inner(
                 needs_rescan |= watcher.take_missed_events();
                 tracing::debug!("File change detected: {:?}", change.path);
                 let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir, Some((&root, respect_gitignore)));
-                if code_enabled && routes.code { note_code_change(&mut code_batch, &mut needs_rescan, change.path.clone()); }
-                if routes.doc {
-                    needs_doc_update.note(change.path.clone());
-                    if matches!(needs_doc_update, FileUpdateRequest::Full) { needs_rescan = true; }
-                }
-                if routes.memory { needs_memory_sync.note(change.path.clone()); }
-                if !routes.any() {
-                    tracing::debug!("Ignoring unrouted change: {:?}", change.path);
-                }
+                queue_watcher_change(&change.path, routes, code_enabled, &mut code_batch, &mut needs_rescan, &mut needs_doc_update, &mut needs_memory_sync);
             }
             path = recv_injected!() => {
                 if let Some(p) = path {
@@ -4554,129 +4570,278 @@ if (require.main === module) {
         }
     }
 
-    /// Catches: a root collection bypassing its nonrecursive glob, build
-    /// exclusions, or store isolation; disabled code must not fill the queue.
-    #[test]
-    fn root_collection_admission_matches_its_glob_and_exclusions() {
-        let root = Path::new("/project");
-        let excludes =
-            build_code_excludes(root, &["**/target/**".into(), "**/node_modules/**".into()]);
-        let keep = routed_path_filter(
-            vec![WatchedCollection::new(root.to_path_buf(), "*.md").unwrap()],
-            excludes,
-            root.join(".mdkb/memory/entries"),
-            false,
-            None,
-        );
-        for (path, expected) in [
-            ("README.md", true),
-            ("docs/deep.md", false),
-            ("src/main.rs", false),
-            ("target/build.md", false),
-            ("node_modules/readme.md", false),
-            (".git/worktrees/a/HEAD", false),
-            (".mdkb/memory/archive/old.md", false),
-            (".mdkb/memory/entries/entry.md", true),
-            (".mdkb/memory/entries/nested/entry.md", false),
-        ] {
-            assert_eq!(keep(&root.join(path)), expected, "{path}");
+    // Exercises callback admission, bounded delivery, production accumulation and
+    // document flush together; assertions below inspect persisted membership.
+    struct DocumentDelivery {
+        root: PathBuf,
+        ctx: Arc<Mutex<Option<Context>>>,
+        collections: Vec<WatchedCollection>,
+        excludes: globset::GlobSet,
+        watcher: FileWatcher,
+    }
+
+    impl DocumentDelivery {
+        fn new(root: &Path, pattern: &str, respect_gitignore: bool) -> Self {
+            let ctx = Context::init(root).unwrap();
+            let mut config = crate::Config::load_or_default(&ctx.config_path);
+            config.indexing.respect_gitignore = respect_gitignore;
+            config.save(&ctx.config_path).unwrap();
+            collections::add_collection(
+                &ctx.conn,
+                &crate::domain::Collection {
+                    name: "docs".into(),
+                    path: ".".into(),
+                    pattern: pattern.into(),
+                    source: "manual".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+            let mut collection = WatchedCollection::new(root.to_path_buf(), pattern).unwrap();
+            collection.respect_gitignore = respect_gitignore;
+            let collections = vec![collection];
+            let excludes =
+                build_code_excludes(root, &["**/target/**".into(), "**/node_modules/**".into()]);
+            let watcher = FileWatcher::new(WatcherConfig { debounce_ms: 20 }).unwrap();
+            watcher.set_filter(routed_path_filter(
+                collections.clone(),
+                excludes.clone(),
+                root.join(".mdkb/memory/entries"),
+                false,
+                None,
+            ));
+            Self {
+                root: root.to_path_buf(),
+                ctx: Arc::new(Mutex::new(Some(ctx))),
+                collections,
+                excludes,
+                watcher,
+            }
         }
-        let recursive = vec![WatchedCollection::new(root.to_path_buf(), "**/*.md").unwrap()];
-        let excludes = build_code_excludes(root, &["**/target/**".into()]);
-        for path in [
-            "target/readme.md",
-            ".mdkb/notes.md",
-            ".git/worktrees/readme.md",
-        ] {
+
+        async fn apply(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+            let mut docs = FileUpdateRequest::Idle;
+            let mut memory = FileUpdateRequest::Idle;
+            let mut code = Vec::new();
+            let mut full = false;
+            for path in paths {
+                self.watcher.deliver_for_test(path);
+                for change in self.watcher.drain_for_test() {
+                    let routes = classify_change(
+                        &change.path,
+                        &self.collections,
+                        &self.excludes,
+                        &self.root.join(".mdkb/memory/entries"),
+                        None,
+                    );
+                    queue_watcher_change(
+                        &change.path,
+                        routes,
+                        false,
+                        &mut code,
+                        &mut full,
+                        &mut docs,
+                        &mut memory,
+                    );
+                }
+            }
+            if full || self.watcher.take_missed_events() {
+                docs = FileUpdateRequest::Full;
+            }
+            flush_doc_update(&self.ctx, &self.root, &mut docs, &mut memory).await;
+        }
+
+        async fn contains(&self, path: &str) -> bool {
+            crate::store::documents::get_document_by_path(
+                &self.ctx.lock().await.as_ref().unwrap().conn,
+                "docs",
+                path,
+            )
+            .unwrap()
+            .is_some()
+        }
+    }
+
+    /// Catches F1: directory-only renames/deletions leaving descendants searchable.
+    #[tokio::test]
+    async fn directory_only_notifications_reconcile_descendant_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("old/sub")).unwrap();
+        std::fs::write(root.join("old/sub/note.md"), "# Note").unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        delivery.apply([root.join("old/sub/note.md")]).await;
+        assert!(delivery.contains("old/sub/note.md").await);
+        std::fs::rename(root.join("old"), root.join("new")).unwrap();
+        delivery.apply([root.join("old"), root.join("new")]).await;
+        assert!(
+            !delivery.contains("old/sub/note.md").await,
+            "directory-only rename left old descendant searchable"
+        );
+        assert!(delivery.contains("new/sub/note.md").await);
+        std::fs::remove_dir_all(root.join("new")).unwrap();
+        delivery.apply([root.join("new")]).await;
+        assert!(!delivery.contains("new/sub/note.md").await);
+    }
+
+    /// Catches F3: policy-only changes never removing or discovering documents.
+    #[tokio::test]
+    async fn ignore_policy_notifications_reconcile_untouched_documents() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::write(root.join("note.md"), "# Note").unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        delivery.apply([root.join("note.md")]).await;
+        assert!(delivery.contains("note.md").await);
+        std::fs::write(root.join(".mdkbignore"), "note.md\n").unwrap();
+        delivery.apply([root.join(".mdkbignore")]).await;
+        assert!(
+            !delivery.contains("note.md").await,
+            "policy edit left ignored document searchable"
+        );
+        std::fs::remove_file(root.join(".mdkbignore")).unwrap();
+        delivery.apply([root.join(".mdkbignore")]).await;
+        assert!(delivery.contains("note.md").await);
+    }
+
+    /// Catches F2: a child whitelist reopening a directory the walker prunes.
+    #[tokio::test]
+    async fn pruned_parent_cannot_deliver_a_child_whitelist_document() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".mdkbignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("ignored/.mdkbignore"), "!note.md\n").unwrap();
+        std::fs::write(root.join("ignored/note.md"), "# Note").unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        delivery.apply([root.join("ignored/note.md")]).await;
+        assert!(
+            !delivery.contains("ignored/note.md").await,
+            "child whitelist bypassed parent pruning"
+        );
+    }
+
+    /// Catches F2: ancestor custom ignores omitted by the per-path matcher.
+    #[tokio::test]
+    async fn ancestor_ignore_prevents_document_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let ancestor = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let root = ancestor.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(ancestor.join(".mdkbignore"), "repo/note.md\n").unwrap();
+        std::fs::write(root.join("note.md"), "# Note").unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        delivery.apply([root.join("note.md")]).await;
+        assert!(
+            !delivery.contains("note.md").await,
+            "ancestor ignore was not applied"
+        );
+    }
+
+    /// Catches F2: .git as a worktree pointer hiding common info/exclude rules.
+    #[tokio::test]
+    async fn worktree_common_exclude_prevents_document_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let main = base.join("main");
+        let root = base.join("worktree");
+        let run = |args: &[&std::ffi::OsStr]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
-                !classify_change(
-                    &root.join(path),
-                    &recursive,
-                    &excludes,
-                    &root.join(".mdkb/memory/entries"),
-                    None,
-                )
-                .any(),
-                "{path}"
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
             );
-        }
+        };
+        run(&["init".as_ref(), main.as_os_str()]);
+        run(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "-c".as_ref(),
+            "user.name=Fixture".as_ref(),
+            "-c".as_ref(),
+            "user.email=fixture@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--allow-empty".as_ref(),
+            "-m".as_ref(),
+            "fixture".as_ref(),
+        ]);
+        run(&[
+            "-C".as_ref(),
+            main.as_os_str(),
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "-b".as_ref(),
+            "fixture".as_ref(),
+            root.as_os_str(),
+        ]);
+        std::fs::write(main.join(".git/info/exclude"), "note.md\n").unwrap();
+        std::fs::write(root.join("note.md"), "# Note").unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", true);
+        delivery.apply([root.join("note.md")]).await;
+        assert!(
+            !delivery.contains("note.md").await,
+            "common Git exclude was not applied"
+        );
     }
 
-    /// Catches: the targeted watcher treating an ignored document as an
-    /// explicit CLI override and indexing it despite walker exclusions.
-    #[test]
-    fn watcher_document_admission_respects_ignore_files_and_nested_stores() {
+    /// Catches: glob/build/hidden/nested-store rejection lost before indexing.
+    #[tokio::test]
+    async fn delivered_document_membership_respects_glob_and_boundaries() {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
-        std::fs::create_dir_all(root.join("docs/nested/.mdkb")).unwrap();
-        std::fs::write(root.join(".mdkbignore"), "docs/ignored.md\n").unwrap();
-        std::fs::write(root.join("docs/.mdkbignore"), "local.md\n").unwrap();
-        std::fs::write(root.join("docs/nested/.mdkb/index.sqlite"), "initialized").unwrap();
-        let mut collection = WatchedCollection::new(root.join("docs"), "**/*.md").unwrap();
-        collection.ignore_root = root.clone();
-        let keep = routed_path_filter(
-            vec![collection],
-            build_code_excludes(&root, &[]),
-            root.join(".mdkb/memory/entries"),
-            false,
-            None,
-        );
-        for (path, expected) in [
-            ("docs/keep.md", true),
-            ("docs/ignored.md", false),
-            ("docs/local.md", false),
-            ("docs/.hidden.md", false),
-            ("docs/nested/child.md", false),
-        ] {
-            assert_eq!(keep(&root.join(path)), expected, "{path}");
+        for dir in ["docs", "target", "nested/.mdkb"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join("nested/.mdkb/index.sqlite"), "initialized").unwrap();
+        let paths = [
+            "keep.md",
+            "docs/deep.md",
+            "target/build.md",
+            ".hidden.md",
+            "nested/note.md",
+        ];
+        for path in paths {
+            std::fs::write(root.join(path), "# Note").unwrap();
+        }
+        let mut delivery = DocumentDelivery::new(&root, "*.md", false);
+        delivery.apply(paths.map(|p| root.join(p))).await;
+        assert!(delivery.contains("keep.md").await);
+        for path in &paths[1..] {
+            assert!(!delivery.contains(path).await, "{path}");
         }
     }
 
-    /// Catches: gitignored source files reaching the channel despite code
-    /// indexing opting into gitignore, or a force-included source being lost.
-    #[test]
-    fn watcher_code_admission_respects_gitignore_and_force_include() {
+    /// Catches: a long unique-path burst losing work instead of recovering,
+    /// or duplicates turning a targeted edit into an unrelated whole-tree scan.
+    #[tokio::test]
+    async fn delivered_bursts_recover_membership_and_duplicates_stay_targeted() {
         let temp = tempfile::tempdir().unwrap();
         let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
-        std::fs::write(
-            root.join(".gitignore"),
-            "ignored.rs\n# mdkb:index\nforced.rs\n",
-        )
-        .unwrap();
-        let keep = routed_path_filter(
-            vec![],
-            build_code_excludes(&root, &[]),
-            root.join(".mdkb/memory/entries"),
-            true,
-            Some((root.clone(), true)),
-        );
-        assert!(!keep(&root.join("ignored.rs")));
-        assert!(keep(&root.join("forced.rs")));
-        assert!(keep(&root.join("ordinary.rs")));
-    }
-
-    /// Catches: repeated events or a long burst growing pending storage
-    /// without bound instead of collapsing into one recoverable full pass.
-    #[test]
-    fn pending_paths_deduplicate_and_collapse_at_the_bound() {
-        let mut batch = Vec::new();
-        let mut rescan = false;
-        let mut memory = FileUpdateRequest::Idle;
-        for i in 0..2048 {
-            note_code_change(&mut batch, &mut rescan, PathBuf::from(format!("{i}.rs")));
-            memory.note(PathBuf::from(format!("{i}.md")));
-            assert!(batch.len() <= 1024);
-        }
-        assert!(rescan);
-        assert!(batch.is_empty());
-        assert!(matches!(memory, FileUpdateRequest::Full));
-        let mut batch = Vec::new();
-        let mut rescan = false;
-        for _ in 0..2048 {
-            note_code_change(&mut batch, &mut rescan, PathBuf::from("same.rs"));
-        }
-        assert_eq!(batch, vec![PathBuf::from("same.rs")]);
-        assert!(!rescan);
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        std::fs::write(root.join("same.md"), "# Same").unwrap();
+        std::fs::write(root.join("unrelated.md"), "# Unrelated").unwrap();
+        delivery
+            .apply((0..2048).map(|_| root.join("same.md")))
+            .await;
+        assert!(delivery.contains("same.md").await);
+        assert!(!delivery.contains("unrelated.md").await);
+        // Missing file paths are legitimate deletion notifications. The final
+        // existing document stands for a changed path beyond the retained cap.
+        std::fs::write(root.join("last.md"), "# Last").unwrap();
+        delivery
+            .apply(
+                (0..2048)
+                    .map(|i| root.join(format!("{i}.md")))
+                    .chain([root.join("last.md")]),
+            )
+            .await;
+        assert!(delivery.contains("last.md").await);
+        assert!(delivery.contains("unrelated.md").await);
     }
 
     #[test]
