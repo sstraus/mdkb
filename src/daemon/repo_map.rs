@@ -16,11 +16,11 @@
 //! root another process has just recorded. That loss costs one re-record on the
 //! next `get_or_open` of the root, which is why no cross-process lock is taken.
 
+use ignore::WalkBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use walkdir::WalkDir;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,25 +112,92 @@ pub fn classify(root: &Path) -> RootHealth {
 /// copies of repos (coverage and mutation runs), which are not repos.
 const SKIPPED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".mdkb", ".tmp"];
 
+/// Generated trees and managed worktree copies are not discovery candidates.
+/// Explicit known roots beneath them are still walked independently.
+fn is_generated_dir(name: &str) -> bool {
+    matches!(name, "build" | "dist" | "coverage" | "__pycache__") || name.ends_with("__wt")
+}
+
 /// Is `path` at or below one of the `ignore` paths?
 pub fn is_ignored(path: &Path, ignore: &[PathBuf]) -> bool {
     ignore.iter().any(|ignored| path.starts_with(ignored))
 }
 
+#[cfg(test)]
+pub(super) static TEST_VISITS: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Normalize walk coverage, not repository identity: an explicit worktree is
+/// still a directory to explore, even when its store belongs to the main repo.
+pub(super) fn covered_walk_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let sorted: BTreeSet<_> = roots
+        .iter()
+        .map(|root| crate::domain::canonicalize_plain(root).unwrap_or_else(|_| root.clone()))
+        .collect();
+    let mut covered: Vec<PathBuf> = Vec::new();
+    for root in sorted {
+        let already_covered = covered.iter().any(|ancestor| {
+            root.strip_prefix(ancestor).is_ok_and(|relative| {
+                // An explicitly requested root below a pruned directory is not
+                // reached by the ancestor's walk; retain that separate walk.
+                !relative.components().any(|part| {
+                    let name = part.as_os_str().to_string_lossy();
+                    SKIPPED_DIRS.contains(&name.as_ref()) || is_generated_dir(&name)
+                }) && !root
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|path| path.starts_with(ancestor))
+                    .any(|path| {
+                        // An explicit known root may live below an ignore rule.
+                        // Without evaluating the rule here, conservatively keep
+                        // its independent walk. The hot-path check is metadata
+                        // only, not a second traversal or a Git subprocess.
+                        path.join(".gitignore").is_file() || path.join(".ignore").is_file()
+                    })
+            })
+        });
+        if !already_covered {
+            covered.push(root);
+        }
+    }
+    covered
+}
+
 /// Find stores below roots the daemon already knows, without opening or
 /// registering them. A store is identified by its SQLite file; walking stops
 /// at `.mdkb` so index internals are never traversed, and at every directory
-/// in [`SKIPPED_DIRS`] or under an `ignore` path.
+/// in [`SKIPPED_DIRS`], generated/worktree trees, local ignore rules, or an
+/// explicit `ignore` path. Explicit walk roots do not inherit parent ignore
+/// files: a registered store remains reachable even below an excluded tree.
 pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
-    for root in roots {
-        let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !SKIPPED_DIRS.contains(&name.as_ref()) && !is_ignored(entry.path(), ignore)
-        });
-        for entry in walker.filter_map(Result::ok) {
-            if !entry.file_type().is_dir() {
+    for root in covered_walk_roots(roots) {
+        let ignored = ignore.to_vec();
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(false)
+            .parents(false)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(move |entry| {
+                let name = entry.file_name().to_string_lossy();
+                !SKIPPED_DIRS.contains(&name.as_ref())
+                    && (entry.depth() == 0 || !is_generated_dir(&name))
+                    && !is_ignored(entry.path(), &ignored)
+            });
+        for entry in builder.build().filter_map(Result::ok) {
+            if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 continue;
+            }
+            #[cfg(test)]
+            {
+                *TEST_VISITS
+                    .lock()
+                    .unwrap()
+                    .entry(entry.path().to_path_buf())
+                    .or_default() += 1;
             }
             let candidate = entry.path().join(".mdkb/index.sqlite");
             if candidate.is_file() {
@@ -995,6 +1062,79 @@ mod tests {
         std::fs::create_dir_all(at.join(".mdkb")).unwrap();
         std::fs::write(at.join(".mdkb/index.sqlite"), b"").unwrap();
         canonical_key(at)
+    }
+
+    /// Catches whole generated/worktree subtrees being enumerated per miss.
+    #[test]
+    fn discovery_io_prunes_generated_and_worktree_subtrees() {
+        let tmp = TempDir::new().unwrap();
+        let root = plant_store(&tmp.path().join("workspace"));
+        let nested = plant_store(&root.join("work/people/hr"));
+        std::fs::write(root.join(".gitignore"), "/generated/\n").unwrap();
+        for output in ["generated", "coverage", "plugins__wt", "build", "dist"] {
+            for i in 0..100 {
+                std::fs::create_dir_all(root.join(output).join(format!("copy{i}/src/deep")))
+                    .unwrap();
+            }
+            plant_store(&root.join(output).join("copied-store"));
+        }
+        let found = discover_nested_stores(std::slice::from_ref(&root), &[]);
+        let visits: usize = TEST_VISITS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(&root))
+            .map(|(_, visits)| visits)
+            .sum();
+        assert_eq!(
+            visits, 4,
+            "only workspace/work/people/hr, not 1500 generated directories"
+        );
+        assert_eq!(found, BTreeSet::from([root, nested]));
+    }
+
+    /// Catches a known root beneath an excluded ancestor losing its own nested
+    /// stores after coverage normalization; explicit roots override walk pruning.
+    #[test]
+    fn discovery_io_explicit_roots_below_pruned_trees_keep_nested_stores() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(&tmp.path().join("parent"));
+        std::fs::write(parent.join(".gitignore"), "/generated/\n").unwrap();
+        std::fs::write(parent.join(".ignore"), "/private/\n").unwrap();
+        for path in [
+            "generated/repo",
+            "private/repo",
+            "plugins__wt/repo",
+            "coverage/repo",
+        ] {
+            let root = plant_store(&parent.join(path));
+            let nested = plant_store(&root.join("nested"));
+            let found = discover_nested_stores(&[parent.clone(), root.clone()], &[]);
+            assert!(found.contains(&root), "explicit {root:?}");
+            assert!(found.contains(&nested), "nested {nested:?}");
+            assert!(!discover_nested_stores(std::slice::from_ref(&parent), &[]).contains(&nested));
+        }
+    }
+
+    /// Catches globally hiding dot-directories or similarly named normal repos,
+    /// and ignoring local .ignore rules when no .git directory exists.
+    #[test]
+    fn discovery_io_local_rules_do_not_hide_visible_sibling_stores() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let expected: BTreeSet<_> = [
+            ".archive",
+            "coverage-tools",
+            "build-tools",
+            "plugins__wt-extra",
+            "deep/inner",
+        ]
+        .iter()
+        .map(|name| plant_store(&parent.join(name)))
+        .collect();
+        std::fs::write(parent.join(".ignore"), "/local-output/\n").unwrap();
+        plant_store(&parent.join("local-output/copy"));
+        assert_eq!(discover_nested_stores(&[parent], &[]), expected);
     }
 
     /// Catches: temporary copies of a repo (`.tmp/cov-audit/plugins`) listed as
