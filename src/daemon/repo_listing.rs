@@ -138,7 +138,15 @@ fn unreadable(row: &mut RepoRow, why: String) {
     row.detail = Some(why);
 }
 
+#[cfg(test)]
+static TEST_OPENS: std::sync::LazyLock<Mutex<std::collections::BTreeMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
 fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
+    #[cfg(test)]
+    {
+        *TEST_OPENS.lock().unwrap().entry(path.to_path_buf()).or_default() += 1;
+    }
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -251,4 +259,25 @@ pub fn render_text(rows: &[RepoRow]) -> String {
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches reopening an unchanged SQLite store on every listing request.
+    #[test]
+    fn discovery_io_listing_reuses_unchanged_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let db = root.join(".mdkb/index.sqlite");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE schema_version (version INTEGER); INSERT INTO schema_version VALUES (1);
+                            CREATE TABLE documents (indexed_at INTEGER); INSERT INTO documents VALUES (1);").unwrap();
+        drop(conn);
+        assert_eq!(list_repos(std::slice::from_ref(&root))[0].docs, Some(1));
+        assert_eq!(list_repos(std::slice::from_ref(&root))[0].docs, Some(1));
+        assert_eq!(TEST_OPENS.lock().unwrap().get(&db), Some(&1));
+    }
 }

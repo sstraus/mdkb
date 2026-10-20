@@ -986,6 +986,59 @@ mod tests {
         assert!(!seen_beta.contains(&in_alpha), "no cross-workspace leak");
     }
 
+    /// Catches overlapping known roots traversing a nested store twice.
+    #[test]
+    fn discovery_io_nested_known_roots_walk_once() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(tmp.path().join("parent"));
+        let child = plant_store(parent.join("child"));
+        let inner = plant_store(child.join("inner"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.repo_map.record(&parent);
+        registry.repo_map.record(&child);
+        assert_eq!(registry.discoverable_roots(), vec![parent, child.clone(), inner]);
+        let visits = super::super::repo_map::TEST_VISITS.lock().unwrap().get(&child).copied();
+        assert_eq!(visits, Some(1));
+    }
+
+    /// Catches the one-slot cache being evicted by another workspace.
+    #[test]
+    fn discovery_io_alternating_workspaces_reuse_both_walks() {
+        let tmp = TempDir::new().unwrap();
+        let a = plant_store(tmp.path().join("a"));
+        let b = plant_store(tmp.path().join("b"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        let first = registry.discoverable_roots_under(std::slice::from_ref(&a));
+        registry.discoverable_roots_under(&[b]);
+        plant_store(a.join("later"));
+        assert_eq!(registry.discoverable_roots_under(&[a]), first);
+    }
+
+    /// Catches concurrent identical cache misses each traversing the tree.
+    #[test]
+    fn discovery_io_concurrent_misses_share_one_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = plant_store(tmp.path().join("root"));
+        for i in 0..100 {
+            std::fs::create_dir_all(root.join(format!("dir{i}/inner"))).unwrap();
+        }
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        let barrier = std::sync::Barrier::new(16);
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                let root = &root;
+                let registry = &registry;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    assert_eq!(registry.discoverable_roots_under(std::slice::from_ref(root)), vec![root.clone()]);
+                });
+            }
+        });
+        let visits = super::super::repo_map::TEST_VISITS.lock().unwrap().get(&root).copied();
+        assert_eq!(visits, Some(1));
+    }
+
     #[test]
     fn test_repo_handle_open() {
         let tmp = TempDir::new().unwrap();

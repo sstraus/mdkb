@@ -117,6 +117,10 @@ pub fn is_ignored(path: &Path, ignore: &[PathBuf]) -> bool {
     ignore.iter().any(|ignored| path.starts_with(ignored))
 }
 
+#[cfg(test)]
+pub(super) static TEST_VISITS: std::sync::LazyLock<Mutex<BTreeMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
 /// Find stores below roots the daemon already knows, without opening or
 /// registering them. A store is identified by its SQLite file; walking stops
 /// at `.mdkb` so index internals are never traversed, and at every directory
@@ -131,6 +135,10 @@ pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet
         for entry in walker.filter_map(Result::ok) {
             if !entry.file_type().is_dir() {
                 continue;
+            }
+            #[cfg(test)]
+            {
+                *TEST_VISITS.lock().unwrap().entry(entry.path().to_path_buf()).or_default() += 1;
             }
             let candidate = entry.path().join(".mdkb/index.sqlite");
             if candidate.is_file() {
