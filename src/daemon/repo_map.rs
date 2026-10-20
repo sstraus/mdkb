@@ -16,11 +16,11 @@
 //! root another process has just recorded. That loss costs one re-record on the
 //! next `get_or_open` of the root, which is why no cross-process lock is taken.
 
+use ignore::WalkBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use walkdir::WalkDir;
 
 use serde::{Deserialize, Serialize};
 
@@ -112,6 +112,12 @@ pub fn classify(root: &Path) -> RootHealth {
 /// copies of repos (coverage and mutation runs), which are not repos.
 const SKIPPED_DIRS: [&str; 5] = [".git", "target", "node_modules", ".mdkb", ".tmp"];
 
+/// Generated trees and managed worktree copies are not discovery candidates.
+/// Explicit known roots beneath them are still walked independently.
+fn is_generated_dir(name: &str) -> bool {
+    matches!(name, "build" | "dist" | "coverage" | "__pycache__") || name.ends_with("__wt")
+}
+
 /// Is `path` at or below one of the `ignore` paths?
 pub fn is_ignored(path: &Path, ignore: &[PathBuf]) -> bool {
     ignore.iter().any(|ignored| path.starts_with(ignored))
@@ -134,9 +140,20 @@ pub(super) fn covered_walk_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
             root.strip_prefix(ancestor).is_ok_and(|relative| {
                 // An explicitly requested root below a pruned directory is not
                 // reached by the ancestor's walk; retain that separate walk.
-                !relative
-                    .components()
-                    .any(|part| SKIPPED_DIRS.iter().any(|name| part.as_os_str() == *name))
+                !relative.components().any(|part| {
+                    let name = part.as_os_str().to_string_lossy();
+                    SKIPPED_DIRS.contains(&name.as_ref()) || is_generated_dir(&name)
+                }) && !root
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|path| path.starts_with(ancestor))
+                    .any(|path| {
+                        // An explicit known root may live below an ignore rule.
+                        // Without evaluating the rule here, conservatively keep
+                        // its independent walk. The hot-path check is metadata
+                        // only, not a second traversal or a Git subprocess.
+                        path.join(".gitignore").is_file() || path.join(".ignore").is_file()
+                    })
             })
         });
         if !already_covered {
@@ -149,16 +166,29 @@ pub(super) fn covered_walk_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// Find stores below roots the daemon already knows, without opening or
 /// registering them. A store is identified by its SQLite file; walking stops
 /// at `.mdkb` so index internals are never traversed, and at every directory
-/// in [`SKIPPED_DIRS`] or under an `ignore` path.
+/// in [`SKIPPED_DIRS`], generated/worktree trees, local ignore rules, or an
+/// explicit `ignore` path. Explicit walk roots do not inherit parent ignore
+/// files: a registered store remains reachable even below an excluded tree.
 pub fn discover_nested_stores(roots: &[PathBuf], ignore: &[PathBuf]) -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
     for root in covered_walk_roots(roots) {
-        let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !SKIPPED_DIRS.contains(&name.as_ref()) && !is_ignored(entry.path(), ignore)
-        });
-        for entry in walker.filter_map(Result::ok) {
-            if !entry.file_type().is_dir() {
+        let ignored = ignore.to_vec();
+        let mut builder = WalkBuilder::new(root);
+        builder
+            .hidden(false)
+            .parents(false)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(move |entry| {
+                let name = entry.file_name().to_string_lossy();
+                !SKIPPED_DIRS.contains(&name.as_ref())
+                    && (entry.depth() == 0 || !is_generated_dir(&name))
+                    && !is_ignored(entry.path(), &ignored)
+            });
+        for entry in builder.build().filter_map(Result::ok) {
+            if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
                 continue;
             }
             #[cfg(test)]
@@ -1061,6 +1091,50 @@ mod tests {
             "only workspace/work/people/hr, not 1500 generated directories"
         );
         assert_eq!(found, BTreeSet::from([root, nested]));
+    }
+
+    /// Catches a known root beneath an excluded ancestor losing its own nested
+    /// stores after coverage normalization; explicit roots override walk pruning.
+    #[test]
+    fn discovery_io_explicit_roots_below_pruned_trees_keep_nested_stores() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(&tmp.path().join("parent"));
+        std::fs::write(parent.join(".gitignore"), "/generated/\n").unwrap();
+        std::fs::write(parent.join(".ignore"), "/private/\n").unwrap();
+        for path in [
+            "generated/repo",
+            "private/repo",
+            "plugins__wt/repo",
+            "coverage/repo",
+        ] {
+            let root = plant_store(&parent.join(path));
+            let nested = plant_store(&root.join("nested"));
+            let found = discover_nested_stores(&[parent.clone(), root.clone()], &[]);
+            assert!(found.contains(&root), "explicit {root:?}");
+            assert!(found.contains(&nested), "nested {nested:?}");
+            assert!(!discover_nested_stores(std::slice::from_ref(&parent), &[]).contains(&nested));
+        }
+    }
+
+    /// Catches globally hiding dot-directories or similarly named normal repos,
+    /// and ignoring local .ignore rules when no .git directory exists.
+    #[test]
+    fn discovery_io_local_rules_do_not_hide_visible_sibling_stores() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let expected: BTreeSet<_> = [
+            ".archive",
+            "coverage-tools",
+            "build-tools",
+            "plugins__wt-extra",
+            "deep/inner",
+        ]
+        .iter()
+        .map(|name| plant_store(&parent.join(name)))
+        .collect();
+        std::fs::write(parent.join(".ignore"), "/local-output/\n").unwrap();
+        plant_store(&parent.join("local-output/copy"));
+        assert_eq!(discover_nested_stores(&[parent], &[]), expected);
     }
 
     /// Catches: temporary copies of a repo (`.tmp/cov-audit/plugins`) listed as
