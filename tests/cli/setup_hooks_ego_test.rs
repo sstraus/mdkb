@@ -131,6 +131,39 @@ fn dry_run_writes_nothing() {
     assert!(!config_path(&home).exists());
 }
 
+/// Catches: running setup from a build registers an ephemeral binary instead of the installed one.
+#[test]
+fn setup_from_build_registers_installed_binary_not_build_artifact() {
+    let root = tempfile::tempdir().unwrap();
+    let installed_dir = root.path().join("installed");
+    fs::create_dir(&installed_dir).unwrap();
+    let installed = installed_dir.join(if cfg!(windows) { "mdkb.exe" } else { "mdkb" });
+    // Use the real executable, not a mock command, as the installed PATH entry.
+    fs::copy(env!("CARGO_BIN_EXE_mdkb"), &installed).unwrap();
+    let mut paths = vec![installed_dir];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let home = root.path().join("ego");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args(["setup", "hooks", "ego"])
+        .env("EGO_HOME", &home)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env_remove("MDKB_BINARY_OVERRIDE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        key_value(&home.join("config.toml")),
+        Some(installed.to_string_lossy().into_owned()),
+        "setup must register the installed PATH binary, not the current build artifact"
+    );
+}
+
 /// Catches: unparsable user config is overwritten instead of reported.
 #[test]
 fn unparsable_config_is_an_error_and_left_alone() {
