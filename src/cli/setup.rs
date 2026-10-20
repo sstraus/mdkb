@@ -376,7 +376,7 @@ pub fn handle_setup_mcp_claude(
 /// Tries in order:
 /// 1. Current executable path (if running from cargo or installed binary)
 /// 2. PATH lookup
-fn find_mdkb_binary() -> Result<String> {
+pub(super) fn find_mdkb_binary() -> Result<String> {
     #[cfg(any(debug_assertions, test))]
     if let Some(override_path) = env::var_os("MDKB_BINARY_OVERRIDE") {
         let s = override_path.to_string_lossy().to_string();

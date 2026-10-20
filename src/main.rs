@@ -1667,6 +1667,29 @@ root=\"scope:home\"                                       # the known repos whos
                         println!("Opt out per-directory with .mdkbignore-hooks");
                     }
                 }
+                SetupHooksCommand::Ego { force, dry_run } => {
+                    use mdkb::cli::setup_ego::{EgoSetupOutcome, handle_setup_hooks_ego};
+                    let result = handle_setup_hooks_ego(force, dry_run)?;
+                    if result.dry_run {
+                        println!("{}", result.merged_toml);
+                    } else {
+                        match &result.outcome {
+                            EgoSetupOutcome::Written => println!(
+                                "Registered mdkb_prompt_command = {} in {}",
+                                result.binary_path,
+                                result.config_path.display()
+                            ),
+                            EgoSetupOutcome::Unchanged => println!(
+                                "Already registered in {}",
+                                result.config_path.display()
+                            ),
+                            EgoSetupOutcome::KeptExisting(existing) => println!(
+                                "Kept existing mdkb_prompt_command = {existing} in {}; use --force to replace it",
+                                result.config_path.display()
+                            ),
+                        }
+                    }
+                }
                 SetupHooksCommand::Codex { disable, dry_run } => {
                     let result = mdkb::cli::setup::handle_setup_hooks_codex(&disable, dry_run)?;
                     if !result.dry_run {

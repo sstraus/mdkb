@@ -1268,6 +1268,17 @@ pub enum SetupHooksCommand {
         http_url: Option<String>,
     },
 
+    /// Register mdkb as ego's prompt-context source (writes ~/.ego/config.toml)
+    Ego {
+        /// Replace an existing, different `mdkb_prompt_command` value
+        #[arg(long)]
+        force: bool,
+
+        /// Print the merged config.toml to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)
     Codex {
         /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use, pre-tool-use, stop)
