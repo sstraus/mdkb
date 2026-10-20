@@ -4238,6 +4238,57 @@ if (require.main === module) {
         assert_eq!(code_doc(path, &collections, &excludes), (true, false));
     }
 
+    /// Catches: a root document collection admitting build and store writes,
+    /// overflowing its own channel and scheduling recovery again after every scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn root_collection_churn_does_not_overflow_or_feed_recovery() {
+        use std::time::Duration;
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let target = root.join("target/debug");
+        let store = root.join(".mdkb");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&store).unwrap();
+        let keep = routed_path_filter(
+            vec![root.clone()],
+            build_code_excludes(&root, &["**/target/**".to_string()]),
+            store.join("memory/entries"),
+        );
+        let counts = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<String, usize>::new()));
+        let observed = counts.clone();
+        let root_for_filter = root.clone();
+        let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms: 20 }).unwrap();
+        watcher.set_filter(move |path| {
+            let prefix = path.strip_prefix(&root_for_filter).unwrap_or(path)
+                .components().next().map(|c| c.as_os_str().to_string_lossy().into_owned()).unwrap_or_default();
+            if keep(path) {
+                *observed.lock().unwrap().entry(prefix).or_default() += 1;
+                true
+            } else { false }
+        });
+        watcher.watch(&root).unwrap();
+        // A received real source edit establishes native registration, not a
+        // guessed startup delay. All later events belong to this one repository.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                std::fs::write(root.join("ready.rs"), "fn ready() {}\n").unwrap();
+                tokio::select! {
+                    change = watcher.recv() => { change.unwrap(); break; }
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        }).await.unwrap();
+        counts.lock().unwrap().clear();
+        for i in 0..300 {
+            std::fs::write(target.join(format!("{i}.o")), "object").unwrap();
+            std::fs::write(store.join(format!("{i}.sqlite-wal")), "wal").unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let counts = counts.lock().unwrap().clone();
+        assert!(!watcher.take_missed_events(), "ignored churn overflowed the 100-slot channel; admitted prefixes: {counts:?}");
+        assert!(counts.keys().all(|p| p != "target" && p != ".mdkb"), "self-generated/build events admitted: {counts:?}");
+    }
+
     #[test]
     fn routed_path_filter_drops_target_churn_and_keeps_routed_paths() {
         // Catches: the watcher filter forgotten, inverted, or wired to a
