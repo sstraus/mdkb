@@ -1714,8 +1714,8 @@ pub async fn run_file_watcher_inner(
     // Process file changes with batching for code reindex.
     // Two event sources: FSEvents watcher and injected paths from post-tool-use IPC.
     let mut code_batch: Vec<PathBuf> = Vec::new();
-    let mut needs_doc_update = false;
-    let mut needs_memory_sync = MemorySyncRequest::Idle;
+    let mut needs_doc_update = FileUpdateRequest::Idle;
+    let mut needs_memory_sync = FileUpdateRequest::Idle;
     // The watcher dropped events under backpressure, so the batch is an
     // incomplete view of what changed and only a full rescan can close the gap.
     //
@@ -1743,7 +1743,7 @@ pub async fn run_file_watcher_inner(
         }
 
         let pending = !code_batch.is_empty()
-            || needs_doc_update
+            || needs_doc_update.is_pending()
             || needs_memory_sync.is_pending()
             || needs_rescan;
         // A fixed deadline, not a fresh sleep after every event: sustained
@@ -1779,7 +1779,10 @@ pub async fn run_file_watcher_inner(
                 tracing::debug!("File change detected: {:?}", change.path);
                 let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
                 if code_enabled && routes.code { note_code_change(&mut code_batch, &mut needs_rescan, change.path.clone()); }
-                if routes.doc { needs_doc_update = true; }
+                if routes.doc {
+                    needs_doc_update.note(change.path.clone());
+                    if matches!(needs_doc_update, FileUpdateRequest::Full) { needs_rescan = true; }
+                }
                 if routes.memory { needs_memory_sync.note(change.path.clone()); }
                 if !routes.any() {
                     tracing::debug!("Ignoring unrouted change: {:?}", change.path);
@@ -1814,15 +1817,14 @@ pub async fn run_file_watcher_inner(
                     if code_enabled {
                         full_code_rescan(&code_index, &root, &pipeline_config).await;
                     }
-                    needs_doc_update = true;
-                    needs_memory_sync = MemorySyncRequest::Full;
+                    needs_doc_update = FileUpdateRequest::Full;
+                    needs_memory_sync = FileUpdateRequest::Full;
                 } else {
                     flush_code_batch(&code_index, &root, &mut code_batch).await;
                 }
-                // Order matters: `handle_update` already runs the memory
-                // reconciliation, so a pending doc update subsumes a pending
-                // memory sync. Flushing docs first lets the memory flush see
-                // the flag cleared and skip a redundant second pass.
+                // Full document recovery includes memory reconciliation and
+                // clears its request. Targeted document updates leave an
+                // independent memory change pending.
                 flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
                 flush_memory_sync(&ctx, &mut needs_memory_sync).await;
                 if recovering {
@@ -1944,8 +1946,8 @@ async fn full_rebuild_from_heal(
     // A quarantine rebuilds `memory_entries` empty, so the projection on disk is
     // the only surviving copy — the doc update's reconciliation pass is what
     // re-imports it. Both flags are set for that reason.
-    let mut needs_docs = true;
-    let mut needs_memory = MemorySyncRequest::Full;
+    let mut needs_docs = FileUpdateRequest::Full;
+    let mut needs_memory = FileUpdateRequest::Full;
     flush_doc_update(ctx, root, &mut needs_docs, &mut needs_memory).await;
     flush_memory_sync(ctx, &mut needs_memory).await;
     full_code_rescan(code_index, root, config).await;
@@ -1982,21 +1984,21 @@ async fn full_rebuild_from_heal(
 /// twelve deletions twelve independent choices, each below the cap, and the
 /// breaker would never fire.
 ///
-/// What the memory reconciliation flush has been asked to do.
+/// A bounded document or memory update request. Each sink owns its request.
 #[derive(Debug, Default)]
-enum MemorySyncRequest {
+enum FileUpdateRequest {
     /// Nothing pending.
     #[default]
     Idle,
-    /// These files under `entries/` changed. The flush may find they are all
-    /// the store's own projections and skip the pass.
+    /// Only these paths changed. Memory sync can skip recorded projections;
+    /// document indexing updates just the named files.
     Changed(Vec<PathBuf>),
     /// Run the pass whatever changed: dropped watcher events, a post-heal
     /// rebuild — the change set is unknown or the whole projection is at stake.
     Full,
 }
 
-impl MemorySyncRequest {
+impl FileUpdateRequest {
     fn note(&mut self, path: PathBuf) {
         match self {
             Self::Idle => *self = Self::Changed(vec![path]),
@@ -2024,11 +2026,11 @@ impl MemorySyncRequest {
 /// entry is such a write: the pass would find nothing to do, so it is skipped
 /// rather than run once per write. Anything else — an edit, an unknown file, a
 /// deletion, a full request — runs the pass.
-async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut MemorySyncRequest) {
+async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut FileUpdateRequest) {
     let changed = match std::mem::take(request) {
-        MemorySyncRequest::Idle => return,
-        MemorySyncRequest::Changed(paths) => Some(paths),
-        MemorySyncRequest::Full => None,
+        FileUpdateRequest::Idle => return,
+        FileUpdateRequest::Changed(paths) => Some(paths),
+        FileUpdateRequest::Full => None,
     };
     // Synchronous SQLite + filesystem work, like `handle_update`: run it on a
     // blocking thread so it never stalls a tokio worker (PERF-1).
@@ -2085,22 +2087,27 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut Memo
     }
 }
 
-/// Flush pending document update.
-///
-/// Clears `needs_memory_sync` too: `handle_update` runs the memory
-/// reconciliation itself, so letting it stand would cost a redundant second
-/// whole-directory pass on every doc change.
+/// Flush only delivered document paths. A full recovery also reconciles the
+/// memory projection and subsumes a pending memory request.
 async fn flush_doc_update(
     ctx: &Arc<Mutex<Option<Context>>>,
     root: &Path,
-    needs_update: &mut bool,
-    needs_memory_sync: &mut MemorySyncRequest,
+    needs_update: &mut FileUpdateRequest,
+    needs_memory_sync: &mut FileUpdateRequest,
 ) {
-    if !*needs_update {
-        return;
-    }
-    *needs_update = false;
-    *needs_memory_sync = MemorySyncRequest::Idle;
+    let files = match std::mem::take(needs_update) {
+        FileUpdateRequest::Idle => return,
+        FileUpdateRequest::Changed(paths) => Some(
+            paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        ),
+        FileUpdateRequest::Full => {
+            *needs_memory_sync = FileUpdateRequest::Idle;
+            None
+        }
+    };
     // `handle_update` is fully synchronous (SQLite writes, filesystem walks, and —
     // via auto-embed/memory-backfill — ONNX inference). Run it on a blocking thread
     // and take the lock there (`blocking_lock`), so it never blocks the tokio worker
@@ -2108,8 +2115,11 @@ async fn flush_doc_update(
     let ctx = Arc::clone(ctx);
     let root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::core::run_mutation(&ctx, "doc reindex", |ctx_ref| {
-            handle_update_unverified(ctx_ref, &root)
+        crate::core::run_mutation(&ctx, "doc reindex", |ctx_ref| match files {
+            Some(files) => {
+                crate::core::indexing::handle_watcher_files_unverified(ctx_ref, &root, &files)
+            }
+            None => handle_update_unverified(ctx_ref, &root),
         })
     })
     .await;
@@ -4431,9 +4441,14 @@ if (require.main === module) {
         std::fs::write(root.join("docs/changed.md"), "# Changed\n").unwrap();
         std::fs::write(root.join("docs/unrelated.md"), "# Unrelated\n").unwrap();
         let ctx = Arc::new(Mutex::new(Some(ctx)));
-        let mut update = true;
-        let mut memory = MemorySyncRequest::Idle;
+        let mut update = FileUpdateRequest::Changed(vec![root.join("docs/changed.md")]);
+        let mut memory =
+            FileUpdateRequest::Changed(vec![root.join(".mdkb/memory/entries/external.md")]);
         flush_doc_update(&ctx, &root, &mut update, &mut memory).await;
+        assert!(
+            memory.is_pending(),
+            "targeted docs must not suppress external memory changes"
+        );
         let guard = ctx.lock().await;
         let conn = &guard.as_ref().unwrap().conn;
         assert!(
@@ -4447,6 +4462,51 @@ if (require.main === module) {
                 .is_none(),
             "one changed path caused a whole-collection scan"
         );
+    }
+
+    /// Catches: targeted updates leaving a deleted document searchable, or
+    /// incorrectly deleting a sibling while processing a rename.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_document_deletion_removes_only_the_changed_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let ctx = Context::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        collections::add_collection(
+            &ctx.conn,
+            &crate::domain::Collection {
+                name: "docs".into(),
+                path: "docs".into(),
+                pattern: "**/*.md".into(),
+                source: "manual".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        let original = root.join("docs/old.md");
+        let sibling = root.join("docs/sibling.md");
+        std::fs::write(&original, "# Old\n").unwrap();
+        std::fs::write(&sibling, "# Sibling\n").unwrap();
+        let ctx = Arc::new(Mutex::new(Some(ctx)));
+        let mut update = FileUpdateRequest::Changed(vec![original.clone(), sibling]);
+        let mut memory = FileUpdateRequest::Idle;
+        flush_doc_update(&ctx, &root, &mut update, &mut memory).await;
+        let renamed = root.join("docs/new.md");
+        std::fs::rename(&original, &renamed).unwrap();
+        let mut update = FileUpdateRequest::Changed(vec![original, renamed]);
+        flush_doc_update(&ctx, &root, &mut update, &mut memory).await;
+        let guard = ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        for (path, present) in [("old.md", false), ("new.md", true), ("sibling.md", true)] {
+            assert_eq!(
+                crate::store::documents::get_document_by_path(conn, "docs", path)
+                    .unwrap()
+                    .is_some(),
+                present,
+                "{path}"
+            );
+        }
     }
 
     /// Catches: a root collection bypassing its nonrecursive glob, build
@@ -4501,7 +4561,7 @@ if (require.main === module) {
     fn pending_paths_deduplicate_and_collapse_at_the_bound() {
         let mut batch = Vec::new();
         let mut rescan = false;
-        let mut memory = MemorySyncRequest::Idle;
+        let mut memory = FileUpdateRequest::Idle;
         for i in 0..2048 {
             note_code_change(&mut batch, &mut rescan, PathBuf::from(format!("{i}.rs")));
             memory.note(PathBuf::from(format!("{i}.md")));
@@ -4509,7 +4569,7 @@ if (require.main === module) {
         }
         assert!(rescan);
         assert!(batch.is_empty());
-        assert!(matches!(memory, MemorySyncRequest::Full));
+        assert!(matches!(memory, FileUpdateRequest::Full));
         let mut batch = Vec::new();
         let mut rescan = false;
         for _ in 0..2048 {
