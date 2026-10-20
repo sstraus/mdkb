@@ -14,6 +14,7 @@ pub mod memory;
 pub mod priority;
 pub mod repos;
 pub mod setup;
+pub mod setup_ego;
 pub mod stats_render;
 pub mod stats_render_report;
 pub mod stats_report;
