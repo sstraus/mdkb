@@ -4408,6 +4408,47 @@ if (require.main === module) {
         );
     }
 
+    /// Catches: one document edit walking all collections and reconciling
+    /// every memory projection instead of indexing only delivered paths.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_document_edit_does_not_index_unrelated_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let ctx = Context::init(&root).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        collections::add_collection(
+            &ctx.conn,
+            &crate::domain::Collection {
+                name: "docs".into(),
+                path: "docs".into(),
+                pattern: "**/*.md".into(),
+                source: "manual".into(),
+                created_at: 0,
+                updated_at: 0,
+            },
+        )
+        .unwrap();
+        std::fs::write(root.join("docs/changed.md"), "# Changed\n").unwrap();
+        std::fs::write(root.join("docs/unrelated.md"), "# Unrelated\n").unwrap();
+        let ctx = Arc::new(Mutex::new(Some(ctx)));
+        let mut update = true;
+        let mut memory = MemorySyncRequest::Idle;
+        flush_doc_update(&ctx, &root, &mut update, &mut memory).await;
+        let guard = ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        assert!(
+            crate::store::documents::get_document_by_path(conn, "docs", "changed.md")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            crate::store::documents::get_document_by_path(conn, "docs", "unrelated.md")
+                .unwrap()
+                .is_none(),
+            "one changed path caused a whole-collection scan"
+        );
+    }
+
     /// Catches: a root collection bypassing its nonrecursive glob, build
     /// exclusions, or store isolation; disabled code must not fill the queue.
     #[test]
