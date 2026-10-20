@@ -57,6 +57,8 @@ pub struct FileWatcher {
     _debouncer: Debouncer<RecommendedWatcher>,
     /// Channel receiver for events.
     receiver: mpsc::Receiver<FileChange>,
+    #[cfg(test)]
+    test_sender: mpsc::Sender<FileChange>,
     /// Set when the debouncer had to drop an event because the channel was full
     /// (a burst larger than the buffer while the consumer was mid-flush). The
     /// consumer reads this via [`FileWatcher::take_missed_events`] and forces a
@@ -81,6 +83,8 @@ impl FileWatcher {
         let (tx, rx) = mpsc::channel(100);
         let missed_events = Arc::new(AtomicBool::new(false));
 
+        #[cfg(test)]
+        let test_sender = tx.clone();
         let missed_for_closure = Arc::clone(&missed_events);
         let filter = Arc::new(OnceLock::new());
         let filter_for_closure: Arc<OnceLock<PathFilter>> = Arc::clone(&filter);
@@ -109,9 +113,35 @@ impl FileWatcher {
         Ok(Self {
             _debouncer: debouncer,
             receiver: rx,
+            #[cfg(test)]
+            test_sender,
             missed_events,
             filter,
         })
+    }
+
+    /// Deterministic native-callback boundary for directory-only notifications.
+    #[cfg(test)]
+    pub(crate) fn deliver_for_test(&self, path: PathBuf) {
+        deliver_change(
+            &self.test_sender,
+            &self.missed_events,
+            &self.filter,
+            &mut None,
+            FileChange {
+                path,
+                kind: ChangeKind::CreateOrModify,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drain_for_test(&mut self) -> Vec<FileChange> {
+        let mut changes = Vec::new();
+        while let Ok(change) = self.receiver.try_recv() {
+            changes.push(change);
+        }
+        changes
     }
 
     /// Drop events whose path `keep` rejects before they reach the channel.
