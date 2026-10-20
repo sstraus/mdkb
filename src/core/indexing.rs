@@ -847,6 +847,35 @@ fn run_files_update(
     files: &[String],
     force: bool,
 ) -> Result<UpdateResult> {
+    run_files_update_mode(ctx, root, files, force, false)
+}
+
+/// Known watcher paths only: force fresh bytes even for same-second saves,
+/// remove vanished documents, and leave integrity verification to the caller
+/// after it releases the context slot. No directory or memory-projection walk.
+pub(crate) fn handle_watcher_files_unverified(
+    ctx: &Context,
+    root: &Path,
+    files: &[String],
+) -> Result<UpdateResult> {
+    let mut result = run_files_update_mode(ctx, root, files, true, true)?;
+    let config = Config::load_or_default(&ctx.config_path);
+    if config.search.auto_embed_docs {
+        match handle_embed(ctx, None) {
+            Ok(r) => result.doc_embeddings_generated = r.generated,
+            Err(e) => tracing::warn!("auto-embed on watcher update failed: {e}"),
+        }
+    }
+    Ok(result)
+}
+
+fn run_files_update_mode(
+    ctx: &Context,
+    root: &Path,
+    files: &[String],
+    force: bool,
+    delete_missing: bool,
+) -> Result<UpdateResult> {
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
@@ -870,6 +899,9 @@ fn run_files_update(
         .filter_map(|coll| match compile_collection_matcher(&coll.pattern) {
             Ok(matcher) => match root.join(&coll.path).canonicalize() {
                 Ok(canonical_base) => Some((coll, matcher, canonical_base)),
+                Err(e) if delete_missing && e.kind() == std::io::ErrorKind::NotFound => {
+                    Some((coll, matcher, canonical_root.join(&coll.path)))
+                }
                 Err(e) => {
                     tracing::warn!(
                         collection = %coll.name,
@@ -918,6 +950,7 @@ fn run_files_update(
                 graph_cfg: &config.graph,
                 relations: &relations,
                 force,
+                delete_missing,
             },
             &mut result,
         )?;
@@ -1121,6 +1154,8 @@ pub(crate) struct SpecifiedFilesInput<'a> {
     /// [`SingleFileInput::relations`].
     pub(crate) relations: &'a [String],
     pub(crate) force: bool,
+    /// Watcher-only deletion semantics; CLI missing paths remain errors.
+    pub(crate) delete_missing: bool,
 }
 
 /// Process each user-supplied file path within a transaction.
@@ -1136,6 +1171,7 @@ pub(crate) fn index_specified_files(
         graph_cfg,
         relations,
         force,
+        delete_missing,
     } = input;
     for file_arg in files {
         let file_path = PathBuf::from(file_arg);
@@ -1148,8 +1184,30 @@ pub(crate) fn index_specified_files(
         };
 
         // Canonicalize once per file for security check + collection matching
+        let mut missing = false;
         let canonical_file = match abs_path.canonicalize() {
             Ok(p) => p,
+            Err(e) if delete_missing && e.kind() == std::io::ErrorKind::NotFound => {
+                // Native watcher paths are absolute and have no traversal
+                // components. Reject anything else rather than interpreting a
+                // missing path through a symlink or a parent traversal.
+                if abs_path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+                {
+                    result
+                        .errors
+                        .push(format!("Invalid deleted watcher path: {file_arg}"));
+                    continue;
+                }
+                missing = true;
+                // Match the canonical root's representation on Windows too.
+                canonical_root.join(
+                    abs_path
+                        .strip_prefix(crate::domain::canonicalize_plain(canonical_root)?)
+                        .unwrap_or(&abs_path),
+                )
+            }
             Err(e) => {
                 result
                     .errors
@@ -1200,6 +1258,14 @@ pub(crate) fn index_specified_files(
 
         // Look up existing document for mtime comparison
         let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+        if missing {
+            if let Some(doc) = existing_doc {
+                if documents::delete_document(&ctx.conn, doc.id)? {
+                    result.removed += 1;
+                }
+            }
+            continue;
+        }
 
         index_single_file(
             SingleFileInput {
