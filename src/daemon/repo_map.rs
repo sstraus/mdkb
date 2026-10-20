@@ -1034,6 +1034,35 @@ mod tests {
         canonical_key(at)
     }
 
+    /// Catches whole generated/worktree subtrees being enumerated per miss.
+    #[test]
+    fn discovery_io_prunes_generated_and_worktree_subtrees() {
+        let tmp = TempDir::new().unwrap();
+        let root = plant_store(&tmp.path().join("workspace"));
+        let nested = plant_store(&root.join("work/people/hr"));
+        std::fs::write(root.join(".gitignore"), "/generated/\n").unwrap();
+        for output in ["generated", "coverage", "plugins__wt", "build", "dist"] {
+            for i in 0..100 {
+                std::fs::create_dir_all(root.join(output).join(format!("copy{i}/src/deep")))
+                    .unwrap();
+            }
+            plant_store(&root.join(output).join("copied-store"));
+        }
+        let found = discover_nested_stores(std::slice::from_ref(&root), &[]);
+        let visits: usize = TEST_VISITS
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(&root))
+            .map(|(_, visits)| visits)
+            .sum();
+        assert_eq!(
+            visits, 4,
+            "only workspace/work/people/hr, not 1500 generated directories"
+        );
+        assert_eq!(found, BTreeSet::from([root, nested]));
+    }
+
     /// Catches: temporary copies of a repo (`.tmp/cov-audit/plugins`) listed as
     /// repos, which made `root=plugins` name four of them and be refused.
     #[test]
