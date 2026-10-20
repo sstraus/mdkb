@@ -14,6 +14,7 @@ pub mod memory;
 pub mod priority;
 pub mod repos;
 pub mod setup;
+pub mod setup_ego;
 pub mod stats_render;
 pub mod stats_render_report;
 pub mod stats_report;
@@ -1265,6 +1266,17 @@ pub enum SetupHooksCommand {
         /// support HTTP handlers for that event.
         #[arg(long)]
         http_url: Option<String>,
+    },
+
+    /// Register mdkb as ego's prompt-context source (writes ~/.ego/config.toml)
+    Ego {
+        /// Replace an existing, different `mdkb_prompt_command` value
+        #[arg(long)]
+        force: bool,
+
+        /// Print the merged config.toml to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)

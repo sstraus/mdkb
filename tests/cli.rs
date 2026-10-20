@@ -11,3 +11,6 @@ mod setup_hooks_codex_test;
 
 #[path = "cli/setup_mcp_codex_test.rs"]
 mod setup_mcp_codex_test;
+
+#[path = "cli/setup_hooks_ego_test.rs"]
+mod setup_hooks_ego_test;
