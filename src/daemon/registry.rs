@@ -516,14 +516,9 @@ impl RepoRegistry {
         let known = self.known_roots();
         let mut roots: std::collections::BTreeSet<PathBuf> = known.iter().cloned().collect();
         let mut walk: Vec<PathBuf> = known;
-        // A scope already covered by a known root adds nothing but a second
-        // walk of the same tree.
-        let uncovered: Vec<PathBuf> = extra
-            .iter()
-            .filter(|e| !walk.iter().any(|k| e.starts_with(k)))
-            .cloned()
-            .collect();
-        walk.extend(uncovered);
+        // Coverage normalization decides which scopes are redundant. A scope
+        // below an ignored/generated ancestor still needs its explicit walk.
+        walk.extend_from_slice(extra);
         roots.extend(self.walk_for(&walk));
         self.retain_unignored(&mut roots);
         roots.into_iter().collect()
@@ -1018,6 +1013,31 @@ mod tests {
         let second = registry.discoverable_roots_under(&[child, root.clone(), root]);
         assert_eq!(second, first);
         assert!(!second.contains(&later));
+    }
+
+    /// Catches a declared workspace below a known root being dropped before
+    /// normalization, even though the ancestor prunes that workspace's tree.
+    #[test]
+    fn discovery_io_declared_scope_overrides_ancestor_pruning() {
+        let tmp = TempDir::new().unwrap();
+        let parent = plant_store(tmp.path().join("parent"));
+        std::fs::write(parent.join(".gitignore"), "/generated/\n").unwrap();
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.repo_map.record(&parent);
+        for path in [
+            "generated/workspace",
+            "coverage/workspace",
+            "plugins__wt/workspace",
+        ] {
+            let scope = parent.join(path);
+            let nested = plant_store(scope.join("nested"));
+            assert!(!registry.discoverable_roots().contains(&nested));
+            assert!(
+                registry
+                    .discoverable_roots_under(&[scope])
+                    .contains(&nested)
+            );
+        }
     }
 
     /// Catches the one-slot cache being evicted by another workspace.
