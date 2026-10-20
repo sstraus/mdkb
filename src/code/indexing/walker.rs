@@ -185,6 +185,14 @@ fn walk_builder(opts: WalkOptions<'_>) -> WalkBuilder {
         respect_gitignore,
     } = opts;
 
+    // ignore 0.4.33 only resolves a worktree's .git pointer and common
+    // info/exclude when require_git is enabled. Keep standalone .gitignore
+    // support outside Git, but enable repository detection inside a worktree
+    // (including collection roots below its top level).
+    let absolute_root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let require_git = absolute_root
+        .ancestors()
+        .any(|dir| dir.join(".git").exists());
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -192,7 +200,7 @@ fn walk_builder(opts: WalkOptions<'_>) -> WalkBuilder {
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
         .follow_links(false)
-        .require_git(false); // respect .gitignore even outside git repos
+        .require_git(require_git);
 
     // Stop at nested-store boundaries: any directory below the root that owns an
     // *initialized* `.mdkb` store is a distinct repo that indexes its own files.

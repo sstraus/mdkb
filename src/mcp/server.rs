@@ -4831,6 +4831,29 @@ if (require.main === module) {
         ]);
         std::fs::write(main.join(".git/info/exclude"), "note.md\n").unwrap();
         std::fs::write(root.join("note.md"), "# Note").unwrap();
+        // Full discovery and incremental admission must agree, including when
+        // a collection starts below the worktree's .git pointer.
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/note.md"), "# Nested note").unwrap();
+        for collection_root in [&root, &root.join("docs")] {
+            let files = crate::code::indexing::walker::walk_files(
+                crate::code::indexing::walker::WalkOptions {
+                    root: collection_root,
+                    ignore_patterns: &[],
+                    respect_gitignore: true,
+                },
+                |path| path.extension().is_some_and(|ext| ext == "md"),
+            );
+            assert!(
+                files.is_empty(),
+                "full walk lost common Git excludes: {files:?}"
+            );
+            assert!(crate::code::indexing::walker::watcher_path_is_ignored(
+                collection_root,
+                &collection_root.join("note.md"),
+                true,
+            ));
+        }
         let mut delivery = DocumentDelivery::new(&root, "**/*.md", true);
         delivery.apply([root.join("note.md")]).await;
         assert!(

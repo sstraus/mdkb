@@ -8,7 +8,9 @@
   Match document collection globs and exclusions instead of accepting every
   descendant of a root collection. Keep database and Git internals out of the
   queue, index only delivered document paths on ordinary edits, bound pending
-  paths, and coalesce recovery per repository with a 30-second cooldown. Found
+  paths, and coalesce recovery per repository with a 30-second cooldown. Apply
+  common Git excludes in worktrees without losing standalone `.gitignore`
+  support. Found
   by the maintainer in daemon CPU and overflow logs (story 015-88aa).
 
 ## 3.11.3 (2026-10-08)
