@@ -1400,12 +1400,19 @@ fn watched_memory_entries_dir(root: &Path, namespace: Option<&str>) -> PathBuf {
 struct WatchedCollection {
     path: PathBuf,
     matcher: globset::GlobMatcher,
+    ignore_root: PathBuf,
+    respect_gitignore: bool,
 }
 
 impl WatchedCollection {
     fn new(path: PathBuf, pattern: &str) -> Option<Self> {
         match crate::core::indexing::compile_collection_matcher(pattern) {
-            Ok(matcher) => Some(Self { path, matcher }),
+            Ok(matcher) => Some(Self {
+                ignore_root: path.clone(),
+                path,
+                matcher,
+                respect_gitignore: false,
+            }),
             Err(error) => {
                 tracing::warn!(%error, %pattern, "Skipping invalid watcher collection glob");
                 None
@@ -1439,6 +1446,12 @@ fn classify_change(
         doc: collections.iter().any(|collection| {
             path.strip_prefix(&collection.path)
                 .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel)))
+                && !crate::code::indexing::walker::watcher_document_is_ignored(
+                    &collection.ignore_root,
+                    &collection.path,
+                    path,
+                    collection.respect_gitignore,
+                )
         }),
         memory,
     }
@@ -1571,7 +1584,7 @@ pub async fn run_file_watcher_inner(
     // aborted when the handle is dropped (RepoHandle::Drop), so waiting
     // indefinitely is bounded by handle lifetime and cannot leak. We only warn
     // once, actionably, if ctx is unusually slow to appear.
-    let collection_list = {
+    let (collection_list, doc_respect_gitignore) = {
         let warn_after =
             tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
         let mut warned = false;
@@ -1584,7 +1597,12 @@ pub async fn run_file_watcher_inner(
                     |ctx_ref| collections::list_collections(&ctx_ref.conn),
                 );
                 match outcome {
-                    Some(Ok(collections)) => break collections,
+                    Some(Ok(collections)) => {
+                        let config = crate::Config::load_or_default(
+                            &ctx_guard.as_ref().unwrap().config_path,
+                        );
+                        break (collections, config.indexing.respect_gitignore);
+                    }
                     Some(Err(error)) => return Err(error),
                     None => {}
                 }
@@ -1604,7 +1622,12 @@ pub async fn run_file_watcher_inner(
 
     let collection_paths: Vec<WatchedCollection> = collection_list
         .iter()
-        .filter_map(|coll| WatchedCollection::new(root.join(&coll.path), &coll.pattern))
+        .filter_map(|coll| {
+            let mut watched = WatchedCollection::new(root.join(&coll.path), &coll.pattern)?;
+            watched.ignore_root = root.clone();
+            watched.respect_gitignore = doc_respect_gitignore;
+            Some(watched)
+        })
         .collect();
     // Documents and code must both reject build/dependency churn. The document
     // defaults apply even when code indexing has no configured exclusions.
@@ -4552,6 +4575,35 @@ if (require.main === module) {
                 .any(),
                 "{path}"
             );
+        }
+    }
+
+    /// Catches: the targeted watcher treating an ignored document as an
+    /// explicit CLI override and indexing it despite walker exclusions.
+    #[test]
+    fn watcher_document_admission_respects_ignore_files_and_nested_stores() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("docs/nested/.mdkb")).unwrap();
+        std::fs::write(root.join(".mdkbignore"), "docs/ignored.md\n").unwrap();
+        std::fs::write(root.join("docs/.mdkbignore"), "local.md\n").unwrap();
+        std::fs::write(root.join("docs/nested/.mdkb/index.sqlite"), "initialized").unwrap();
+        let mut collection = WatchedCollection::new(root.join("docs"), "**/*.md").unwrap();
+        collection.ignore_root = root.clone();
+        let keep = routed_path_filter(
+            vec![collection],
+            build_code_excludes(&root, &[]),
+            root.join(".mdkb/memory/entries"),
+            false,
+        );
+        for (path, expected) in [
+            ("docs/keep.md", true),
+            ("docs/ignored.md", false),
+            ("docs/local.md", false),
+            ("docs/.hidden.md", false),
+            ("docs/nested/child.md", false),
+        ] {
+            assert_eq!(keep(&root.join(path)), expected, "{path}");
         }
     }
 

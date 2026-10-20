@@ -260,6 +260,89 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
     files
 }
 
+/// Check one document candidate without walking sibling files. The watcher
+/// uses this after its collection glob and build exclusions have matched.
+/// Read ignore files only along this path; do not rediscover the repository.
+pub(crate) fn watcher_document_is_ignored(
+    repo_root: &Path,
+    collection_root: &Path,
+    path: &Path,
+    respect_gitignore: bool,
+) -> bool {
+    let Ok(relative) = path.strip_prefix(collection_root) else {
+        return true;
+    };
+    let forced = if respect_gitignore {
+        let mut overrides = OverrideBuilder::new(collection_root);
+        for pattern in parse_mdkb_index_annotations(collection_root) {
+            let _ = overrides.add(&pattern);
+        }
+        overrides
+            .build()
+            .is_ok_and(|m| m.matched(path, false).is_whitelist())
+    } else {
+        false
+    };
+    if path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+    {
+        return true;
+    }
+    if !forced
+        && relative
+            .components()
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return true;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
+    let mut directories = Vec::new();
+    let mut parent = path.parent();
+    while let Some(dir) = parent {
+        if !dir.starts_with(repo_root) {
+            break;
+        }
+        if !forced
+            && dir != collection_root
+            && dir.starts_with(collection_root)
+            && dir.join(".mdkb/index.sqlite").is_file()
+        {
+            return true;
+        }
+        directories.push(dir);
+        if dir == repo_root {
+            break;
+        }
+        parent = dir.parent();
+    }
+    if respect_gitignore {
+        let _ = builder.add(repo_root.join(".git/info/exclude"));
+    }
+    for dir in directories.into_iter().rev() {
+        let _ = builder.add(dir.join(".ignore"));
+        let _ = builder.add(dir.join(if respect_gitignore {
+            ".gitignore"
+        } else {
+            MDKB_IGNORE_FILENAME
+        }));
+    }
+    if forced {
+        return false;
+    }
+    if builder
+        .build()
+        .is_ok_and(|m| m.matched_path_or_any_parents(path, false).is_ignore())
+    {
+        return true;
+    }
+    if respect_gitignore {
+        let (global, _) = ignore::gitignore::GitignoreBuilder::new(repo_root).build_global();
+        return global.matched_path_or_any_parents(path, false).is_ignore();
+    }
+    false
+}
+
 /// Discover source files under `root` for code indexing.
 ///
 /// Convenience wrapper over [`walk_files`] with a language filter for the
