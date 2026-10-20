@@ -263,7 +263,7 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
 /// Check one document candidate without walking sibling files. The watcher
 /// uses this after its collection glob and build exclusions have matched.
 /// Read ignore files only along this path; do not rediscover the repository.
-pub(crate) fn watcher_document_is_ignored(
+pub(crate) fn watcher_path_is_ignored(
     repo_root: &Path,
     collection_root: &Path,
     path: &Path,
@@ -330,11 +330,14 @@ pub(crate) fn watcher_document_is_ignored(
     if forced {
         return false;
     }
-    if builder
-        .build()
-        .is_ok_and(|m| m.matched_path_or_any_parents(path, false).is_ignore())
-    {
-        return true;
+    if let Ok(matcher) = builder.build() {
+        let matched = matcher.matched_path_or_any_parents(path, false);
+        if matched.is_ignore() {
+            return true;
+        }
+        if matched.is_whitelist() {
+            return false;
+        }
     }
     if respect_gitignore {
         let (global, _) = ignore::gitignore::GitignoreBuilder::new(repo_root).build_global();

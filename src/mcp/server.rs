@@ -1426,6 +1426,7 @@ fn classify_change(
     collections: &[WatchedCollection],
     code_excludes: &globset::GlobSet,
     memory_entries_dir: &Path,
+    code_policy: Option<(&Path, bool)>,
 ) -> ChangeRoutes {
     use crate::code::parsing::language::Language;
     // Only the active projection is a store input. Database/WAL files and
@@ -1442,11 +1443,19 @@ fn classify_change(
         };
     }
     ChangeRoutes {
-        code: Language::from_path(path).is_some(),
+        code: Language::from_path(path).is_some()
+            && code_policy.is_none_or(|(root, respect_gitignore)| {
+                !crate::code::indexing::walker::watcher_path_is_ignored(
+                    root,
+                    root,
+                    path,
+                    respect_gitignore,
+                )
+            }),
         doc: collections.iter().any(|collection| {
             path.strip_prefix(&collection.path)
                 .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel)))
-                && !crate::code::indexing::walker::watcher_document_is_ignored(
+                && !crate::code::indexing::walker::watcher_path_is_ignored(
                     &collection.ignore_root,
                     &collection.path,
                     path,
@@ -1463,9 +1472,18 @@ fn routed_path_filter(
     code_excludes: globset::GlobSet,
     memory_entries_dir: PathBuf,
     code_enabled: bool,
+    code_policy: Option<(PathBuf, bool)>,
 ) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
     move |path| {
-        let routes = classify_change(path, &collections, &code_excludes, &memory_entries_dir);
+        let routes = classify_change(
+            path,
+            &collections,
+            &code_excludes,
+            &memory_entries_dir,
+            code_policy
+                .as_ref()
+                .map(|(root, respect)| (root.as_path(), *respect)),
+        );
         (code_enabled && routes.code) || routes.doc || routes.memory
     }
 }
@@ -1666,6 +1684,7 @@ pub async fn run_file_watcher_inner(
         code_excludes.clone(),
         memory_entries_dir.clone(),
         code_enabled,
+        Some((root.clone(), respect_gitignore)),
     ));
 
     // Watch root recursively — it covers code, collections inside root, AND the
@@ -1800,7 +1819,7 @@ pub async fn run_file_watcher_inner(
                 // always follows one and carries the news out of the watcher.
                 needs_rescan |= watcher.take_missed_events();
                 tracing::debug!("File change detected: {:?}", change.path);
-                let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
+                let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir, Some((&root, respect_gitignore)));
                 if code_enabled && routes.code { note_code_change(&mut code_batch, &mut needs_rescan, change.path.clone()); }
                 if routes.doc {
                     needs_doc_update.note(change.path.clone());
@@ -4249,6 +4268,7 @@ if (require.main === module) {
             &collections,
             excludes,
             Path::new("/project/.mdkb/memory/entries"),
+            None,
         );
         (r.code, r.doc)
     }
@@ -4264,6 +4284,7 @@ if (require.main === module) {
             &collections,
             &excludes,
             entries,
+            None,
         );
         assert!(
             r.memory,
@@ -4279,7 +4300,7 @@ if (require.main === module) {
             Path::new("/project/.mdkb/memory/index.json"),
             Path::new("/project/.mdkb/memory/archive/old.md"),
         ] {
-            let r = classify_change(noisy, &collections, &excludes, entries);
+            let r = classify_change(noisy, &collections, &excludes, entries, None);
             assert!(
                 !r.memory,
                 "{} must not trigger reconciliation",
@@ -4313,11 +4334,11 @@ if (require.main === module) {
         let in_namespace = Path::new("/project/.mdkb/namespaces/test/memory/entries/x.md");
         let in_default = Path::new("/project/.mdkb/memory/entries/x.md");
         assert!(
-            classify_change(in_namespace, &collections, &excludes, &namespaced).memory,
+            classify_change(in_namespace, &collections, &excludes, &namespaced, None).memory,
             "a projected entry in the namespaced store must trigger reconciliation"
         );
         assert!(
-            !classify_change(in_default, &collections, &excludes, &namespaced).memory,
+            !classify_change(in_default, &collections, &excludes, &namespaced, None).memory,
             "the default store's projection is not this watcher's to reconcile"
         );
     }
@@ -4386,6 +4407,7 @@ if (require.main === module) {
             build_code_excludes(&root, &["**/target/**".to_string()]),
             store.join("memory/entries"),
             true,
+            None,
         );
         let counts = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
             String,
@@ -4544,6 +4566,7 @@ if (require.main === module) {
             excludes,
             root.join(".mdkb/memory/entries"),
             false,
+            None,
         );
         for (path, expected) in [
             ("README.md", true),
@@ -4570,7 +4593,8 @@ if (require.main === module) {
                     &root.join(path),
                     &recursive,
                     &excludes,
-                    &root.join(".mdkb/memory/entries")
+                    &root.join(".mdkb/memory/entries"),
+                    None,
                 )
                 .any(),
                 "{path}"
@@ -4595,6 +4619,7 @@ if (require.main === module) {
             build_code_excludes(&root, &[]),
             root.join(".mdkb/memory/entries"),
             false,
+            None,
         );
         for (path, expected) in [
             ("docs/keep.md", true),
@@ -4605,6 +4630,29 @@ if (require.main === module) {
         ] {
             assert_eq!(keep(&root.join(path)), expected, "{path}");
         }
+    }
+
+    /// Catches: gitignored source files reaching the channel despite code
+    /// indexing opting into gitignore, or a force-included source being lost.
+    #[test]
+    fn watcher_code_admission_respects_gitignore_and_force_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "ignored.rs\n# mdkb:index\nforced.rs\n",
+        )
+        .unwrap();
+        let keep = routed_path_filter(
+            vec![],
+            build_code_excludes(&root, &[]),
+            root.join(".mdkb/memory/entries"),
+            true,
+            Some((root.clone(), true)),
+        );
+        assert!(!keep(&root.join("ignored.rs")));
+        assert!(keep(&root.join("forced.rs")));
+        assert!(keep(&root.join("ordinary.rs")));
     }
 
     /// Catches: repeated events or a long burst growing pending storage
@@ -4643,6 +4691,7 @@ if (require.main === module) {
             excludes,
             PathBuf::from("/project/.mdkb/memory/entries"),
             true,
+            None,
         );
         assert!(!keep(Path::new("/project/target/debug/deps/foo.rs")));
         assert!(!keep(Path::new("/project/target/debug/foo.o")));
