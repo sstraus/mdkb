@@ -273,6 +273,47 @@ write path. Behavioral-prior mining is separate and disabled by default. When
 reads a bounded transcript tail and launches the external distiller without
 holding up the host. The hook itself returns `{}` immediately.
 
+#### Inline episodes (ego and other hosts without transcript files)
+
+`mdkb hook stop` reads a JSON object from stdin. The daemon method is
+`hook.stop`. Send `session_id` (the real host session ID) and one episode source:
+
+- `transcript_path`: the existing host transcript file path. mdkb reads its last
+  800 lines in the background, as before.
+- `episode_jsonl`: a string of complete Claude-shaped JSONL records, at most
+  **800 records and 262144 UTF-8 bytes**. This is inline data, not a file path or
+  ego's public session export. mdkb owns the payload before it returns.
+
+Each inline record has `type` (`user` or `assistant`) and
+`message.content` (a string or an array of blocks). Supported blocks are
+`{"type":"text","text":"..."}`,
+`{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"..."}}`,
+and `{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"..."}`.
+Tool input can also include `file_path`. Tool uses belong to assistant records;
+results and real prompt text belong to user records. A record can include an
+RFC 3339 `timestamp`; preserve the actual completion time on tool results so
+settlement can distinguish failures before and after a prior was shown.
+
+Example stdin (the newlines inside the string are JSON escapes):
+
+```json
+{"session_id":"ego-session","episode_jsonl":"{\"type\":\"user\",\"message\":{\"content\":\"No, edit the generator template instead.\"}}\n"}
+```
+
+Inline data uses the same episode parser, prior settlement, recall settlement,
+and optional miner as file data. Settlement does not require mining to be on.
+If `episode_jsonl` is present, it takes precedence over `transcript_path`.
+A non-string, malformed record, unsupported block, or over-limit payload is
+refused as a whole with a logged reason. It is never truncated or replaced by
+the file source. Empty inline text is an empty episode. Blank JSONL records are
+malformed. The hook still exits 0 and emits no host instructions (`{}` at RPC).
+Embedding backfill remains independent of episode acceptance.
+
+Delivery is best-effort, not exactly-once: `session_id` correlates observations,
+but Stop has no persistent occurrence deduplication. Inline data can be sent to
+an external or remote-backed `distiller_program` only when the operator has
+configured mining; this input form does not enable it.
+
 #### The distiller contract
 
 The distiller is any CLI, and the contract is three rules:

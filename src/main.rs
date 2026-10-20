@@ -352,7 +352,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // includes directories no store may be anchored at. It has no
             // human reading its stderr and nothing to record here, so it ends
             // quietly instead of repeating the refusal on every event.
-            None if is_lifecycle_hook(&cli.command) => return Ok(()),
+            None if is_lifecycle_hook(&cli.command) => {
+                // The host still writes an event for a no-op. Drain it before
+                // closing the pipe so that a large payload cannot cause EPIPE.
+                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                return Ok(());
+            }
             // `--root` names the repos itself; the directory it runs from
             // anchors nothing, so a container of repositories is a fine place
             // to run it, as it is for the MCP `root` parameter.

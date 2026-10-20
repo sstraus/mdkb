@@ -144,6 +144,86 @@ fn run_hook_with_home(
     (stdout, stderr, output.status.code().unwrap_or(-1))
 }
 
+// Catches: the no-project guard closes stdin before the host finishes writing,
+// turning a successful no-op into a host-side BrokenPipe.
+#[test]
+fn lifecycle_no_project_consumes_payload_before_exit() {
+    let payload = serde_json::json!({"prompt": "x".repeat(1024 * 1024)}).to_string();
+    let mut failures = Vec::new();
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "post-tool-use",
+        "pre-tool-use",
+        "stop",
+    ] {
+        for attempt in 1..=4 {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut child = Command::new(mdkb_bin())
+                .args(["hook", event])
+                .current_dir(temp.path())
+                .env_remove("CLAUDE_PROJECT_DIR")
+                .env("MDKB_NO_DAEMON", "1")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn lifecycle hook");
+            // Larger than a pipe buffer: success requires the child to read,
+            // regardless of which process gets scheduled first.
+            let written = child.stdin.take().unwrap().write_all(payload.as_bytes());
+            let output = child.wait_with_output().expect("reap lifecycle hook");
+            if written.is_err()
+                || !output.status.success()
+                || !output.stdout.is_empty()
+                || !output.stderr.is_empty()
+                || temp.path().join(".mdkb").exists()
+            {
+                failures.push(format!(
+                    "{event} attempt {attempt}: write={written:?}, status={}, stdout={:?}, stderr={:?}, store_created={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                    temp.path().join(".mdkb").exists()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// Catches: rejected inline evidence fails the host or silently loses its reason.
+#[test]
+fn hook_stop_inline_refusal_logs_reason_and_exits_zero() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let root = temp.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    handle_init(&root).expect("init");
+    for (inline, reason) in [
+        (serde_json::json!("not json"), "record 1"),
+        (
+            serde_json::json!("x".repeat(262_145)),
+            "exceeds 262144 bytes",
+        ),
+        (serde_json::json!("{}\n".repeat(801)), "exceeds 800 records"),
+    ] {
+        let payload = serde_json::json!({"session_id": "ego-session", "episode_jsonl": inline});
+        let (stdout, stderr, code) =
+            run_hook_with_home("stop", &root, &payload.to_string(), Some(&home));
+        assert_eq!(code, 0, "{stderr}");
+        assert!(
+            stdout.trim().is_empty(),
+            "refusal must not emit host instructions: {stdout}"
+        );
+        assert!(
+            stderr.contains("inline episode refused") && stderr.contains(reason),
+            "missing refusal reason: {stderr}"
+        );
+    }
+}
+
 #[test]
 fn hooks_e2e_warmup_recall_and_reindex() {
     let temp = tempfile::tempdir().expect("tempdir");

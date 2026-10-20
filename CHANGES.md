@@ -2,7 +2,21 @@
 
 ## Unreleased
 
+### Added
+
+- **Stop hooks accept bounded inline episodes.** Hosts such as ego can send
+  `session_id` and `episode_jsonl` without an ephemeral transcript file. Inline
+  input uses the existing prior and recall settlement and mining paths. Reject
+  malformed input or more than 800 records or 256 KiB with a logged reason,
+  without blocking the host. Requested by the maintainer while integrating
+  ego's session observations (story 014-70ca).
+
 ### Fixed
+
+- **No-project lifecycle hooks consume their input before exiting.** Drain the
+  host payload even when no project can hold a store, so a successful no-op
+  does not close the pipe during the host's write. Found by the full rb test
+  gate and reproduced across all five lifecycle events (story 014-70ca).
 
 - **Daemon watchers reject build and store churn before queue admission.**
   Match document collection globs and exclusions instead of accepting every

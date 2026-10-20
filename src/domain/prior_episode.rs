@@ -148,6 +148,54 @@ fn record_time(raw: Option<&str>) -> Option<i64> {
         .map(|dt| dt.timestamp())
 }
 
+/// Validate inline records before the tolerant transcript parser can skip them.
+/// File transcripts stay tolerant of unrelated host records; inline episodes
+/// must contain only complete user/assistant messages, never partial evidence.
+pub fn validate_inline_episode(jsonl: &str) -> Result<(), String> {
+    for (index, line) in jsonl.lines().enumerate() {
+        let record: Record = serde_json::from_str(line)
+            .map_err(|e| format!("episode_jsonl record {}: {e}", index + 1))?;
+        if !matches!(record.kind.as_str(), "user" | "assistant") {
+            return Err(format!(
+                "episode_jsonl record {}: expected user or assistant",
+                index + 1
+            ));
+        }
+        let Some(message) = record.message else {
+            return Err(format!(
+                "episode_jsonl record {}: missing message",
+                index + 1
+            ));
+        };
+        if let Content::Blocks(blocks) = message.content {
+            for block in blocks {
+                match block {
+                    Block::Other => {
+                        return Err(format!(
+                            "episode_jsonl record {}: unsupported content block",
+                            index + 1
+                        ));
+                    }
+                    Block::ToolUse { .. } if record.kind != "assistant" => {
+                        return Err(format!(
+                            "episode_jsonl record {}: tool_use requires assistant",
+                            index + 1
+                        ));
+                    }
+                    Block::ToolResult { .. } if record.kind != "user" => {
+                        return Err(format!(
+                            "episode_jsonl record {}: tool_result requires user",
+                            index + 1
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parse a transcript window (JSONL text) into a structured [`Episode`].
 ///
 /// Mirrors the action→consequence→handling extraction: tool_use blocks in

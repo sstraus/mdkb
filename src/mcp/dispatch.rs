@@ -6984,6 +6984,55 @@ fn doc_graph_neighbors(
 /// Number of trailing transcript lines that form the mined episode window.
 const STOP_EPISODE_WINDOW_LINES: usize = 800;
 
+/// Maximum inline payload size, measured before parsing or cloning it.
+const STOP_EPISODE_MAX_BYTES: usize = 256 * 1024;
+
+/// Both inputs feed the same parser, settlement and mining pipeline.
+#[derive(Clone)]
+enum StopEpisodeSource {
+    Transcript(String),
+    Inline(Arc<str>),
+}
+
+impl From<String> for StopEpisodeSource {
+    fn from(path: String) -> Self {
+        Self::Transcript(path)
+    }
+}
+
+impl StopEpisodeSource {
+    async fn window(self) -> Result<String, String> {
+        match self {
+            Self::Inline(jsonl) => Ok(jsonl.to_string()),
+            Self::Transcript(path) => {
+                let jsonl = tokio::task::spawn_blocking(move || std::fs::read_to_string(path))
+                    .await
+                    .map_err(|e| format!("transcript read task failed: {e}"))?
+                    .map_err(|e| format!("read transcript failed: {e}"))?;
+                Ok(tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES))
+            }
+        }
+    }
+}
+
+fn stop_episode_source(event: &Value) -> Result<Option<StopEpisodeSource>, String> {
+    if let Some(inline) = event.get("episode_jsonl") {
+        let jsonl = inline.as_str().ok_or("episode_jsonl must be a string")?;
+        if jsonl.len() > STOP_EPISODE_MAX_BYTES {
+            return Err("episode_jsonl exceeds 262144 bytes".into());
+        }
+        if jsonl.lines().count() > STOP_EPISODE_WINDOW_LINES {
+            return Err("episode_jsonl exceeds 800 records".into());
+        }
+        crate::domain::prior_episode::validate_inline_episode(jsonl)?;
+        return Ok(Some(StopEpisodeSource::Inline(Arc::from(jsonl))));
+    }
+    Ok(event
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(|path| StopEpisodeSource::Transcript(path.to_owned())))
+}
+
 /// `hook.stop` — end-of-episode boundary that feeds behavioral-prior mining.
 ///
 /// Returns `{}` immediately. Mining is kill-switched off by default and, when
@@ -7003,20 +7052,22 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
         dctx.adopt(task);
     }
 
-    let transcript_path = event
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .map(String::from);
+    let source = match stop_episode_source(event) {
+        Ok(source) => source,
+        Err(reason) => {
+            tracing::warn!("hook.stop: inline episode refused: {reason}");
+            return json!({});
+        }
+    };
     let session = event_session(event);
 
     // Settling comes first and is NOT behind the mining gate: priors are
     // injected whenever `injection_enabled` is on, which is a different switch.
-    // Gating settlement on mining would leave every prior shown in such a repo
-    // permanently unsettled, which is the frozen belief this closes. It re-reads
-    // the transcript rather than sharing the mining read — one file read against
-    // a task that may never run, or may spend a minute in an LLM call.
-    if let Some(path) = transcript_path.clone() {
-        dctx.spawn_background(settle_session(Arc::clone(&handle), path, session.clone()));
+    // Gating settlement on mining would leave injected priors unsettled. Inline
+    // input is shared; file input retains its independent reads so settlement
+    // never waits for the distiller.
+    if let Some(source) = source.clone() {
+        dctx.spawn_background(settle_session(Arc::clone(&handle), source, session.clone()));
     }
 
     let cfg = &handle.config.priors;
@@ -7029,17 +7080,11 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
         return json!({});
     };
     let args = cfg.distiller_args.clone();
-    let Some(transcript_path) = transcript_path else {
+    let Some(source) = source else {
         return json!({});
     };
 
-    dctx.spawn_background(mine_episode(
-        handle,
-        transcript_path,
-        session,
-        program,
-        args,
-    ));
+    dctx.spawn_background(mine_episode(handle, source, session, program, args));
     json!({})
 }
 
@@ -7052,27 +7097,21 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
 /// only ever go dark, however well it worked.
 ///
 /// Best-effort like all Stop-hook work: every failure is a log line.
-async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, session: String) {
+async fn settle_session(
+    handle: Arc<RepoHandle>,
+    source: impl Into<StopEpisodeSource>,
+    session: String,
+) {
     use crate::domain::prior_episode::parse_episode;
     use crate::store::priors::{ObservedError, settle_injections};
 
-    let jsonl = match tokio::task::spawn_blocking(move || std::fs::read_to_string(&transcript_path))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::debug!("prior settling: read transcript failed: {e}");
-            return;
-        }
-        Err(e) => {
-            tracing::debug!("prior settling: transcript read task failed: {e}");
+    let window = match source.into().window().await {
+        Ok(window) => window,
+        Err(reason) => {
+            tracing::debug!("prior settling: {reason}");
             return;
         }
     };
-    // The same window the miner reads. A prior injected earlier than this window
-    // is settled against what the window shows, which can only ever miss a
-    // recurrence — it never invents one.
-    let window = tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES);
     let episode = parse_episode(&window);
     let recall_events = crate::domain::recall_outcome::parse_events(&window);
     let errors: Vec<ObservedError> = episode
@@ -7199,14 +7238,14 @@ impl MiningOutcome {
 /// rule every future `return` has to remember.
 async fn mine_episode(
     handle: Arc<RepoHandle>,
-    transcript_path: String,
+    source: impl Into<StopEpisodeSource>,
     session: String,
     program: String,
     args: Vec<String>,
 ) {
     let root = handle.root.clone();
     let t0 = std::time::Instant::now();
-    let outcome = mine_episode_inner(handle, transcript_path, session, program, args).await;
+    let outcome = mine_episode_inner(handle, source.into(), session, program, args).await;
     let elapsed_ms = t0.elapsed().as_millis() as u64;
     let label = outcome.label();
     let reason = outcome.reason().map(str::to_string);
@@ -7236,7 +7275,7 @@ async fn mine_episode(
 /// the detached spawn) so it can be awaited directly in tests.
 async fn mine_episode_inner(
     handle: Arc<RepoHandle>,
-    transcript_path: String,
+    source: impl Into<StopEpisodeSource>,
     session: String,
     program: String,
     args: Vec<String>,
@@ -7249,18 +7288,13 @@ async fn mine_episode_inner(
     use crate::domain::prior_episode::parse_episode;
     use crate::store::priors::integrate_distilled;
 
-    // Read the transcript tail off the async runtime.
-    let jsonl = match tokio::task::spawn_blocking(move || std::fs::read_to_string(&transcript_path))
-        .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            tracing::debug!("prior mining: read transcript failed: {e}");
-            return MiningOutcome::Failed(format!("read transcript failed: {e}"));
+    let window = match source.into().window().await {
+        Ok(window) => window,
+        Err(reason) => {
+            tracing::debug!("prior mining: {reason}");
+            return MiningOutcome::Failed(reason);
         }
-        Err(e) => return MiningOutcome::Failed(format!("transcript read task failed: {e}")),
     };
-    let window = tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES);
 
     let episode = parse_episode(&window);
     let Some(sig) = detect_candidate(&episode) else {
@@ -16430,7 +16464,7 @@ mod tests {
     /// Mining stays OFF throughout: settling is gated on injection, not on
     /// mining, and gating it on mining would leave every prior in such a repo
     /// unsettled forever.
-    async fn inject_then_stop(transcript: &str) -> (i64, i64, Option<String>) {
+    async fn inject_then_stop(transcript: &str, inline: bool) -> (i64, i64, Option<String>) {
         let tmp = TempDir::new().unwrap();
         let handle = Arc::new(make_handle_with(&tmp, |config| {
             config.priors.mining_enabled = false;
@@ -16458,15 +16492,15 @@ mod tests {
 
         let transcript_path = tmp.path().join("transcript.jsonl");
         std::fs::write(&transcript_path, transcript).unwrap();
+        let event = if inline {
+            json!({"episode_jsonl": transcript, "session_id": "s1"})
+        } else {
+            json!({"transcript_path": transcript_path.to_string_lossy(), "session_id": "s1"})
+        };
         let dctx = make_collecting_dctx();
-        hook_stop_impl(
-            Arc::clone(&handle),
-            &json!({
-                "transcript_path": transcript_path.to_string_lossy(),
-                "session_id": "s1"
-            }),
-            &dctx,
-        );
+        dispatch_call("hook.stop", event, Arc::clone(&handle), &dctx)
+            .await
+            .expect("Stop dispatch");
         dctx.join_background().await;
 
         let (confirmed, refuted) = cluster_belief(&handle, &cluster_id).await;
@@ -16485,7 +16519,7 @@ mod tests {
     /// closes as `unrefuted` so the next Stop hook does not ask again.
     #[tokio::test]
     async fn a_session_that_did_not_trip_the_error_does_not_confirm_the_prior() {
-        let (confirmed, refuted, outcome) = inject_then_stop(MINE_BORING_TRANSCRIPT).await;
+        let (confirmed, refuted, outcome) = inject_then_stop(MINE_BORING_TRANSCRIPT, false).await;
         assert_eq!(
             confirmed, 0,
             "a quiet session is not evidence the lesson held"
@@ -16502,10 +16536,143 @@ mod tests {
     async fn the_warned_error_happening_anyway_refutes_the_prior() {
         // MINE_FIX_TRANSCRIPT carries exactly the failure the seeded cluster
         // warns about: the model was told, and hit it regardless.
-        let (confirmed, refuted, outcome) = inject_then_stop(MINE_FIX_TRANSCRIPT).await;
+        let (confirmed, refuted, outcome) = inject_then_stop(MINE_FIX_TRANSCRIPT, false).await;
         assert_eq!(refuted, 1, "the failure came back after the warning");
         assert_eq!(confirmed, 0);
         assert_eq!(outcome.as_deref(), Some("refuted"));
+    }
+
+    /// Catches: inline settlement is missing or incorrectly gated on mining.
+    #[tokio::test]
+    async fn hook_stop_inline_settlement_matches_transcript_with_mining_disabled() {
+        for (transcript, expected) in [
+            (
+                MINE_BORING_TRANSCRIPT,
+                (0, 0, Some("unrefuted".to_string())),
+            ),
+            (MINE_FIX_TRANSCRIPT, (0, 1, Some("refuted".to_string()))),
+        ] {
+            let inline = inject_then_stop(transcript, true).await;
+            let file = inject_then_stop(transcript, false).await;
+            assert_eq!(inline, expected);
+            assert_eq!(inline, file, "inline and file settlement must agree");
+        }
+    }
+
+    /// Catches: over-limit input is truncated, or malformed data falls back to
+    /// a file and settles an outcome that the host did not report.
+    #[tokio::test]
+    async fn hook_stop_inline_rejects_invalid_input_without_file_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let cluster_id = seed_promoted_prior_with_signature(
+            &handle,
+            "pre_tool",
+            r#"{"path_glob":"src/generated/**"}"#,
+            "Do not edit generated files.",
+            Some("error[E0433]: failed to resolve"),
+        )
+        .await;
+        let injected = hook_pre_tool_use_impl(&handle, &json!({
+            "tool_name": "Edit", "tool_input": {"file_path": tmp.path().join("src/generated/api.rs")},
+            "session_id": "s1"
+        })).await;
+        assert_ne!(injected, json!({}));
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
+        let cases = [
+            (json!(null), "must be a string"),
+            (json!([]), "must be a string"),
+            (json!("x".repeat(262_145)), "exceeds 262144 bytes"),
+            (json!("{}\n".repeat(801)), "exceeds 800 records"),
+            (
+                json!(format!("{MINE_CORRECTION_TRANSCRIPT}\nnot json")),
+                "record 4",
+            ),
+            (json!(r#"{"type":"user"}"#), "missing message"),
+            (
+                json!(r#"{"type":"user","message":{"content":[{"type":"tool_result"}]}}"#),
+                "record 1",
+            ),
+            (
+                json!(r#"{"type":"assistant","message":{"content":[{"type":"bogus"}]}}"#),
+                "unsupported content block",
+            ),
+        ];
+        for (inline, reason) in cases {
+            let event = json!({"session_id": "s1", "episode_jsonl": inline,
+                "transcript_path": transcript.to_string_lossy()});
+            let error = stop_episode_source(&event)
+                .err()
+                .expect("must refuse invalid episode");
+            assert!(error.contains(reason), "expected {reason:?}: {error}");
+            let dctx = make_collecting_dctx();
+            assert_eq!(
+                hook_stop_impl(Arc::clone(&handle), &event, &dctx),
+                json!({})
+            );
+            dctx.join_background().await;
+            assert_eq!(
+                injection_outcome(&handle, &cluster_id).await,
+                None,
+                "invalid input must not settle from the fallback transcript"
+            );
+        }
+    }
+
+    /// Catches: off-by-one limits reject valid evidence, truncation loses the
+    /// last failure, or character counting admits oversized UTF-8 input.
+    #[tokio::test]
+    async fn hook_stop_inline_accepts_exact_record_and_byte_limits() {
+        let tool = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"last-error","name":"Bash","input":{"command":"cargo build"}}]}}"#;
+        let failure = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"last-error","is_error":true,"content":"error[E0433]: failed to resolve"}]}}"#;
+        let empty = r#"{"type":"user","message":{"content":""}}"#;
+        let mut records = vec![tool];
+        records.extend(std::iter::repeat_n(empty, 798));
+        records.push(failure);
+        let exact_records = records.join("\n");
+        let too_many_records = format!("{empty}\n{exact_records}");
+
+        // Pad a real user message with multibyte text, leaving the decisive
+        // tool result as the final record at the exact byte boundary.
+        let unpadded = format!("{empty}\n{tool}\n{failure}");
+        let padding_bytes = 262_144 - unpadded.len();
+        let padding = format!(
+            "{}{}",
+            "é".repeat(padding_bytes / 2),
+            " ".repeat(padding_bytes % 2)
+        );
+        let prompt = json!({"type": "user", "message": {"content": padding}}).to_string();
+        let exact_bytes = format!("{prompt}\n{tool}\n{failure}");
+        assert_eq!(exact_bytes.len(), 262_144, "fixture byte boundary");
+        let too_many_bytes = format!("{prompt} \n{tool}\n{failure}");
+        assert_eq!(too_many_bytes.len(), 262_145, "fixture byte boundary");
+
+        for (name, episode, expected) in [
+            (
+                "800 records",
+                exact_records,
+                (0, 1, Some("refuted".to_string())),
+            ),
+            (
+                "262144 bytes",
+                exact_bytes,
+                (0, 1, Some("refuted".to_string())),
+            ),
+            ("801 records", too_many_records, (0, 0, None)),
+            ("262145 bytes", too_many_bytes, (0, 0, None)),
+            (
+                "empty episode",
+                String::new(),
+                (0, 0, Some("unrefuted".to_string())),
+            ),
+        ] {
+            assert_eq!(
+                inject_then_stop(&episode, true).await,
+                expected,
+                "{name}: accepted final-record failure must refute the prior; refused evidence must leave its injection open"
+            );
+        }
     }
 
     /// A prior nobody was shown has nothing to answer for. Without this, every
@@ -16847,6 +17014,69 @@ mod tests {
             outcomes,
             vec!["distilled", "promoted"],
             "the first session integrates, the second promotes"
+        );
+    }
+
+    /// Catches: inline-only Stop silently skips mining at the transcript_path gate.
+    #[tokio::test]
+    async fn hook_stop_inline_episode_mines_without_transcript_path() {
+        let mut snapshots = Vec::new();
+        for inline in [true, false] {
+            let tmp = TempDir::new().unwrap();
+            let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
+            let (program, args) = Stub {
+                stdout: distilled,
+                ..Default::default()
+            }
+            .build(tmp.path());
+            let handle = Arc::new(make_handle_with(&tmp, |config| {
+                config.priors.mining_enabled = true;
+                config.priors.distiller_program = Some(program);
+                config.priors.distiller_args = args;
+            }));
+            let transcript = tmp.path().join("episode.jsonl");
+            let mut event = json!({"session_id": "inline-session"});
+            if inline {
+                event["episode_jsonl"] = json!(MINE_CORRECTION_TRANSCRIPT);
+            } else {
+                std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
+                event["transcript_path"] = json!(transcript.to_string_lossy());
+            }
+            let dctx = make_collecting_dctx();
+            assert_eq!(
+                hook_stop_impl(Arc::clone(&handle), &event, &dctx),
+                json!({})
+            );
+            dctx.join_background().await;
+            ensure_handle_context(&handle).await.unwrap();
+            let guard = handle.ctx.lock().await;
+            let count: i64 = guard
+                .as_ref()
+                .unwrap()
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM prior_candidates WHERE source_session = 'inline-session'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 1,
+                "Stop must persist the mined prior (inline={inline})"
+            );
+            let snapshot: (String, String, String, String) = guard.as_ref().unwrap().conn.query_row(
+            "SELECT lesson, trigger_kind, trigger_matcher, source_session FROM prior_candidates",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+            assert_eq!(
+                snapshot.0,
+                "Do not edit generated files; edit the generator template."
+            );
+            snapshots.push(snapshot);
+        }
+        assert_eq!(
+            snapshots[0], snapshots[1],
+            "inline and file mining must agree"
         );
     }
 
