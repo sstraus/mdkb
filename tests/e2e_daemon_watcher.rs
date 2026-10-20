@@ -905,6 +905,9 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     let root = tmp.path().to_path_buf();
 
     let ctx = Context::init(&root).expect("Context::init");
+    // Catches the root-collection bypass: previously even these non-document
+    // writes routed to docs and overflowed the delivery channel.
+    add_collection(&ctx.conn, &make_collection("_root", ".")).unwrap();
     let src = root.join("src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("seed.rs"), "pub fn seed() {}\n").unwrap();
@@ -945,6 +948,7 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     // burst causes.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+    let docs_before = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
 
     // Six times the channel: unfiltered, the tail would be dropped (measured
     // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls).
@@ -963,6 +967,13 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
          not installed, so the channel overflowed and forced a full rescan"
     );
 
+    assert_eq!(
+        DOC_REINDEX_COUNT.load(Ordering::Relaxed),
+        docs_before,
+        "root collection churn must not cause document rescans"
+    );
+    eprintln!("600 non-document writes under root collection: code rescans=0, doc rescans=0");
+
     // Control: a routed change is still delivered and reindexed.
     let routed = || std::fs::write(src.join("routed.rs"), "pub fn routed() {}\n").unwrap();
     routed();
@@ -978,4 +989,55 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     }
 
     watcher.abort();
+}
+
+/// Catches: resetting the idle sleep on every injected event, which starves
+/// indexing forever under a continuous editor/hook stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn continuous_injected_changes_do_not_starve_indexing() {
+    let _serial = WATCHER_TESTS.lock().await;
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+    let ctx = Arc::new(Mutex::new(Some(Context::init(&root).unwrap())));
+    let code = Arc::new(Mutex::new(None));
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+    let watcher = tokio::spawn(run_file_watcher_inner(
+        root.clone(),
+        ctx,
+        Arc::clone(&code),
+        true,
+        vec![],
+        true,
+        50,
+        200,
+        Some(Arc::clone(&ready)),
+        Some(rx),
+    ));
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
+        .await
+        .unwrap();
+    let source = root.join("continuous.rs");
+    std::fs::write(&source, "pub fn continuous() {}\n").unwrap();
+    // Drive the actual hook injection channel faster than the idle window,
+    // checking the consumer-visible symbol while traffic is still in flight.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        tx.send(source.clone()).await.unwrap();
+        if code
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|f| f.get_symbol_by_name("continuous").is_some())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "continuous injected traffic starved the code flush"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    watcher.abort();
+    let _ = watcher.await;
 }
