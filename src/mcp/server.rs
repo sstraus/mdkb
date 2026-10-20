@@ -1374,11 +1374,13 @@ struct ChangeRoutes {
     doc: bool,
     /// The git-tracked memory entry projection, `.mdkb/memory/entries/*.md`.
     memory: bool,
+    /// Membership may have changed for an unknown set of descendants.
+    reconcile: bool,
 }
 
 impl ChangeRoutes {
     fn any(self) -> bool {
-        self.code || self.doc || self.memory
+        self.code || self.doc || self.memory || self.reconcile
     }
 }
 
@@ -1400,7 +1402,6 @@ fn watched_memory_entries_dir(root: &Path, namespace: Option<&str>) -> PathBuf {
 struct WatchedCollection {
     path: PathBuf,
     matcher: globset::GlobMatcher,
-    ignore_root: PathBuf,
     respect_gitignore: bool,
 }
 
@@ -1408,7 +1409,6 @@ impl WatchedCollection {
     fn new(path: PathBuf, pattern: &str) -> Option<Self> {
         match crate::core::indexing::compile_collection_matcher(pattern) {
             Ok(matcher) => Some(Self {
-                ignore_root: path.clone(),
                 path,
                 matcher,
                 respect_gitignore: false,
@@ -1433,20 +1433,58 @@ fn classify_change(
     // other stores' projections must never trigger document or code indexing.
     let memory = path.parent() == Some(memory_entries_dir)
         && path.extension().and_then(|e| e.to_str()) == Some("md");
+    // The debouncer drops event type information. A vanished path may have
+    // been a directory (even one named notes.md), so reconcile its descendants.
+    let subtree = path.is_dir() || !path.exists();
     let internal = path
         .components()
         .any(|c| c.as_os_str() == ".mdkb" || c.as_os_str() == ".git");
-    if internal || code_excludes.is_match(path) {
+    // A trailing /** excludes directory contents, not always the directory
+    // notification itself. Test a descendant before admitting subtree work.
+    if internal
+        || code_excludes.is_match(path)
+        || (subtree && code_excludes.is_match(path.join("__mdkb_subtree__")))
+    {
         return ChangeRoutes {
             memory,
             ..Default::default()
         };
     }
+    let policy = path.file_name().and_then(|name| name.to_str());
+    let policy_applies = |respect: bool| {
+        policy == Some(".ignore")
+            || policy == Some(if respect { ".gitignore" } else { ".mdkbignore" })
+    };
+    let in_scope =
+        |root: &Path, candidate: &Path| candidate.starts_with(root) || root.starts_with(candidate);
+    let relevant_policy = |root: &Path, respect: bool, parent: &Path| {
+        policy_applies(respect)
+            && in_scope(root, parent)
+            && (!parent.starts_with(root)
+                || !crate::code::indexing::walker::watcher_path_is_ignored(root, parent, respect))
+    };
+    let policy_change = path.parent().is_some_and(|parent| {
+        collections.iter().any(|collection| {
+            relevant_policy(&collection.path, collection.respect_gitignore, parent)
+        }) || code_policy.is_some_and(|(root, respect)| relevant_policy(root, respect, parent))
+    });
+    let subtree_change = subtree
+        && (collections.iter().any(|collection| {
+            in_scope(&collection.path, path)
+                && (!path.starts_with(&collection.path)
+                    || !crate::code::indexing::walker::watcher_path_is_ignored(
+                        &collection.path,
+                        path,
+                        collection.respect_gitignore,
+                    ))
+        }) || code_policy.is_some_and(|(root, respect)| {
+            in_scope(root, path)
+                && !crate::code::indexing::walker::watcher_path_is_ignored(root, path, respect)
+        }));
     ChangeRoutes {
         code: Language::from_path(path).is_some()
             && code_policy.is_none_or(|(root, respect_gitignore)| {
                 !crate::code::indexing::walker::watcher_path_is_ignored(
-                    root,
                     root,
                     path,
                     respect_gitignore,
@@ -1456,13 +1494,13 @@ fn classify_change(
             path.strip_prefix(&collection.path)
                 .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel)))
                 && !crate::code::indexing::walker::watcher_path_is_ignored(
-                    &collection.ignore_root,
                     &collection.path,
                     path,
                     collection.respect_gitignore,
                 )
         }),
         memory,
+        reconcile: policy_change || subtree_change,
     }
 }
 
@@ -1482,9 +1520,10 @@ fn routed_path_filter(
             &memory_entries_dir,
             code_policy
                 .as_ref()
+                .filter(|_| code_enabled)
                 .map(|(root, respect)| (root.as_path(), *respect)),
         );
-        (code_enabled && routes.code) || routes.doc || routes.memory
+        (code_enabled && routes.code) || routes.doc || routes.memory || routes.reconcile
     }
 }
 
@@ -1515,6 +1554,12 @@ fn queue_watcher_change(
     docs: &mut FileUpdateRequest,
     memory: &mut FileUpdateRequest,
 ) {
+    if !routes.any() {
+        tracing::debug!(?path, "Ignoring unrouted change");
+    }
+    if routes.reconcile {
+        *needs_rescan = true;
+    }
     if code_enabled && routes.code {
         note_code_change(code_batch, needs_rescan, path.to_path_buf());
     }
@@ -1666,7 +1711,6 @@ pub async fn run_file_watcher_inner(
         .iter()
         .filter_map(|coll| {
             let mut watched = WatchedCollection::new(root.join(&coll.path), &coll.pattern)?;
-            watched.ignore_root = root.clone();
             watched.respect_gitignore = doc_respect_gitignore;
             Some(watched)
         })
@@ -1843,7 +1887,7 @@ pub async fn run_file_watcher_inner(
                 // always follows one and carries the news out of the watcher.
                 needs_rescan |= watcher.take_missed_events();
                 tracing::debug!("File change detected: {:?}", change.path);
-                let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir, Some((&root, respect_gitignore)));
+                let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir, code_enabled.then_some((root.as_path(), respect_gitignore)));
                 queue_watcher_change(&change.path, routes, code_enabled, &mut code_batch, &mut needs_rescan, &mut needs_doc_update, &mut needs_memory_sync);
             }
             path = recv_injected!() => {
@@ -4688,21 +4732,27 @@ if (require.main === module) {
     /// Catches F3: policy-only changes never removing or discovering documents.
     #[tokio::test]
     async fn ignore_policy_notifications_reconcile_untouched_documents() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
-        std::fs::write(root.join("note.md"), "# Note").unwrap();
-        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
-        delivery.apply([root.join("note.md")]).await;
-        assert!(delivery.contains("note.md").await);
-        std::fs::write(root.join(".mdkbignore"), "note.md\n").unwrap();
-        delivery.apply([root.join(".mdkbignore")]).await;
-        assert!(
-            !delivery.contains("note.md").await,
-            "policy edit left ignored document searchable"
-        );
-        std::fs::remove_file(root.join(".mdkbignore")).unwrap();
-        delivery.apply([root.join(".mdkbignore")]).await;
-        assert!(delivery.contains("note.md").await);
+        for (policy, respect) in [
+            (".mdkbignore", false),
+            (".ignore", false),
+            (".gitignore", true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+            std::fs::write(root.join("note.md"), "# Note").unwrap();
+            let mut delivery = DocumentDelivery::new(&root, "**/*.md", respect);
+            delivery.apply([root.join("note.md")]).await;
+            assert!(delivery.contains("note.md").await);
+            std::fs::write(root.join(policy), "note.md\n").unwrap();
+            delivery.apply([root.join(policy)]).await;
+            assert!(
+                !delivery.contains("note.md").await,
+                "policy edit left ignored document searchable"
+            );
+            std::fs::remove_file(root.join(policy)).unwrap();
+            delivery.apply([root.join(policy)]).await;
+            assert!(delivery.contains("note.md").await);
+        }
     }
 
     /// Catches F2: a child whitelist reopening a directory the walker prunes.
@@ -4816,6 +4866,97 @@ if (require.main === module) {
         }
     }
 
+    /// Catches: delivery crossing an initialized nested-store boundary, or
+    /// ignoring per-directory exclusions after a collection glob matches.
+    #[tokio::test]
+    async fn delivered_document_ignores_and_nested_stores_preserve_membership() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::create_dir_all(root.join("docs/nested/.mdkb")).unwrap();
+        std::fs::write(root.join(".mdkbignore"), "docs/ignored.md\n").unwrap();
+        std::fs::write(root.join("docs/.mdkbignore"), "local.md\n").unwrap();
+        std::fs::write(root.join("docs/nested/.mdkb/index.sqlite"), "initialized").unwrap();
+        let paths = [
+            "docs/keep.md",
+            "docs/ignored.md",
+            "docs/local.md",
+            "docs/.hidden.md",
+            "docs/nested/child.md",
+        ];
+        for path in paths {
+            std::fs::write(root.join(path), "# Note").unwrap();
+        }
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        delivery.apply(paths.map(|path| root.join(path))).await;
+        assert!(delivery.contains("docs/keep.md").await);
+        for path in &paths[1..] {
+            assert!(!delivery.contains(path).await, "{path}");
+        }
+    }
+
+    /// Catches: source admission indexing ignored symbols or losing annotated
+    /// force-includes before the code index observes a delivered edit.
+    #[tokio::test]
+    async fn delivered_source_membership_preserves_ignore_and_force_include() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        std::fs::write(
+            root.join(".gitignore"),
+            "ignored.rs\n# mdkb:index\nforced.rs\n",
+        )
+        .unwrap();
+        for name in ["ignored", "forced", "ordinary"] {
+            std::fs::write(
+                root.join(format!("{name}.rs")),
+                format!("pub fn {name}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let excludes = build_code_excludes(&root, &[]);
+        let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms: 20 }).unwrap();
+        watcher.set_filter(routed_path_filter(
+            vec![],
+            excludes.clone(),
+            root.join(".mdkb/memory/entries"),
+            true,
+            Some((root.clone(), true)),
+        ));
+        for name in ["ignored", "forced", "ordinary"] {
+            watcher.deliver_for_test(root.join(format!("{name}.rs")));
+        }
+        let mut batch = Vec::new();
+        let mut full = false;
+        let mut docs = FileUpdateRequest::Idle;
+        let mut memory = FileUpdateRequest::Idle;
+        for change in watcher.drain_for_test() {
+            let routes = classify_change(
+                &change.path,
+                &[],
+                &excludes,
+                &root.join(".mdkb/memory/entries"),
+                Some((&root, true)),
+            );
+            queue_watcher_change(
+                &change.path,
+                routes,
+                true,
+                &mut batch,
+                &mut full,
+                &mut docs,
+                &mut memory,
+            );
+        }
+        let code = Arc::new(Mutex::new(Some(
+            IndexFacade::create(root.join("code.sqlite")).unwrap(),
+        )));
+        flush_code_batch(&code, &root, &mut batch).await;
+        let guard = code.lock().await;
+        let index = guard.as_ref().unwrap();
+        assert!(index.get_symbol_by_name("ignored").is_none());
+        assert!(index.get_symbol_by_name("forced").is_some());
+        assert!(index.get_symbol_by_name("ordinary").is_some());
+    }
+
     /// Catches: a long unique-path burst losing work instead of recovering,
     /// or duplicates turning a targeted edit into an unrelated whole-tree scan.
     #[tokio::test]
@@ -4830,12 +4971,15 @@ if (require.main === module) {
             .await;
         assert!(delivery.contains("same.md").await);
         assert!(!delivery.contains("unrelated.md").await);
-        // Missing file paths are legitimate deletion notifications. The final
-        // existing document stands for a changed path beyond the retained cap.
+        // Existing unique paths reach the pending-path cap, rather than the
+        // separate unknown/deleted-subtree reconciliation fallback.
+        for i in 0..1025 {
+            std::fs::write(root.join(format!("{i}.md")), "# Burst").unwrap();
+        }
         std::fs::write(root.join("last.md"), "# Last").unwrap();
         delivery
             .apply(
-                (0..2048)
+                (0..1025)
                     .map(|i| root.join(format!("{i}.md")))
                     .chain([root.join("last.md")]),
             )

@@ -92,6 +92,33 @@ fn discover_forced_files(
     force_patterns: &[String],
     accept: &dyn Fn(&Path) -> bool,
 ) -> Vec<PathBuf> {
+    let Some(builder) = forced_walk_builder(root, force_patterns) else {
+        return Vec::new();
+    };
+
+    builder
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+            {
+                return None;
+            }
+            if !accept(&path) {
+                return None;
+            }
+            Some(path)
+        })
+        .collect()
+}
+
+/// The forced pass and watcher admission must use identical traversal rules.
+fn forced_walk_builder(root: &Path, force_patterns: &[String]) -> Option<WalkBuilder> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -119,29 +146,11 @@ fn discover_forced_files(
             tracing::error!(
                 "Failed to build mdkb:index overrides: {e}. Forced files will NOT be included."
             );
-            return Vec::new();
+            return None;
         }
     }
 
-    builder
-        .build()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
-        .filter_map(|entry| {
-            let path = entry.into_path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
-            {
-                return None;
-            }
-            if !accept(&path) {
-                return None;
-            }
-            Some(path)
-        })
-        .collect()
+    Some(builder)
 }
 
 /// Walk a directory and collect file paths, applying ignore rules and the
@@ -169,7 +178,7 @@ fn is_nested_store(dir: &Path) -> bool {
     dir.join(".mdkb").join("index.sqlite").is_file()
 }
 
-pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+fn walk_builder(opts: WalkOptions<'_>) -> WalkBuilder {
     let WalkOptions {
         root,
         ignore_patterns,
@@ -229,6 +238,14 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
         }
     }
 
+    builder
+}
+
+pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let root = opts.root;
+    let respect_gitignore = opts.respect_gitignore;
+    let builder = walk_builder(opts);
+
     let mut files: Vec<PathBuf> = builder
         .build()
         .filter_map(Result::ok)
@@ -264,7 +281,6 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
 /// uses this after its collection glob and build exclusions have matched.
 /// Read ignore files only along this path; do not rediscover the repository.
 pub(crate) fn watcher_path_is_ignored(
-    repo_root: &Path,
     collection_root: &Path,
     path: &Path,
     respect_gitignore: bool,
@@ -272,78 +288,46 @@ pub(crate) fn watcher_path_is_ignored(
     let Ok(relative) = path.strip_prefix(collection_root) else {
         return true;
     };
-    let forced = if respect_gitignore {
-        let mut overrides = OverrideBuilder::new(collection_root);
-        for pattern in parse_mdkb_index_annotations(collection_root) {
-            let _ = overrides.add(&pattern);
-        }
-        overrides
-            .build()
-            .is_ok_and(|m| m.matched(path, false).is_whitelist())
-    } else {
-        false
-    };
-    if path
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
-    {
-        return true;
-    }
-    if !forced
-        && relative
-            .components()
-            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
-    {
-        return true;
-    }
-    let mut builder = ignore::gitignore::GitignoreBuilder::new(repo_root);
-    let mut directories = Vec::new();
-    let mut parent = path.parent();
-    while let Some(dir) = parent {
-        if !dir.starts_with(repo_root) {
-            break;
-        }
-        if !forced
-            && dir != collection_root
-            && dir.starts_with(collection_root)
-            && dir.join(".mdkb/index.sqlite").is_file()
-        {
-            return true;
-        }
-        directories.push(dir);
-        if dir == repo_root {
-            break;
-        }
-        parent = dir.parent();
-    }
-    if respect_gitignore {
-        let _ = builder.add(repo_root.join(".git/info/exclude"));
-    }
-    for dir in directories.into_iter().rev() {
-        let _ = builder.add(dir.join(".ignore"));
-        let _ = builder.add(dir.join(if respect_gitignore {
-            ".gitignore"
-        } else {
-            MDKB_IGNORE_FILENAME
-        }));
-    }
-    if forced {
+    // Construct a fresh matcher per event so policy edits cannot leave stale
+    // directory snapshots. This uses the walker's own parent/Git hierarchy and
+    // pruning precedence without enumerating siblings or retaining new state.
+    let builder = walk_builder(WalkOptions {
+        root: collection_root,
+        ignore_patterns: &[],
+        respect_gitignore,
+    });
+    let mut matchers = builder.build_matchers();
+    let ignored = matchers[0]
+        .matched(relative, path.is_dir() || !path.exists())
+        .is_ignore();
+    // Incremental matchers cannot apply filter_entry, so enforce the walker's
+    // initialized-store boundary explicitly along this candidate's ancestors.
+    let nested = path
+        .ancestors()
+        .skip(usize::from(!path.is_dir()))
+        .take_while(|dir| *dir != collection_root)
+        .any(is_nested_store);
+    if !ignored && !nested {
         return false;
     }
-    if let Ok(matcher) = builder.build() {
-        let matched = matcher.matched_path_or_any_parents(path, false);
-        if matched.is_ignore() {
-            return true;
-        }
-        if matched.is_whitelist() {
-            return false;
+    if respect_gitignore
+        && !path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+    {
+        let patterns = parse_mdkb_index_annotations(collection_root);
+        if !patterns.is_empty()
+            && let Some(builder) = forced_walk_builder(collection_root, &patterns)
+        {
+            let mut matchers = builder.build_matchers();
+            // As in discover_forced_files, force inclusion can cross hidden
+            // directories and nested stores, but must actually match an override.
+            return !matchers[0]
+                .matched(relative, path.is_dir() || !path.exists())
+                .is_whitelist();
         }
     }
-    if respect_gitignore {
-        let (global, _) = ignore::gitignore::GitignoreBuilder::new(repo_root).build_global();
-        return global.matched_path_or_any_parents(path, false).is_ignore();
-    }
-    false
+    true
 }
 
 /// Discover source files under `root` for code indexing.
