@@ -172,7 +172,13 @@ fn lifecycle_no_project_consumes_payload_before_exit() {
             // Larger than a pipe buffer: success requires the child to read,
             // regardless of which process gets scheduled first.
             let written = child.stdin.take().unwrap().write_all(payload.as_bytes());
-            eprintln!("scratch={:?}, canonical={:?}, resolved={:?}, home={:?}", temp.path(), temp.path().canonicalize(), mdkb::git::resolve_registrable_root(temp.path(), None), mdkb::daemon::config::home_dir());
+            eprintln!(
+                "scratch={:?}, canonical={:?}, resolved={:?}, home={:?}",
+                temp.path(),
+                temp.path().canonicalize(),
+                mdkb::git::resolve_registrable_root(temp.path(), None),
+                mdkb::daemon::config::home_dir()
+            );
             let output = child.wait_with_output().expect("reap lifecycle hook");
             if written.is_err()
                 || !output.status.success()

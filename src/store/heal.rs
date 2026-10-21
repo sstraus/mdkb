@@ -1107,6 +1107,8 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
             .unwrap_or(&name);
         if !salvaged.contains(copy_name) {
             if copy_name == name {
+                #[cfg(test)]
+                eprintln!("sweep warning branch: {name}");
                 tracing::warn!(
                     "quarantine {name} is past its retention but its salvage never succeeded; keeping it — it may hold the only copy of those memory entries"
                 );
@@ -2038,8 +2040,21 @@ mod tests {
         });
 
         if logs.is_empty() {
+            tracing::callsite::rebuild_interest_cache();
             let probe = captured_logs(|| {
-                eprintln!("capture WARN enabled: {}", tracing::enabled!(tracing::Level::WARN));
+                tracing::warn!("direct capture probe");
+                eprintln!(
+                    "fixture exists={}, contents={:?}",
+                    corrupt.exists(),
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name())
+                        .collect::<Vec<_>>()
+                );
+                eprintln!(
+                    "capture WARN enabled: {}",
+                    tracing::enabled!(tracing::Level::WARN)
+                );
                 sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
             });
             eprintln!("second sweep capture: {probe:?}");
