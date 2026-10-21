@@ -1483,7 +1483,12 @@ fn classify_change(
                 )
             }),
         doc: collections.iter().any(|collection| {
-            ((missing && in_scope(&collection.path, path))
+            // Ignore matchers accept descendants only. A vanished strict
+            // ancestor still removes this collection's stored descendants.
+            if missing && collection.path.starts_with(path) && collection.path.as_path() != path {
+                return true;
+            }
+            ((missing && path.starts_with(&collection.path))
                 || path
                     .strip_prefix(&collection.path)
                     .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel))))
@@ -4865,6 +4870,86 @@ if (require.main === module) {
             )
             .unwrap()
             .is_some()
+        }
+    }
+
+    /// Catches critic F1: descendant-only ignore checks dropping a vanished
+    /// ancestor when no repository-root collection masks the routing error.
+    #[tokio::test]
+    async fn vanished_collection_ancestor_deletes_only_nested_collection() {
+        for respect_gitignore in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+            std::fs::create_dir_all(root.join("docs/guides")).unwrap();
+            std::fs::create_dir_all(root.join("docs-other/references")).unwrap();
+            let mut delivery = DocumentDelivery::new(&root, "**/*.md", respect_gitignore);
+            {
+                let guard = delivery.ctx.lock().await;
+                let conn = &guard.as_ref().unwrap().conn;
+                for collection in collections::list_collections(conn).unwrap() {
+                    collections::remove_collection(conn, &collection.name).unwrap();
+                }
+                for (name, path) in [("docs", "docs/guides"), ("other", "docs-other/references")] {
+                    collections::add_collection(
+                        conn,
+                        &crate::domain::Collection {
+                            name: name.into(),
+                            path: path.into(),
+                            pattern: "**/*.md".into(),
+                            source: "manual".into(),
+                            created_at: 0,
+                            updated_at: 0,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            delivery.collections = ["docs/guides", "docs-other/references"]
+                .into_iter()
+                .map(|path| {
+                    let mut collection =
+                        WatchedCollection::new(root.join(path), "**/*.md").unwrap();
+                    collection.respect_gitignore = respect_gitignore;
+                    collection
+                })
+                .collect();
+            delivery.watcher.set_filter(routed_path_filter(
+                delivery.collections.clone(),
+                delivery.excludes.clone(),
+                root.join(".mdkb/memory/entries"),
+                false,
+                None,
+            ));
+            let note = root.join("docs/guides/note.md");
+            let sibling = root.join("docs-other/references/keep.md");
+            std::fs::write(&note, "# Removed\n").unwrap();
+            std::fs::write(&sibling, "# Keep\n").unwrap();
+            delivery.apply([note, sibling]).await;
+            assert!(delivery.contains("note.md").await);
+            std::fs::write(
+                root.join("docs-other/references/undelivered.md"),
+                "# Not delivered\n",
+            )
+            .unwrap();
+            std::fs::remove_dir_all(root.join("docs")).unwrap();
+            delivery.apply([root.join("docs")]).await;
+            assert!(
+                !delivery.contains("note.md").await,
+                "vanished ancestor was dropped (respect_gitignore={respect_gitignore})"
+            );
+            let guard = delivery.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            assert!(
+                crate::store::documents::get_document_by_path(conn, "other", "keep.md")
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                crate::store::documents::get_document_by_path(conn, "other", "undelivered.md")
+                    .unwrap()
+                    .is_none(),
+                "ancestor deletion must not scan the disjoint collection"
+            );
         }
     }
 
