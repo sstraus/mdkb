@@ -43,8 +43,14 @@ fn unrelated_tables_and_comments_stay_byte_identical() {
     assert_eq!(result.outcome, EgoSetupOutcome::Written);
 
     let written = fs::read_to_string(config_path(&home)).unwrap();
-    let line = format!("{KEY} = \"{}\"\n", env!("CARGO_BIN_EXE_mdkb"));
-    assert_eq!(written.replacen(&line, "", 1), USER_CONFIG);
+    // TOML permits literal Windows paths as well as escaped basic strings.
+    // Check bytes outside the inserted assignment, not its quote style.
+    let assignments: Vec<_> = written
+        .split_inclusive('\n')
+        .filter(|line| line.starts_with(&format!("{KEY} = ")))
+        .collect();
+    assert_eq!(assignments.len(), 1, "{written}");
+    assert_eq!(written.replacen(assignments[0], "", 1), USER_CONFIG);
     assert_eq!(
         key_value(&config_path(&home)).as_deref(),
         Some(env!("CARGO_BIN_EXE_mdkb"))
@@ -113,10 +119,10 @@ fn absent_config_file_is_created_with_only_the_key() {
 
     handle_setup_hooks_ego(false, false).unwrap();
 
-    assert_eq!(
-        fs::read_to_string(config_path(&home)).unwrap(),
-        format!("{KEY} = \"{}\"\n", env!("CARGO_BIN_EXE_mdkb"))
-    );
+    let written = fs::read_to_string(config_path(&home)).unwrap();
+    let doc: toml::Value = written.parse().unwrap();
+    assert_eq!(doc.as_table().unwrap().len(), 1, "{written}");
+    assert_eq!(doc[KEY].as_str(), Some(env!("CARGO_BIN_EXE_mdkb")));
 }
 
 /// Catches: --dry-run writes the file.
@@ -158,8 +164,11 @@ fn setup_from_build_registers_installed_binary_not_build_artifact() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        key_value(&home.join("config.toml")),
-        Some(installed.to_string_lossy().into_owned()),
+        mdkb::domain::canonicalize_plain(std::path::Path::new(
+            &key_value(&home.join("config.toml")).unwrap()
+        ))
+        .unwrap(),
+        mdkb::domain::canonicalize_plain(&installed).unwrap(),
         "setup must register the installed PATH binary, not the current build artifact"
     );
 }

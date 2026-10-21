@@ -502,7 +502,20 @@ fn holds_git_repos(dir: &Path) -> bool {
 /// test passes it, while `~/.mdkb` was measured at 1.2 GB indexing the whole
 /// home. A store at or above `$HOME` anchors everything the user owns.
 fn is_home_or_above(dir: &Path, home: Option<&Path>) -> bool {
-    home.is_some_and(|home| home.starts_with(dir))
+    home.is_some_and(|home| {
+        // Windows temp paths can use an 8.3 home alias (RUNNER~1), while
+        // USERPROFILE names the same directory as runneradmin. Compare resolved
+        // paths before deciding that its global store belongs to a project.
+        #[cfg(windows)]
+        {
+            let home =
+                crate::domain::canonicalize_plain(home).unwrap_or_else(|_| home.to_path_buf());
+            let dir = crate::domain::canonicalize_plain(dir).unwrap_or_else(|_| dir.to_path_buf());
+            home.starts_with(dir)
+        }
+        #[cfg(not(windows))]
+        home.starts_with(dir)
+    })
 }
 
 /// True if anchoring a store at `dir` would cover far more than one project.
@@ -1108,6 +1121,31 @@ mod tests {
         // repo, so the guard stays out of the way — it refuses containers, not
         // ordinary non-git projects.
         assert_eq!(resolve_project_root(&drifted, None), Some(drifted));
+    }
+
+    /// Catches: Windows aliases allowing the home store to become a project
+    /// store for a scratch directory under the same home.
+    #[cfg(windows)]
+    #[test]
+    fn home_aliases_do_not_expose_the_global_store_to_scratch_directories() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir(home.path().join(".mdkb")).unwrap();
+        let scratch = home.path().join("scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let canonical_home = crate::domain::canonicalize_plain(home.path()).unwrap();
+        let verbatim_home = home.path().canonicalize().unwrap();
+
+        assert!(is_home_or_above(&verbatim_home, Some(&canonical_home)));
+        assert!(is_home_or_above(home.path(), Some(&canonical_home)));
+        assert!(!is_home_or_above(&scratch, Some(&canonical_home)));
+        assert_eq!(
+            find_project_store_above(&scratch, Some(&canonical_home)),
+            None
+        );
+        assert_eq!(
+            find_project_store_above(&scratch.canonicalize().unwrap(), Some(&canonical_home)),
+            None
+        );
     }
 
     #[test]

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **CI warning capture and Windows hook setup.** Keep quarantine warnings
+  observable when another test first emits them without a subscriber. Compare
+  Windows home directory aliases by resolved path so scratch-directory hooks
+  do not borrow the global home store. Setup tests now check valid TOML values
+  and executable identity instead of quote style or Windows short-path spelling.
+  Found by the Linux and Windows CI jobs after release 3.12.0.
+
 ## 3.12.0 (2026-10-21)
 
 ### Added

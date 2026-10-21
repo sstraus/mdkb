@@ -2025,6 +2025,42 @@ mod tests {
         assert_eq!(invalidations(&db), before + 1);
     }
 
+    /// Catches: the single-dispatch optimization caching `never` when a
+    /// warning is first emitted outside the capture's thread-local default.
+    #[test]
+    fn capture_keeps_a_warning_first_emitted_without_a_subscriber() {
+        const CHILD: &str = "MDKB_TEST_CAPTURE_SINGLE_DISPATCH";
+        if std::env::var_os(CHILD).is_none() {
+            // Subscriber registration is process-global. Other tests must not
+            // supply the second dispatch that would mask this regression.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::heal::tests::capture_keeps_a_warning_first_emitted_without_a_subscriber",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(captured_logs(|| {}).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let (_, now) =
+            quarantine_aged_with(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1, false);
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+        let logs = captured_logs(|| {
+            sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+        });
+        assert!(logs.contains("is past its retention"), "{logs}");
+    }
+
     /// The one warning per sweep names the copy itself, not its `-wal`.
     #[test]
     fn an_expired_unsalvaged_copy_is_warned_about_once_by_its_own_name() {
@@ -2505,14 +2541,21 @@ mod tests {
         thread_local! {
             static BUFFER: Buf = Buf::default();
         }
-        static DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-        let dispatch = DISPATCH.get_or_init(|| {
-            tracing::Dispatch::new(
+        static DISPATCH: std::sync::OnceLock<(tracing::Dispatch, tracing::Dispatch)> =
+            std::sync::OnceLock::new();
+        let (dispatch, _registry_pin) = DISPATCH.get_or_init(|| {
+            let capture = tracing::Dispatch::new(
                 tracing_subscriber::fmt()
                     .with_writer(|| BUFFER.with(Clone::clone))
                     .with_ansi(false)
                     .finish(),
-            )
+            );
+            // tracing-core's single-dispatch fast path consults the emitting
+            // thread's default, not the registered dispatch. A first warning
+            // outside capture can therefore cache `never` permanently. Keep
+            // two live dispatches so registration always consults the registry.
+            let registry_pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            (capture, registry_pin)
         });
         let buf = BUFFER.with(Clone::clone);
         buf.0.lock().unwrap().clear();
