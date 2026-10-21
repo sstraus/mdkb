@@ -207,7 +207,7 @@ async fn the_floor_is_inclusive_and_admitted_entries_come_best_first() {
     // Catches: `>` for `>=` (an entry exactly at the fitted floor dropped) and
     // an admitted list in pool order instead of score order.
     let cfg = HooksConfig::default();
-    let floor = cfg.recall_rerank_min_score_en;
+    let floor = cfg.recall_rerank_min_scores["en"];
     let scores = vec![floor - 0.01, floor, floor + 3.0, floor + 1.0];
     let (_, reranker) = scripted(move |_| Ok(scores.clone()));
     let stage = rerank_stage(&reranker, &cfg, "what is the daemon", pool(4), BUDGET).await;

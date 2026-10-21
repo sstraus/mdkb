@@ -4,6 +4,14 @@
 
 ### Added
 
+- **Automatic recall reranking is opt-in by prompt language.** The default
+  `hooks.recall_rerank_languages = []` keeps MiniLM-only recall without fetching
+  or loading the cross-encoder. Select `it` or `en` explicitly, with finite
+  per-language floors in `hooks.recall_rerank_min_scores` (fitted defaults:
+  `it = -1.05`, `en = -1.95`). Reject unsupported languages, missing floors,
+  and removed `recall_rerank_it/en` switches or scalar floor keys with a message
+  naming the replacement. Requested by the maintainer (story 018-90b0).
+
 - **Stop hooks accept bounded inline episodes.** Hosts such as ego can send
   `session_id` and `episode_jsonl` without an ephemeral transcript file. Inline
   input uses the existing prior and recall settlement and mining paths. Reject

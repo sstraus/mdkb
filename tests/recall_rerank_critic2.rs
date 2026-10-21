@@ -60,8 +60,11 @@ fn each_language_reads_only_its_own_switch() {
     ];
     for (it, en, want_it, want_en, want_unknown) in cases {
         let cfg = HooksConfig {
-            recall_rerank_it: it,
-            recall_rerank_en: en,
+            recall_rerank_languages: [(it, "it"), (en, "en")]
+                .into_iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, code)| code.to_string())
+                .collect(),
             ..HooksConfig::default()
         };
         let label = format!("it={it} en={en}");

@@ -129,8 +129,7 @@ fn render_developer_config(config_path: &Path, retention_days: u32) -> Result<St
         toml_edit::value(i64::from(retention_days)),
     );
     let merged = doc.to_string();
-    let parsed: Config = toml::from_str(&merged)?;
-    parsed.validate()?;
+    Config::from_toml(&merged)?;
     Ok(merged)
 }
 

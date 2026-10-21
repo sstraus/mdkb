@@ -159,6 +159,11 @@ On the box the hf-hub client fails TLS (`UnknownIssuer`); `box-run.sh` prefetche
 
 ## Reranker on MiniLM top-5, held out (story 202-4c67)
 
+The following describes the historical shipped configuration. Story 018-90b0
+later made reranking opt-in with `hooks.recall_rerank_languages = []` by default
+and moved the fitted floors to `hooks.recall_rerank_min_scores`. The old switch
+and scalar floor keys are rejected; see the current hook configuration docs.
+
 Shipped: jina-reranker-v2 int8 on MiniLM's top five, per-language floor on the reranker score, per entry (`hooks.recall_rerank_min_score_it` -1.05, `..._en` -1.95). Floors are the lowest 0.05 step above the best negative of the 2026-09-30 fit data (IT best -1.081, EN best -1.986). Per-entry admission injects 20 entries for 12 IT hits on the fit pool; admitting all five once the top passes injects 75 for 14.
 
 Held-out set, written after the fit, four-gram check against the corpus passed: 44 IT positives and 24 IT negatives, 36 EN positives and 24 EN negatives. Harness: `scripts/eval-recall-options/a6.py` (`pool`, `report`). Floors not refitted on it. Wilson 95% intervals.

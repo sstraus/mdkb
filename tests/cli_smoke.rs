@@ -688,10 +688,10 @@ fn smoke_update_machine_formats_emit_a_single_document() {
 #[test]
 fn smoke_embed() {
     let repo = Repo::new();
-    // `embed` fetches the 280 MB reranker weights unless the reranker is off.
+    // Default/empty language list keeps embed MiniLM-only, with no reranker fetch.
     std::fs::write(
         repo.root.join(".mdkb/config.toml"),
-        "[hooks]\nrecall_rerank_it = false\nrecall_rerank_en = false\n",
+        "[hooks]\nrecall_rerank_languages = []\n",
     )
     .unwrap();
     run(&["update"], &repo.root);
@@ -707,6 +707,11 @@ fn embed_still_embeds_when_the_reranker_download_fails() {
     // Catches: the weights fetched before the embedding, so a failed download
     // aborts `mdkb embed` with no vectors written.
     let repo = Repo::new();
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[hooks]\nrecall_rerank_languages = [\"it\"]\n",
+    )
+    .unwrap();
     run(&["update"], &repo.root);
     // A model cache that holds MiniLM but not the reranker, and an endpoint
     // nothing listens on.

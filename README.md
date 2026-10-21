@@ -224,6 +224,27 @@ it while a miss on a sigil prompt costs one search.
 | `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
 
+Cross-encoder reranking is separate and **off by default**. With
+`hooks.recall_rerank_languages = []`, recall stays MiniLM-only: `mdkb embed`
+does not fetch reranker weights and the daemon does not load the cross-encoder.
+To opt in for Italian prompts only:
+
+```toml
+[hooks]
+recall_rerank_languages = ["it"]
+recall_rerank_min_scores = { it = -1.05, en = -1.95 }
+```
+
+Run `mdkb embed` after opting in to fetch the weights. Only `it` and `en` are
+recognised by the prompt-language detector; a tied vote uses Italian. Each
+selected language needs a finite floor in the table. An explicit table replaces
+the fitted defaults. The English floor came from a small synthetic store and
+admitted 3/24 held-out negatives, so review it before enabling English. Missing
+floors and unsupported codes are configuration errors. Old `recall_rerank_it` /
+`recall_rerank_en` keys are rejected, not translated; replace them with the list.
+Old `recall_rerank_min_score_it/en` keys must become the table above. A model
+already loaded by a previous opt-in stays resident until the daemon restarts.
+
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
 chose it on 2026-09-30 without a shadow week. The measurement that would have
 gated it is still available: this repo logged 1716 UserPromptSubmit calls over

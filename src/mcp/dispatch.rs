@@ -8860,6 +8860,8 @@ mod tests {
             delay: std::time::Duration,
             score: f32,
         },
+        /// Count calls at the model-load boundary without loading weights.
+        Counted(Arc<std::sync::atomic::AtomicUsize>),
         /// The model ran and errored.
         Fails,
     }
@@ -8877,6 +8879,10 @@ mod tests {
                     std::thread::sleep(*delay);
                     Ok(vec![*score; docs.len()])
                 }
+                StubReranker::Counted(calls) => {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![3.0; docs.len()])
+                }
                 StubReranker::Fails => Err(RerankError::Failed("stub".into())),
             }
         }
@@ -8890,14 +8896,66 @@ mod tests {
     ) -> Arc<RepoHandle> {
         let mut handle = handle_at(tmp.path().to_path_buf(), |config| {
             config.hooks.user_prompt_submit_require_sigil = false;
-            // English is off by default; these tests exercise the stage.
-            config.hooks.recall_rerank_en = true;
+            // Both languages explicitly opt in; these tests exercise the stage.
+            config.hooks.recall_rerank_languages = vec!["it".into(), "en".into()];
             tweak(config);
         });
         Arc::get_mut(&mut handle)
             .expect("a fresh handle has one owner")
             .reranker = Arc::new(reranker);
         handle
+    }
+
+    fn counted_rerank_handle(
+        tmp: &TempDir,
+        tweak: impl FnOnce(&mut Config),
+    ) -> (Arc<RepoHandle>, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handle = handle_at(tmp.path().to_path_buf(), tweak);
+        Arc::get_mut(&mut handle).unwrap().reranker =
+            Arc::new(StubReranker::Counted(Arc::clone(&calls)));
+        (handle, calls)
+    }
+
+    #[tokio::test]
+    async fn default_config_never_calls_the_reranker_model_load_boundary() {
+        // Catches an opt-out default or unconditional score call loading the
+        // cross-encoder even though the user never selected a language.
+        let tmp = TempDir::new().unwrap();
+        let (handle, calls) = counted_rerank_handle(&tmp, |_| {});
+        seed_memory_entry(&handle, "default-minilm").await;
+        for (prompt, session) in [
+            (RECALL_PROMPT, "default-en"),
+            ("perche il topic non funziona", "default-it"),
+        ] {
+            let (result, row) = prompt_row(&handle, prompt, session).await;
+            if prompt == RECALL_PROMPT {
+                assert!(
+                    additional_context(&result).contains("default-minilm"),
+                    "{result}"
+                );
+            }
+            assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn italian_opt_in_scores_italian_but_never_loads_for_english() {
+        // Catches treating a nonempty list as a global rerank switch.
+        let tmp = TempDir::new().unwrap();
+        let (handle, calls) = counted_rerank_handle(&tmp, |cfg| {
+            cfg.hooks.recall_rerank_languages = vec!["it".into()];
+        });
+        seed_memory_entry(&handle, "opted-in").await;
+        let (result, row) = prompt_row(&handle, "perche il topic non funziona", "opt-in-it").await;
+        assert!(additional_context(&result).contains("opted-in"), "{result}");
+        assert_eq!(row["phases"]["rerank_outcome"], "ok", "{row}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "opt-in-en").await;
+        assert!(additional_context(&result).contains("opted-in"), "{result}");
+        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// One prompt through the dispatcher, with the row it logged.
@@ -15572,7 +15630,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_reranked_handle(
             &tmp,
-            |config| config.hooks.recall_rerank_en = false,
+            |config| config.hooks.recall_rerank_languages = vec!["it".into()],
             StubReranker::Scores {
                 delay: ms(0),
                 score: -9.0,
@@ -15619,8 +15677,7 @@ mod tests {
         let handle = make_reranked_handle(
             &tmp,
             |config| {
-                config.hooks.recall_rerank_it = false;
-                config.hooks.recall_rerank_en = false;
+                config.hooks.recall_rerank_languages.clear();
             },
             StubReranker::Scores {
                 delay: ms(0),
@@ -15633,15 +15690,6 @@ mod tests {
 
         assert!(additional_context(&result).contains("rerank-off"));
         assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-    }
-
-    #[test]
-    fn the_reranker_is_on_for_italian_and_off_for_english_by_default() {
-        // Catches: the English floor (3/24 held-out negatives admitted) going
-        // live because the default flipped.
-        let hooks = Config::default().hooks;
-        assert!(hooks.recall_rerank_it);
-        assert!(!hooks.recall_rerank_en);
     }
 
     #[tokio::test]
