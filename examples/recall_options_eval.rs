@@ -4,6 +4,7 @@
 //!
 //!   FASTEMBED_CACHE_DIR=<dir> cargo run --release --example recall_options_eval -- \
 //!       embed <model> <data-dir> <memory-recall.json>
+//!   ... -- pipeline <minilm-l6|e5-small> <5|10> <1..78> <data-dir> <memory-recall.json>
 //!   ... -- lex <data-dir> <memory-recall.json>
 //!   ... -- rerank <reranker> <data-dir> <memory-recall.json> <pool.json>
 //!
@@ -422,9 +423,66 @@ fn rerank(key: &str, d: &Data, pool_path: &str) -> Value {
            "pool_cpu_s": cpu1.zip(cpu0).map(|(end, start)| end - start), "scores": scores})
 }
 
+/// Warm prompt-path measurement, with both models resident in one process.
+/// Corpus embedding and model loading are outside the timed prompt interval.
+fn pipeline(model_key: &str, k: usize, limit: usize, d: &Data) -> Value {
+    assert!(matches!(k, 5 | 10));
+    assert!((1..=78).contains(&limit));
+    let cache = std::env::var("FASTEMBED_CACHE_DIR").expect("set FASTEMBED_CACHE_DIR");
+    let (model_id, qp, pp) = embedding_spec(model_key);
+    let model = TextEmbedding::try_new(
+        InitOptions::new(model_id)
+            .with_cache_dir(cache.clone().into())
+            .with_show_download_progress(false),
+    )
+    .unwrap();
+    let reranker = load_reranker("jina-v2-int8", &cache);
+    let texts: Vec<&str> = d.corpus.iter().map(|(_, _, text)| text.as_str()).collect();
+    let vectors: Vec<Vec<f32>> = model
+        .embed(
+            texts.iter().map(|text| format!("{pp}{text}")).collect(),
+            Some(32),
+        )
+        .unwrap()
+        .into_iter()
+        .map(normalize)
+        .collect();
+    let prompts = [&d.sets["it_pos"][..], &d.sets["it_neg"][..]].concat();
+    let run = |prompt: &str| {
+        let started = Instant::now();
+        let q = normalize(
+            model
+                .embed(vec![format!("{qp}{prompt}")], Some(1))
+                .unwrap()
+                .remove(0),
+        );
+        let mut scores: Vec<(usize, f32)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, q.iter().zip(v).map(|(a, b)| a * b).sum()))
+            .collect();
+        scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let candidates: Vec<&str> = scores.iter().take(k).map(|(i, _)| texts[*i]).collect();
+        reranker.rerank(prompt, candidates, false, Some(k)).unwrap();
+        started.elapsed().as_secs_f64() * 1e3
+    };
+    run(&prompts[0]);
+    let samples: Vec<f64> = prompts.iter().take(limit).map(|p| run(p)).collect();
+    let (_, peak) = rusage();
+    json!({"model": model_key, "reranker": "jina-v2-int8", "k": k,
+        "latency_embed_rank_rerank": quantiles(samples.clone()), "samples_ms": samples,
+        "rss_peak_bytes": peak})
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let out = match a[1].as_str() {
+        "pipeline" => pipeline(
+            &a[2],
+            a[3].parse().unwrap(),
+            a[4].parse().unwrap(),
+            &load(&a[5], &a[6]),
+        ),
         "embed" => embed(&a[2], &load(&a[3], &a[4])),
         "lex" => lex(&load(&a[2], &a[3])),
         "rerank" => rerank(&a[2], &load(&a[3], &a[4]), &a[5]),
