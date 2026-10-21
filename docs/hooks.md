@@ -648,8 +648,9 @@ Removed rerank keys refuse daemon admission, MCP startup, lifecycle-hook policy
 loading and document watcher updates with the replacement in the logged error.
 No legacy values are translated. Lifecycle hooks skip the event and exit 0;
 they do not run with defaults. `doctor` remains available to report invalid
-configuration. Other malformed hot-reload configurations keep the daemon's last
-good configuration, not factory defaults; removed rerank keys refuse new requests.
+configuration. Other malformed files keep the existing logged whole-file fallback
+at cold start. Malformed hot-reloads keep the daemon's last good configuration,
+not factory defaults; removed rerank keys refuse new requests.
 
 ## Automated verification
 

@@ -1200,8 +1200,13 @@ impl Config {
         Ok(config)
     }
 
-    /// Load a serving repository without discarding an invalid configuration.
-    /// Only a missing file uses defaults; callers refuse the repository otherwise.
+    pub(crate) fn is_removed_rerank_error(error: &Error) -> bool {
+        matches!(error.kind(), ErrorKind::ConfigInvalid { field, message }
+            if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))
+    }
+
+    /// Refuse removed rerank controls at serving boundaries. Other malformed
+    /// files retain the existing logged whole-file fallback; absent files use defaults.
     pub fn load_for_repo(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         match Self::load(path) {
@@ -1209,9 +1214,13 @@ impl Config {
             Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
                 Ok(Self::default())
             }
-            Err(error) => {
-                tracing::warn!(root_config = %path.display(), %error, "Refusing repository with invalid configuration");
+            Err(error) if Self::is_removed_rerank_error(&error) => {
+                tracing::warn!(root_config = %path.display(), %error, "Refusing repository with removed rerank configuration");
                 Err(error)
+            }
+            Err(error) => {
+                tracing::warn!(root_config = %path.display(), %error, "Invalid configuration; every setting in the file is ignored, built-in defaults are in use");
+                Ok(Self::default())
             }
         }
     }

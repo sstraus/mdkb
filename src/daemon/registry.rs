@@ -78,7 +78,7 @@ impl RepoHandle {
         let root = canonicalize_root(root)?;
         let config_path = config_path(&root);
         let identity = ConfigIdentity::of(&config_path);
-        let config = load_config(&config_path, global_priors)?;
+        let config = load_config(&config_path, global_priors, false)?;
         Ok(Self::with_state(
             root,
             config,
@@ -97,14 +97,14 @@ impl RepoHandle {
     /// indexing. The caller spawns the new handle's watcher; the old watcher
     /// stops when the last request holding the old handle drops it.
     ///
-    /// Like [`open`](Self::open), invalid configuration refuses the repository.
-    /// A reload never replaces restrictive settings with defaults.
+    /// A malformed reload keeps the last good config; removed rerank controls
+    /// refuse new requests. Neither replaces restrictive settings with defaults.
     fn reopen(&self, global_priors: &toml::Table) -> Result<Self> {
         let config_path = config_path(&self.root);
         // Identity first: an edit landing during the read is then seen as a
         // change on the next access instead of being recorded as already read.
         let identity = ConfigIdentity::of(&config_path);
-        let config = load_config(&config_path, global_priors)?;
+        let config = load_config(&config_path, global_priors, true)?;
         Ok(Self::with_state(
             self.root.clone(),
             config,
@@ -228,8 +228,12 @@ fn config_path(root: &Path) -> PathBuf {
 
 /// `config.toml` read strictly, with the daemon's global `[priors]` layered
 /// under the repo's own. A missing file is the defaults, not an error.
-fn load_config(path: &Path, global_priors: &toml::Table) -> Result<Config> {
-    let mut config = Config::load_for_repo(path)?;
+fn load_config(path: &Path, global_priors: &toml::Table, reload: bool) -> Result<Config> {
+    let mut config = if reload && path.exists() {
+        Config::load(path)?
+    } else {
+        Config::load_for_repo(path)?
+    };
     let repo_priors = crate::config::raw_priors_layer(path);
     config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
     Ok(config)
@@ -669,9 +673,7 @@ impl RepoRegistry {
                 Ok(Some(fresh))
             }
             Err(e) => {
-                if matches!(e.kind(), crate::error::ErrorKind::ConfigInvalid { field, message }
-                    if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))
-                {
+                if Config::is_removed_rerank_error(&e) {
                     tracing::warn!(root = %canonical.display(), error = %e, "Refusing repository with removed rerank configuration");
                     return Err(e);
                 }

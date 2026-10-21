@@ -26,8 +26,10 @@
   `it = -1.05`, `en = -1.95`). Reject unsupported languages, missing floors,
   and removed `recall_rerank_it/en` switches or scalar floor keys with a message
   naming the replacement. Daemon admission, MCP startup, hooks and document
-  watcher updates refuse invalid config rather than reset unrelated settings to
-  defaults; hooks skip the event and exit 0. Diagnostic commands can still
+  watcher updates refuse removed keys rather than reset unrelated settings to
+  defaults; hooks skip the event and exit 0. Other malformed files keep the
+  existing logged fallback, and malformed daemon hot-reloads keep the last good
+  config. Diagnostic commands can still
   report the error. Requested by the maintainer (story 018-90b0); refusal gap
   found by the maintainer's release review.
 

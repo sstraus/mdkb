@@ -254,10 +254,11 @@ floors and unsupported codes are configuration errors. Old `recall_rerank_it` /
 `recall_rerank_en` keys are rejected, not translated; replace them with the list.
 Old `recall_rerank_min_score_it/en` keys must become the table above. Daemon
 admission, MCP startup, lifecycle hooks and document watcher updates refuse
-invalid configuration and log the replacement keys, rather than discard the
-file and run with defaults. Hooks remain best-effort: they skip the event and
+removed rerank keys and log their replacements, rather than discard the file
+and run with defaults. Hooks remain best-effort: they skip the event and
 exit successfully. Diagnostic commands such as `doctor` can still report the
-invalid file. A model already loaded by a previous opt-in stays resident until the daemon restarts.
+invalid file. Other malformed files keep the existing logged whole-file fallback;
+malformed daemon hot-reloads keep the last good config. A model already loaded by a previous opt-in stays resident until the daemon restarts.
 
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
 chose it on 2026-09-30 without a shadow week. The measurement that would have
