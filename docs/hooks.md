@@ -627,16 +627,29 @@ HTTP hooks require the configured HTTP/HTTPS server to remain running and
 `MDKB_HOOK_TOKEN` to match its bearer token. `mdkb update` remains the safe full
 differential fallback.
 
-Watcher admission follows the same collection globs and ignore policy as the
-full document/code walk, including common Git excludes in linked worktrees.
-Ordinary file edits index only the delivered paths, not the whole document
-tree. Git and database churn is rejected before queue admission; the active
-`memory/entries/*.md` projection remains an input. Directory moves/deletions
-and relevant ignore-file changes reconcile membership, so removed or newly
-ignored files do not remain indexed. Pending work is bounded to 1024 paths;
-overflow recovery is coalesced per repository with a 30-second cooldown rather
-than triggering a full rescan for every dropped event. These bounds control
-recovery work, not a promise that every change is indexed within 30 seconds.
+Watcher admission applies collection globs and Git/ignore-file rules, including
+common Git excludes in linked worktrees. A shared exclusion union of code
+patterns, document defaults and `.tmp` gates all routes. This is not full-walk
+parity for custom patterns: code-only exclusions can suppress documents, and
+force-included documents below excluded directories require `mdkb update`.
+Ordinary edits index only delivered paths. Vanished files and subtrees remove
+stored rows on an exact-path or slash-prefix match, without a tree walk.
+Existing directories and relevant ignore-file changes still trigger full
+membership reconciliation. Git and database churn is rejected before queue
+admission; the active `memory/entries/*.md` projection remains an input.
+Pending work is bounded to 1024 paths. Overflow and membership recovery are
+coalesced per repository with a 30-second cooldown; ordinary targeted work does
+not wait for that recovery cooldown. Failed document batches retain their paths
+(or full request), warn with the repository root, and retry after 30 seconds.
+Per-file errors also retain the batch. These bounds control recovery work, not
+a promise that every change is indexed within 30 seconds.
+
+Removed rerank keys refuse daemon admission, MCP startup, lifecycle-hook policy
+loading and document watcher updates with the replacement in the logged error.
+No legacy values are translated. Lifecycle hooks skip the event and exit 0;
+they do not run with defaults. `doctor` remains available to report invalid
+configuration. Other malformed hot-reload configurations keep the daemon's last
+good configuration, not factory defaults; removed rerank keys refuse new requests.
 
 ## Automated verification
 

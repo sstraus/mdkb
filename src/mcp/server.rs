@@ -1084,17 +1084,7 @@ pub enum TransportMode {
 pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error::Result<()> {
     // Load config if available
     let config_path = root.join(".mdkb/config.toml");
-    let full_config = if config_path.exists() {
-        match crate::Config::load(&config_path) {
-            Ok(config) => config,
-            Err(e) => {
-                tracing::warn!("Failed to load config, using defaults: {}", e);
-                crate::Config::default()
-            }
-        }
-    } else {
-        crate::Config::default()
-    };
+    let full_config = crate::Config::load_for_repo(&config_path)?;
     let code_ignore_patterns = full_config.code.indexing.ignore_patterns.clone();
 
     tracing::info!(
@@ -1433,9 +1423,10 @@ fn classify_change(
     // other stores' projections must never trigger document or code indexing.
     let memory = path.parent() == Some(memory_entries_dir)
         && path.extension().and_then(|e| e.to_str()) == Some("md");
-    // The debouncer drops event type information. A vanished path may have
-    // been a directory (even one named notes.md), so reconcile its descendants.
-    let subtree = path.is_dir() || !path.exists();
+    // Existing directories need discovery; vanished paths use stored-prefix
+    // deletion without walking any unaffected collection or source tree.
+    let missing = !path.exists();
+    let subtree = path.is_dir();
     let internal = path
         .components()
         .any(|c| c.as_os_str() == ".mdkb" || c.as_os_str() == ".git");
@@ -1443,7 +1434,7 @@ fn classify_change(
     // notification itself. Test a descendant before admitting subtree work.
     if internal
         || code_excludes.is_match(path)
-        || (subtree && code_excludes.is_match(path.join("__mdkb_subtree__")))
+        || ((subtree || missing) && code_excludes.is_match(path.join("__mdkb_subtree__")))
     {
         return ChangeRoutes {
             memory,
@@ -1482,7 +1473,8 @@ fn classify_change(
                 && !crate::code::indexing::walker::watcher_path_is_ignored(root, path, respect)
         }));
     ChangeRoutes {
-        code: Language::from_path(path).is_some()
+        code: (Language::from_path(path).is_some()
+            || (missing && code_policy.is_some_and(|(root, _)| path.starts_with(root))))
             && code_policy.is_none_or(|(root, respect_gitignore)| {
                 !crate::code::indexing::walker::watcher_path_is_ignored(
                     root,
@@ -1491,8 +1483,10 @@ fn classify_change(
                 )
             }),
         doc: collections.iter().any(|collection| {
-            path.strip_prefix(&collection.path)
-                .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel)))
+            ((missing && in_scope(&collection.path, path))
+                || path
+                    .strip_prefix(&collection.path)
+                    .is_ok_and(|rel| collection.matcher.is_match(crate::domain::rel_key(rel))))
                 && !crate::code::indexing::walker::watcher_path_is_ignored(
                     &collection.path,
                     path,
@@ -1532,8 +1526,29 @@ fn routed_path_filter(
 const MAX_PENDING_PATHS: usize = 1024;
 const RECOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Recovery and failed documents wait independently; targeted edits never wait
+/// for an unrelated full-pass cooldown.
+fn next_watcher_flush_deadline(
+    batch: tokio::time::Instant,
+    recovery: tokio::time::Instant,
+    doc_retry: Option<tokio::time::Instant>,
+    rescan: bool,
+    incremental: bool,
+    docs: bool,
+) -> tokio::time::Instant {
+    [
+        incremental.then_some(batch),
+        rescan.then_some(batch.max(recovery)),
+        docs.then_some(batch.max(doc_retry.unwrap_or(batch))),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+    .unwrap_or(batch)
+}
+
 fn note_code_change(batch: &mut Vec<PathBuf>, rescan: &mut bool, path: PathBuf) {
-    if *rescan || batch.contains(&path) {
+    if batch.contains(&path) {
         return;
     }
     if batch.len() == MAX_PENDING_PATHS {
@@ -1685,9 +1700,8 @@ pub async fn run_file_watcher_inner(
                 );
                 match outcome {
                     Some(Ok(collections)) => {
-                        let config = crate::Config::load_or_default(
-                            &ctx_guard.as_ref().unwrap().config_path,
-                        );
+                        let config =
+                            crate::Config::load_for_repo(&ctx_guard.as_ref().unwrap().config_path)?;
                         break (collections, config.indexing.respect_gitignore);
                     }
                     Some(Err(error)) => return Err(error),
@@ -1717,6 +1731,8 @@ pub async fn run_file_watcher_inner(
         .collect();
     // Documents and code must both reject build/dependency churn. The document
     // defaults apply even when code indexing has no configured exclusions.
+    // DEFERRED (2026-10-21) — ARCH-1: split route policies and preserve force-
+    // includes at admission; the current union is documented, not full-walk parity.
     let exclude_patterns: Vec<String> = code_ignore_patterns
         .iter()
         .cloned()
@@ -1838,6 +1854,7 @@ pub async fn run_file_watcher_inner(
     let mut needs_rescan = false;
     let mut flush_deadline = None;
     let mut recovery_not_before = tokio::time::Instant::now();
+    let mut doc_retry_not_before = None;
 
     loop {
         // Helper: receive from the optional injected-path channel, or block forever if absent.
@@ -1867,11 +1884,15 @@ pub async fn run_file_watcher_inner(
             flush_deadline = None;
             idle_deadline
         };
-        let deadline = if needs_rescan {
-            deadline.max(recovery_not_before)
-        } else {
-            deadline
-        };
+        let deadline = next_watcher_flush_deadline(
+            deadline,
+            recovery_not_before,
+            doc_retry_not_before,
+            needs_rescan,
+            !code_batch.is_empty() || needs_memory_sync.is_pending(),
+            needs_doc_update.is_pending()
+                && !(needs_rescan && matches!(needs_doc_update, FileUpdateRequest::Full)),
+        );
 
         tokio::select! {
             change = watcher.recv() => {
@@ -1905,11 +1926,11 @@ pub async fn run_file_watcher_inner(
             // blocks on the two event sources rather than waking on a timer.
             () = tokio::time::sleep_until(deadline), if pending => {
                 flush_deadline = None;
-                let recovering = needs_rescan;
-                if needs_rescan {
+                let recovering = needs_rescan && tokio::time::Instant::now() >= recovery_not_before;
+                if recovering {
                     needs_rescan = false;
                     tracing::warn!(
-                        "Watcher: recovering dropped change events with a full rescan"
+                        "Watcher: reconciling directory, ignore-policy or dropped-event changes with a full rescan"
                     );
                     code_batch.clear();
                     // Gated, unlike the incremental flush: that one is a no-op on
@@ -1927,7 +1948,12 @@ pub async fn run_file_watcher_inner(
                 // Full document recovery includes memory reconciliation and
                 // clears its request. Targeted document updates leave an
                 // independent memory change pending.
-                flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
+                if recovering || (!(needs_rescan && matches!(needs_doc_update, FileUpdateRequest::Full))
+                    && doc_retry_not_before.is_none_or(|at| tokio::time::Instant::now() >= at)) {
+                    flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
+                    doc_retry_not_before = needs_doc_update.is_pending()
+                        .then(|| tokio::time::Instant::now() + RECOVERY_INTERVAL);
+                }
                 flush_memory_sync(&ctx, &mut needs_memory_sync).await;
                 if recovering {
                     recovery_not_before = tokio::time::Instant::now() + RECOVERY_INTERVAL;
@@ -2087,7 +2113,7 @@ async fn full_rebuild_from_heal(
 /// breaker would never fire.
 ///
 /// A bounded document or memory update request. Each sink owns its request.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 enum FileUpdateRequest {
     /// Nothing pending.
     #[default]
@@ -2197,26 +2223,26 @@ async fn flush_doc_update(
     needs_update: &mut FileUpdateRequest,
     needs_memory_sync: &mut FileUpdateRequest,
 ) {
-    let files = match std::mem::take(needs_update) {
+    let request = std::mem::take(needs_update);
+    let full = matches!(request, FileUpdateRequest::Full);
+    let files = match &request {
         FileUpdateRequest::Idle => return,
         FileUpdateRequest::Changed(paths) => Some(
             paths
-                .into_iter()
+                .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
         ),
-        FileUpdateRequest::Full => {
-            *needs_memory_sync = FileUpdateRequest::Idle;
-            None
-        }
+        FileUpdateRequest::Full => None,
     };
     // `handle_update` is fully synchronous (SQLite writes, filesystem walks, and —
     // via auto-embed/memory-backfill — ONNX inference). Run it on a blocking thread
     // and take the lock there (`blocking_lock`), so it never blocks the tokio worker
     // or holds an async guard across seconds of work (PERF-1).
     let ctx = Arc::clone(ctx);
-    let root = root.to_path_buf();
+    let task_root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
+        let root = task_root;
         crate::core::run_mutation(&ctx, "doc reindex", |ctx_ref| match files {
             Some(files) => {
                 crate::core::indexing::handle_watcher_files_unverified(ctx_ref, &root, &files)
@@ -2227,6 +2253,16 @@ async fn flush_doc_update(
     .await;
     match outcome {
         Ok(Some(Ok(result))) => {
+            for error in &result.errors {
+                tracing::warn!(root = %root.display(), %error, "Watcher document update failed; retaining batch for retry");
+            }
+            if result.errors.is_empty() {
+                if full {
+                    *needs_memory_sync = FileUpdateRequest::Idle;
+                }
+            } else {
+                *needs_update = request;
+            }
             DOC_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
             if result.added > 0 || result.updated > 0 || result.removed > 0 {
                 tracing::info!(
@@ -2237,9 +2273,18 @@ async fn flush_doc_update(
                 );
             }
         }
-        Ok(Some(Err(e))) => tracing::error!("Doc reindex failed: {}", e),
-        Ok(None) => {} // ctx not initialized — nothing to do
-        Err(e) => tracing::error!("Doc reindex task panicked: {}", e),
+        Ok(Some(Err(error))) => {
+            tracing::warn!(root = %root.display(), %error, "Doc reindex failed; retaining batch for retry");
+            *needs_update = request;
+        }
+        Ok(None) => {
+            tracing::warn!(root = %root.display(), "Doc reindex context unavailable; retaining batch for retry");
+            *needs_update = request;
+        }
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "Doc reindex task panicked; retaining batch for retry");
+            *needs_update = request;
+        }
     }
 }
 
@@ -4610,6 +4655,122 @@ if (require.main === module) {
                     .is_some(),
                 present,
                 "{path}"
+            );
+        }
+    }
+
+    // Catches PERF-1: a deleted file or subtree must not walk unrelated files.
+    #[tokio::test]
+    async fn release_review_vanished_paths_do_not_rescan() {
+        for deleted in ["gone.md", "gone"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+            let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+            let path = root.join(deleted);
+            let indexed = if deleted == "gone" {
+                std::fs::create_dir(&path).unwrap();
+                path.join("child.md")
+            } else {
+                path.clone()
+            };
+            std::fs::write(&indexed, "# Gone\n").unwrap();
+            delivery.apply([indexed.clone()]).await;
+            assert!(
+                delivery
+                    .contains(&crate::domain::rel_key(
+                        indexed.strip_prefix(&root).unwrap()
+                    ))
+                    .await
+            );
+            std::fs::write(root.join("unrelated.md"), "# Not delivered\n").unwrap();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            delivery.apply([path]).await;
+            assert!(
+                !delivery
+                    .contains(&crate::domain::rel_key(
+                        indexed.strip_prefix(&root).unwrap()
+                    ))
+                    .await
+            );
+            assert!(
+                !delivery.contains("unrelated.md").await,
+                "vanished {deleted} caused a full walk"
+            );
+        }
+    }
+
+    // Catches retries spinning immediately, or full recovery delaying targeted edits.
+    #[test]
+    fn release_review_recovery_deadlines_do_not_hold_targeted_work() {
+        let now = tokio::time::Instant::now();
+        let batch = now + std::time::Duration::from_secs(1);
+        let retry = now + std::time::Duration::from_secs(30);
+        assert_eq!(
+            next_watcher_flush_deadline(batch, retry, None, true, false, false),
+            retry
+        );
+        assert_eq!(
+            next_watcher_flush_deadline(batch, retry, None, true, true, false),
+            batch
+        );
+        assert_eq!(
+            next_watcher_flush_deadline(batch, retry, Some(retry), false, false, true),
+            retry
+        );
+        assert_eq!(
+            next_watcher_flush_deadline(batch, retry, Some(retry), false, true, true),
+            batch
+        );
+        assert_eq!(
+            next_watcher_flush_deadline(batch, retry, None, true, false, true),
+            batch
+        );
+    }
+
+    // Catches BUG-2: closed slots, returned errors and per-file failures must
+    // retain real delivered work, so a later retry repairs persisted membership.
+    #[tokio::test]
+    async fn release_review_failed_doc_flush_retries_paths() {
+        for failure in ["closed", "config", "file"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+            let delivery = DocumentDelivery::new(&root, "**/*.md", false);
+            let path = root.join("retry.md");
+            let config_path = root.join(".mdkb/config.toml");
+            let config = std::fs::read_to_string(&config_path).unwrap();
+            let saved = match failure {
+                "closed" => delivery.ctx.lock().await.take(),
+                "config" => {
+                    std::fs::write(&config_path, "[hooks]\nrecall_rerank_it = true\n").unwrap();
+                    None
+                }
+                _ => {
+                    std::fs::create_dir(&path).unwrap();
+                    None
+                }
+            };
+            if failure != "file" {
+                std::fs::write(&path, "# Retry\n").unwrap();
+            }
+            let mut docs = FileUpdateRequest::Changed(vec![path.clone()]);
+            let mut memory = FileUpdateRequest::Idle;
+            flush_doc_update(&delivery.ctx, &root, &mut docs, &mut memory).await;
+            match failure {
+                "closed" => *delivery.ctx.lock().await = saved,
+                "config" => std::fs::write(&config_path, config).unwrap(),
+                _ => {
+                    std::fs::remove_dir(&path).unwrap();
+                    std::fs::write(&path, "# Retry\n").unwrap();
+                }
+            }
+            flush_doc_update(&delivery.ctx, &root, &mut docs, &mut memory).await;
+            assert!(
+                delivery.contains("retry.md").await,
+                "{failure} flush lost its delivered path"
             );
         }
     }

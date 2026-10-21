@@ -1200,6 +1200,22 @@ impl Config {
         Ok(config)
     }
 
+    /// Load a serving repository without discarding an invalid configuration.
+    /// Only a missing file uses defaults; callers refuse the repository otherwise.
+    pub fn load_for_repo(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(config) => Ok(config),
+            Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
+                Ok(Self::default())
+            }
+            Err(error) => {
+                tracing::warn!(root_config = %path.display(), %error, "Refusing repository with invalid configuration");
+                Err(error)
+            }
+        }
+    }
+
     /// Load configuration, or fall back to the built-in defaults and say why.
     ///
     /// The fallback is whole-file and deliberate: a store must still open when

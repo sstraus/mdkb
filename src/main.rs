@@ -355,7 +355,9 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             None if is_lifecycle_hook(&cli.command) => {
                 // The host still writes an event for a no-op. Drain it before
                 // closing the pipe so that a large payload cannot cause EPIPE.
-                let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                if stdin_is_not_tty() {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                }
                 return Ok(());
             }
             // `--root` names the repos itself; the directory it runs from

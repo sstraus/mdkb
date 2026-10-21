@@ -276,7 +276,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `code_hits_in_pretooluse` | bool | `true` | Return indexed definition hits before suggesting a command |
 | `doc_graph_in_recall` | bool | `true` | Add bounded one-hop document neighbors to recall |
 
-Removed `recall_rerank_it` / `recall_rerank_en` switches fail config loading and name `recall_rerank_languages`. Removed scalar floor keys name `recall_rerank_min_scores`. No legacy values are translated. `mdkb embed` fetches the cross-encoder only for a nonempty language list. A daemon started with the empty default never loads its weights; restart a daemon that previously loaded the model to release its resident memory.
+Removed `recall_rerank_it` / `recall_rerank_en` switches name `recall_rerank_languages`; removed scalar floor keys name `recall_rerank_min_scores`. Daemon admission, MCP startup, lifecycle-hook policy loading and document watcher updates refuse the repository with a logged error instead of using defaults. Hooks skip the event and exit 0. Diagnostic loaders (`doctor`, config reporting) can still inspect the error. Other malformed daemon hot-reloads keep the last good configuration; removed keys refuse new requests. No legacy values are translated. `mdkb embed` fetches the cross-encoder only for a nonempty language list. A daemon started with the empty default never loads its weights; restart a daemon that previously loaded the model to release its resident memory.
 
 ## Opt-out Mechanisms
 

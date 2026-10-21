@@ -273,7 +273,7 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
     // Detect and register convention-based collections before processing
     let pattern_upgrades = apply_conventions(ctx, root)?;
 
-    let config = Config::load_or_default(&ctx.config_path);
+    let config = Config::load_for_repo(&ctx.config_path)?;
 
     if config.code.enabled {
         let index_path = root.join(".mdkb/code.sqlite");
@@ -514,7 +514,7 @@ fn report_collection_deltas(
 }
 /// Detect and register convention-based collections.
 pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<Vec<String>> {
-    let config = crate::config::Config::load_or_default(&ctx.config_path);
+    let config = crate::config::Config::load_for_repo(&ctx.config_path)?;
     if !config.conventions.enabled {
         return Ok(Vec::new());
     }
@@ -859,7 +859,7 @@ pub(crate) fn handle_watcher_files_unverified(
     files: &[String],
 ) -> Result<UpdateResult> {
     let mut result = run_files_update_mode(ctx, root, files, true, true)?;
-    let config = Config::load_or_default(&ctx.config_path);
+    let config = Config::load_for_repo(&ctx.config_path)?;
     if config.search.auto_embed_docs {
         match handle_embed(ctx, None) {
             Ok(r) => result.doc_embeddings_generated = r.generated,
@@ -932,7 +932,7 @@ fn run_files_update_mode(
         })
         .collect();
 
-    let config = Config::load_or_default(&ctx.config_path);
+    let config = Config::load_for_repo(&ctx.config_path)?;
     let started_at = chrono::Utc::now().timestamp();
     with_transaction(&ctx.conn, || {
         // Under `auto` the key set is derived from the corpus, so it has to be
@@ -1225,6 +1225,26 @@ pub(crate) fn index_specified_files(
             continue;
         }
 
+        if missing {
+            // A vanished notification may name a directory. Delete only stored
+            // paths below it, including collections rooted inside that subtree.
+            for (collection, _, base) in matchers {
+                let relative = if base.starts_with(&canonical_file) {
+                    String::new()
+                } else if let Ok(relative) = canonical_file.strip_prefix(base) {
+                    crate::domain::rel_key(relative)
+                } else {
+                    continue;
+                };
+                result.removed += documents::delete_documents_by_path_prefix(
+                    &ctx.conn,
+                    &collection.name,
+                    &relative,
+                )?;
+            }
+            continue;
+        }
+
         // Find which collection this file belongs to.
         //
         // The most specific base path wins, matching the rule the full walk
@@ -1258,14 +1278,6 @@ pub(crate) fn index_specified_files(
 
         // Look up existing document for mtime comparison
         let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
-        if missing {
-            if let Some(doc) = existing_doc {
-                if documents::delete_document(&ctx.conn, doc.id)? {
-                    result.removed += 1;
-                }
-            }
-            continue;
-        }
 
         index_single_file(
             SingleFileInput {

@@ -365,6 +365,7 @@ impl Context {
             ))
         })?;
         let config_path = mdkb_dir.join("config.toml");
+        Config::load_for_repo(&config_path)?;
         let db_path = mdkb_dir.join("index.sqlite");
 
         // Schema initialization, integrity recovery and ordinary mutations are
@@ -544,6 +545,7 @@ impl Context {
             Error::other(format!("cannot canonicalize {}: {e}", mdkb_dir.display()))
         })?;
         let config_path = mdkb_dir.join("config.toml");
+        Config::load_for_repo(&config_path)?;
         let db_path = mdkb_dir.join("index.sqlite");
 
         // sqlite-vec must still be registered: a read-only connection can query

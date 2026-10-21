@@ -78,15 +78,7 @@ impl RepoHandle {
         let root = canonicalize_root(root)?;
         let config_path = config_path(&root);
         let identity = ConfigIdentity::of(&config_path);
-        let config = load_config(&config_path, global_priors).unwrap_or_else(|e| {
-            tracing::warn!(
-                "Failed to load config for {}, using defaults: {e}",
-                root.display()
-            );
-            let mut config = Config::default();
-            config.priors = crate::config::merge_priors(global_priors, None);
-            config
-        });
+        let config = load_config(&config_path, global_priors)?;
         Ok(Self::with_state(
             root,
             config,
@@ -105,9 +97,8 @@ impl RepoHandle {
     /// indexing. The caller spawns the new handle's watcher; the old watcher
     /// stops when the last request holding the old handle drops it.
     ///
-    /// Unlike [`open`](Self::open), a file that does not parse is an error, not
-    /// a fall back to defaults: cold start has nothing better, a reload has the
-    /// config it is replacing.
+    /// Like [`open`](Self::open), invalid configuration refuses the repository.
+    /// A reload never replaces restrictive settings with defaults.
     fn reopen(&self, global_priors: &toml::Table) -> Result<Self> {
         let config_path = config_path(&self.root);
         // Identity first: an edit landing during the read is then seen as a
@@ -238,11 +229,7 @@ fn config_path(root: &Path) -> PathBuf {
 /// `config.toml` read strictly, with the daemon's global `[priors]` layered
 /// under the repo's own. A missing file is the defaults, not an error.
 fn load_config(path: &Path, global_priors: &toml::Table) -> Result<Config> {
-    let mut config = if path.exists() {
-        Config::load(path)?
-    } else {
-        Config::default()
-    };
+    let mut config = Config::load_for_repo(path)?;
     let repo_priors = crate::config::raw_priors_layer(path);
     config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
     Ok(config)
@@ -382,7 +369,7 @@ impl RepoRegistry {
         let canonical = canonicalize_root(root)?;
 
         // Fast path: already open
-        if let Some(handle) = self.open_handle(&canonical) {
+        if let Some(handle) = self.open_handle(&canonical)? {
             return Ok(handle);
         }
 
@@ -440,7 +427,7 @@ impl RepoRegistry {
     /// Get an existing handle without opening (returns None if not registered).
     pub fn get(&self, root: &Path) -> Option<Arc<RepoHandle>> {
         let canonical = canonicalize_root(root).ok()?;
-        self.open_handle(&canonical)
+        self.open_handle(&canonical).ok().flatten()
     }
 
     /// List all registered repo roots with their last access time.
@@ -651,17 +638,25 @@ impl RepoRegistry {
     ///
     /// Story 180-b051: the config used to be read once per handle, so an edit
     /// was silently ignored until LRU eviction or a daemon restart.
-    fn open_handle(&self, canonical: &Path) -> Option<Arc<RepoHandle>> {
-        let handle = Arc::clone(&*self.handles.get(canonical)?);
+    fn open_handle(&self, canonical: &Path) -> Result<Option<Arc<RepoHandle>>> {
+        let Some(entry) = self.handles.get(canonical) else {
+            return Ok(None);
+        };
+        let handle = Arc::clone(&*entry);
+        drop(entry);
         handle.touch();
         if !handle.config_identity.changed() {
-            return Some(handle);
+            return Ok(Some(handle));
         }
         let _gate = self.open_gate.lock().unwrap_or_else(|e| e.into_inner());
         // Another caller may have reloaded it while this one waited.
-        let current = Arc::clone(&*self.handles.get(canonical)?);
+        let Some(entry) = self.handles.get(canonical) else {
+            return Ok(None);
+        };
+        let current = Arc::clone(&*entry);
+        drop(entry);
         if !current.config_identity.changed() {
-            return Some(current);
+            return Ok(Some(current));
         }
         match current.reopen(&self.daemon_config.priors) {
             Ok(fresh) => {
@@ -671,16 +666,22 @@ impl RepoRegistry {
                 drop(_gate);
                 tracing::info!("Reloaded config: {}", canonical.display());
                 spawn_watcher_for_handle(&fresh);
-                Some(fresh)
+                Ok(Some(fresh))
             }
             Err(e) => {
+                if matches!(e.kind(), crate::error::ErrorKind::ConfigInvalid { field, message }
+                    if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))
+                {
+                    tracing::warn!(root = %canonical.display(), error = %e, "Refusing repository with removed rerank configuration");
+                    return Err(e);
+                }
                 if current.set_config_error(e.to_string()) {
                     tracing::warn!(
                         root = %canonical.display(),
                         "config.toml changed but does not load ({e}); still serving the previous config"
                     );
                 }
-                Some(current)
+                Ok(Some(current))
             }
         }
     }
@@ -1083,6 +1084,46 @@ mod tests {
             .get(&root)
             .copied();
         assert_eq!(visits, Some(1));
+    }
+
+    // Catches BUG-1: a removed rerank key must not reset restrictive settings.
+    #[test]
+    fn release_review_removed_keys_refuse_daemon_open() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        std::fs::write(
+            root.join(".mdkb/config.toml"),
+            "[hooks]\nrecall_rerank_it = true\nuser_prompt_submit_require_sigil = true\n",
+        )
+        .unwrap();
+        let error = RepoHandle::open(&root, &toml::Table::new())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("recall_rerank_languages"), "{error}");
+    }
+
+    // Catches cached handles serving a removed-key configuration on hot reload.
+    #[test]
+    fn release_review_removed_keys_refuse_cached_daemon_handle() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let path = root.join(".mdkb/config.toml");
+        std::fs::write(&path, "[hooks]\nrecall_limit = 7\n").unwrap();
+        let registry = RepoRegistry::new(allow_temp_config());
+        let good = registry.get_or_open(&root).unwrap();
+        std::fs::write(&path, "[hooks]\nrecall_rerank_it = true\n").unwrap();
+        let error = registry.get_or_open(&root).unwrap_err().to_string();
+        assert!(error.contains("recall_rerank_languages"), "{error}");
+        std::fs::write(&path, "[hooks]\nrecall_limit = 7\n").unwrap();
+        assert_eq!(
+            registry
+                .get_or_open(&root)
+                .unwrap()
+                .config
+                .hooks
+                .recall_limit,
+            good.config.hooks.recall_limit
+        );
     }
 
     #[test]
@@ -1715,8 +1756,8 @@ mod tests {
     }
 
     /// A typo in the file must not reset a tuned repo to factory defaults
-    /// mid-session: cold open falls back to defaults, a reload keeps the last
-    /// good config and says why.
+    /// mid-session: a reload keeps the last good config and says why.
+    /// Removed controls are refused rather than treated as a transient typo.
     #[test]
     fn an_invalid_config_keeps_the_handle_it_replaces() {
         let tmp = TempDir::new().unwrap();

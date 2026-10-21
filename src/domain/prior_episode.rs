@@ -153,8 +153,16 @@ fn record_time(raw: Option<&str>) -> Option<i64> {
 /// must contain only complete user/assistant messages, never partial evidence.
 pub fn validate_inline_episode(jsonl: &str) -> Result<(), String> {
     for (index, line) in jsonl.lines().enumerate() {
-        let record: Record = serde_json::from_str(line)
-            .map_err(|e| format!("episode_jsonl record {}: {e}", index + 1))?;
+        let record: Record = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "episode_jsonl record {}: {:?} error at line {}, column {} ({} bytes)",
+                index + 1,
+                e.classify(),
+                e.line(),
+                e.column(),
+                line.len()
+            )
+        })?;
         if !matches!(record.kind.as_str(), "user" | "assistant") {
             return Err(format!(
                 "episode_jsonl record {}: expected user or assistant",
@@ -290,6 +298,15 @@ pub fn parse_episode(jsonl: &str) -> Episode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Catches SEC-1: serde type errors must not copy the offending prompt to logs.
+    #[test]
+    fn release_review_inline_refusal_does_not_echo_content() {
+        let error = validate_inline_episode(r#"{"type":"user","message":"private-prompt-marker"}"#)
+            .unwrap_err();
+        assert!(!error.contains("private-prompt-marker"), "{error}");
+        assert!(error.contains("record 1"));
+    }
 
     // One assistant tool_use, then a user tool_result error, then a corrective
     // assistant tool_use, then a clean user tool_result.

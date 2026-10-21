@@ -496,10 +496,14 @@ impl IndexFacade {
             let rel_key = rel_key(path, root);
 
             if !path.exists() {
-                // File deleted from disk
-                if indexed_hashes.contains_key(&rel_key) {
-                    deleted.push(path.clone());
-                }
+                // The native watcher may deliver only a vanished directory.
+                // Match stored keys on a component boundary, not by extension.
+                deleted.extend(
+                    indexed_hashes
+                        .keys()
+                        .filter(|key| Path::new(key).starts_with(&rel_key))
+                        .map(|key| root.join(key)),
+                );
                 continue;
             }
 
@@ -1915,6 +1919,27 @@ pub fn world() {
             facade.get_symbol_by_name("ccc").is_some(),
             "the edit landed"
         );
+    }
+
+    // Catches vanished-directory notifications retaining child symbols or deleting siblings.
+    #[test]
+    fn release_review_deleted_code_subtree_keeps_siblings() {
+        let src = tempfile::tempdir().unwrap();
+        let gone = src.path().join("gone");
+        fs::create_dir(&gone).unwrap();
+        fs::write(gone.join("child.rs"), "pub fn removed_child() {}\n").unwrap();
+        fs::write(
+            src.path().join("gone_sibling.rs"),
+            "pub fn retained_sibling() {}\n",
+        )
+        .unwrap();
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        facade.reindex_files(src.path(), &[gone]).unwrap();
+        assert!(facade.get_symbol_by_name("removed_child").is_none());
+        assert!(facade.get_symbol_by_name("retained_sibling").is_some());
     }
 
     #[test]
