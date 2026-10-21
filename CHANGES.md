@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`mdkb setup hooks ego` registers installed prompt context.** Set
+  `mdkb_prompt_command` in ego's user TOML without registering a temporary build
+  binary or changing unrelated settings/comments. Keep a different registration
+  unless `--force` is given; `--dry-run` previews without writing. Requested by
+  the maintainer (story 013-33a8).
+
 - **Automatic recall reranking is opt-in by prompt language.** The default
   `hooks.recall_rerank_languages = []` keeps MiniLM-only recall without fetching
   or loading the cross-encoder. Select `it` or `en` explicitly, with finite
@@ -19,7 +25,26 @@
   without blocking the host. Requested by the maintainer while integrating
   ego's session observations (story 014-70ca).
 
+### Changed
+
+- **Repository-focused documentation.** Replace product comparisons with mdkb's
+  repository-memory scope, keep evaluation guidance independent of other tools,
+  and use a fictional person in the frontmatter relation example.
+
+- **Close the configurable-embedder experiment after the failed gate.** The
+  paired Italian injection-recall comparison did not show a significant e5-small
+  gain, and the measured Mac pipeline p95 exceeded 700 ms. Keep MiniLM as the
+  retriever; do not ship configurable embeddings from this experiment. Record
+  native latency/RSS evidence and the distinction between retrieval and injection
+  in `docs/recall-options-eval.md`. Maintainer evaluation (story 005-a632).
+
 ### Fixed
+
+- **Repeated repository discovery and listing avoid redundant I/O.** Coalesce
+  discovery per root set, prune ignored/generated/worktree subtrees, and preserve
+  explicit roots below pruned ancestors. Cache unchanged repository rows against
+  database/WAL and Git signatures for at most 60 seconds without migrating
+  stores. Found by the maintainer investigating daemon CPU use (story 016-ebdd).
 
 - **Older stores migrate before prior reclustering reads the misfire counter.**
   Add the column before the v27 data pass, so a search of a candidate-bearing
@@ -38,8 +63,8 @@
   queue, index only delivered document paths on ordinary edits, bound pending
   paths, and coalesce recovery per repository with a 30-second cooldown. Apply
   common Git excludes in worktrees without losing standalone `.gitignore`
-  support. Found
-  by the maintainer in daemon CPU and overflow logs (story 015-88aa).
+  support, and reconcile directory and ignore-policy changes so membership stays
+  correct. Found by the maintainer in daemon CPU and overflow logs (story 015-88aa).
 
 ## 3.11.3 (2026-10-08)
 

@@ -52,6 +52,25 @@ mdkb setup hooks codex
 Restart the host CLI after setup. Re-running is idempotent: existing
 hook entries are replaced, unrelated settings are preserved.
 
+### ego prompt context
+
+```bash
+mdkb setup hooks ego --dry-run
+mdkb setup hooks ego
+# Replace a different existing registration only when intended:
+mdkb setup hooks ego --force
+```
+
+This sets the top-level `mdkb_prompt_command` to an installed mdkb binary in
+`$EGO_HOME/config.toml`, or `~/.ego/config.toml` when `EGO_HOME` is unset. Setup
+finds an installed binary rather than registering an ephemeral build artifact;
+install mdkb first if none can be found. It preserves unrelated TOML, comments,
+and symlinked config targets. A matching value is unchanged; a different value
+is kept unless `--force` is given. `--dry-run` prints the merged TOML and writes
+nothing. This is ego's prompt-context registration, not a Claude/Codex lifecycle
+hook configuration. Hosts that deliver Stop observations use the
+[inline episode contract](#inline-episodes-ego-and-other-hosts-without-transcript-files).
+
 ### Disable individual events at install time
 
 ```bash
@@ -71,6 +90,10 @@ mdkb setup hooks claude --dry-run
 Prints the merged settings JSON to stdout without writing.
 
 ## Event contracts
+
+Outside a project that can hold an mdkb store, lifecycle commands are successful
+no-ops. They still consume the host's stdin payload before exiting, so a large
+event does not fail with a broken pipe merely because no store is available.
 
 Command handlers read the event JSON from stdin and write a JSON object to
 stdout. Exit code is always 0. Native HTTP handlers send the same event object
@@ -603,6 +626,17 @@ Command hooks auto-start the daemon and fall back in-process unless
 HTTP hooks require the configured HTTP/HTTPS server to remain running and
 `MDKB_HOOK_TOKEN` to match its bearer token. `mdkb update` remains the safe full
 differential fallback.
+
+Watcher admission follows the same collection globs and ignore policy as the
+full document/code walk, including common Git excludes in linked worktrees.
+Ordinary file edits index only the delivered paths, not the whole document
+tree. Git and database churn is rejected before queue admission; the active
+`memory/entries/*.md` projection remains an input. Directory moves/deletions
+and relevant ignore-file changes reconcile membership, so removed or newly
+ignored files do not remain indexed. Pending work is bounded to 1024 paths;
+overflow recovery is coalesced per repository with a 30-second cooldown rather
+than triggering a full rescan for every dropped event. These bounds control
+recovery work, not a promise that every change is indexed within 30 seconds.
 
 ## Automated verification
 
