@@ -273,7 +273,14 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
         return Ok(());
     };
     params["root"] = json!(root.display().to_string());
-    let hooks = hooks_config(&root);
+    let hooks = match hooks_config(&root) {
+        Ok(hooks) => hooks,
+        Err(error) => {
+            tracing::warn!(root = %root.display(), %error, "Hook refused repository configuration");
+            eprintln!("mdkb hook: refusing {}: {error}", root.display());
+            return Ok(());
+        }
+    };
     let daemon_required = hooks.daemon_required;
 
     if !daemon_is_reachable_here() {
@@ -361,8 +368,8 @@ fn daemon_route_available(platform_has_daemon: bool, no_daemon_env: bool) -> boo
 }
 
 /// The repo's `[hooks]` policy: the daemon-required flag and the deadlines.
-fn hooks_config(root: &Path) -> HooksConfig {
-    crate::Config::load_or_default(root.join(".mdkb/config.toml")).hooks
+fn hooks_config(root: &Path) -> Result<HooksConfig> {
+    Ok(crate::Config::load_for_repo(root.join(".mdkb/config.toml"))?.hooks)
 }
 
 /// Daemon config for the in-process (`MDKB_NO_DAEMON`) fallback. The `root` here
@@ -1200,6 +1207,20 @@ mod tests {
         assert_eq!(hook_timeout("status", &hooks), CALL_TIMEOUT);
     }
 
+    // Catches hooks silently enabling defaults when a removed key invalidates policy.
+    #[test]
+    fn release_review_removed_keys_refuse_hook_policy() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join(".mdkb")).unwrap();
+        std::fs::write(
+            tmp.path().join(".mdkb/config.toml"),
+            "[hooks]\nrecall_rerank_it = true\nuser_prompt_submit_require_sigil = true\n",
+        )
+        .unwrap();
+        let error = hooks_config(tmp.path()).unwrap_err().to_string();
+        assert!(error.contains("recall_rerank_languages"), "{error}");
+    }
+
     #[test]
     fn user_prompt_submit_wait_is_the_deadline_plus_the_margin() {
         // Catches: a fixed client wait that ignores a raised deadline, and
@@ -1231,8 +1252,12 @@ mod tests {
         )
         .unwrap();
 
-        assert!(hooks_config(tmp.path()).daemon_required);
-        assert!(!hooks_config(&tmp.path().join("without-config")).daemon_required);
+        assert!(hooks_config(tmp.path()).unwrap().daemon_required);
+        assert!(
+            !hooks_config(&tmp.path().join("without-config"))
+                .unwrap()
+                .daemon_required
+        );
     }
 
     #[tokio::test]

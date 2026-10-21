@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.12.0 (2026-10-21)
 
 ### Added
 
@@ -10,14 +10,6 @@
   unless `--force` is given; `--dry-run` previews without writing. Requested by
   the maintainer (story 013-33a8).
 
-- **Automatic recall reranking is opt-in by prompt language.** The default
-  `hooks.recall_rerank_languages = []` keeps MiniLM-only recall without fetching
-  or loading the cross-encoder. Select `it` or `en` explicitly, with finite
-  per-language floors in `hooks.recall_rerank_min_scores` (fitted defaults:
-  `it = -1.05`, `en = -1.95`). Reject unsupported languages, missing floors,
-  and removed `recall_rerank_it/en` switches or scalar floor keys with a message
-  naming the replacement. Requested by the maintainer (story 018-90b0).
-
 - **Stop hooks accept bounded inline episodes.** Hosts such as ego can send
   `session_id` and `episode_jsonl` without an ephemeral transcript file. Inline
   input uses the existing prior and recall settlement and mining paths. Reject
@@ -26,6 +18,20 @@
   ego's session observations (story 014-70ca).
 
 ### Changed
+
+- **Breaking: automatic recall reranking is opt-in by prompt language.** The default
+  `hooks.recall_rerank_languages = []` keeps MiniLM-only recall without fetching
+  or loading the cross-encoder. Select `it` or `en` explicitly, with finite
+  per-language floors in `hooks.recall_rerank_min_scores` (fitted defaults:
+  `it = -1.05`, `en = -1.95`). Reject unsupported languages, missing floors,
+  and removed `recall_rerank_it/en` switches or scalar floor keys with a message
+  naming the replacement. Daemon admission, MCP startup, hooks and document
+  watcher updates refuse removed keys rather than reset unrelated settings to
+  defaults; hooks skip the event and exit 0. Other malformed files keep the
+  existing logged fallback, and malformed daemon hot-reloads keep the last good
+  config. Diagnostic commands can still
+  report the error. Requested by the maintainer (story 018-90b0); refusal gap
+  found by the maintainer's release review.
 
 - **Repository-focused documentation.** Replace product comparisons with mdkb's
   repository-memory scope, keep evaluation guidance independent of other tools,
@@ -63,8 +69,18 @@
   queue, index only delivered document paths on ordinary edits, bound pending
   paths, and coalesce recovery per repository with a 30-second cooldown. Apply
   common Git excludes in worktrees without losing standalone `.gitignore`
-  support, and reconcile directory and ignore-policy changes so membership stays
-  correct. Found by the maintainer in daemon CPU and overflow logs (story 015-88aa).
+  support. Vanished paths delete stored rows by exact path or slash prefix;
+  existing directories and ignore-policy events reconcile membership. Failed
+  document batches retain their paths and retry after 30 seconds, with per-file
+  errors logged against the repository root. The shared admission exclusion union
+  can suppress documents covered by custom code exclusions; force-included files
+  below excluded directories require a manual update. Found by the maintainer
+  in daemon CPU/overflow logs (story 015-88aa) and release review.
+
+- **Inline episode refusals do not echo malformed prompt values into logs.**
+  Report the record index, JSON error class, position and byte length instead.
+  No-project lifecycle hooks drain piped input, not an interactive terminal.
+  Found by the maintainer's release review.
 
 ## 3.11.3 (2026-10-08)
 

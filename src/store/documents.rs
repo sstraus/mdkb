@@ -255,6 +255,30 @@ pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
     Ok(rows_affected > 0)
 }
 
+/// Delete one indexed path and its descendants, without filesystem discovery.
+/// A slash boundary keeps `guide` distinct from `guidebook`; SQL wildcards in
+/// filenames are literal because this uses equality and substr, not LIKE.
+pub(crate) fn delete_documents_by_path_prefix(
+    conn: &Connection,
+    collection: &str,
+    path: &str,
+) -> Result<usize> {
+    let prefix = format!("{path}/");
+    let mut statement = conn.prepare(
+        "SELECT id FROM documents WHERE collection = ?1 AND (?2 = '' OR relative_path = ?2 OR substr(relative_path, 1, length(?3)) = ?3)"
+    )?;
+    let ids = statement
+        .query_map(params![collection, path, prefix], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut removed = 0;
+    for id in ids {
+        removed += usize::from(delete_document(conn, id)?);
+    }
+    Ok(removed)
+}
+
 /// Mark `claude_sessions` documents whose source transcript is gone as
 /// `archived`. `present_paths` is the set of relative paths still produced by
 /// live transcript files this indexing pass. Returns the number newly archived.

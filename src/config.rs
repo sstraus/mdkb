@@ -1200,6 +1200,31 @@ impl Config {
         Ok(config)
     }
 
+    pub(crate) fn is_removed_rerank_error(error: &crate::error::Error) -> bool {
+        matches!(error.kind(), ErrorKind::ConfigInvalid { field, message }
+            if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))
+    }
+
+    /// Refuse removed rerank controls at serving boundaries. Other malformed
+    /// files retain the existing logged whole-file fallback; absent files use defaults.
+    pub fn load_for_repo(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(config) => Ok(config),
+            Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
+                Ok(Self::default())
+            }
+            Err(error) if Self::is_removed_rerank_error(&error) => {
+                tracing::warn!(root_config = %path.display(), %error, "Refusing repository with removed rerank configuration");
+                Err(error)
+            }
+            Err(error) => {
+                tracing::warn!(root_config = %path.display(), %error, "Invalid configuration; every setting in the file is ignored, built-in defaults are in use");
+                Ok(Self::default())
+            }
+        }
+    }
+
     /// Load configuration, or fall back to the built-in defaults and say why.
     ///
     /// The fallback is whole-file and deliberate: a store must still open when

@@ -252,8 +252,13 @@ the fitted defaults. The English floor came from a small synthetic store and
 admitted 3/24 held-out negatives, so review it before enabling English. Missing
 floors and unsupported codes are configuration errors. Old `recall_rerank_it` /
 `recall_rerank_en` keys are rejected, not translated; replace them with the list.
-Old `recall_rerank_min_score_it/en` keys must become the table above. A model
-already loaded by a previous opt-in stays resident until the daemon restarts.
+Old `recall_rerank_min_score_it/en` keys must become the table above. Daemon
+admission, MCP startup, lifecycle hooks and document watcher updates refuse
+removed rerank keys and log their replacements, rather than discard the file
+and run with defaults. Hooks remain best-effort: they skip the event and
+exit successfully. Diagnostic commands such as `doctor` can still report the
+invalid file. Other malformed files keep the existing logged whole-file fallback;
+malformed daemon hot-reloads keep the last good config. A model already loaded by a previous opt-in stays resident until the daemon restarts.
 
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
 chose it on 2026-09-30 without a shadow week. The measurement that would have
@@ -947,11 +952,17 @@ Uses the same syntax as `.gitignore`, including `!pattern` for re-inclusion. Pla
 
 ### Background indexing
 
-Ordinary watcher edits index only delivered document paths. Admission uses the
-same collection globs and ignore policy as a full walk, including common Git
-excludes in linked worktrees. Build, Git and database churn does not trigger a
-whole-tree scan; directory and ignore-policy changes still reconcile membership.
-Pending paths and overflow recovery are bounded per repository. See
+Ordinary watcher edits index only delivered document paths. Vanished files or
+subtrees delete stored rows by path prefix, without discovering unrelated files.
+Existing-directory and relevant ignore-policy events still reconcile membership.
+Admission applies collection globs and Git/ignore-file rules, including common
+Git excludes in linked worktrees. It also applies a shared exclusion union of
+code patterns, document defaults and `.tmp` to all routes: custom code exclusions
+can therefore suppress document updates, and force-included documents below
+excluded directories need a manual `mdkb update`. Build, Git and database churn
+is rejected before queue admission. Failed document batches retain their paths
+and retry after a 30-second cooldown; targeted edits do not wait for an unrelated
+full-recovery cooldown. Pending paths and overflow recovery are bounded per repository. See
 [watcher recovery and troubleshooting](docs/hooks.md#edited-files-not-reindexing).
 
 ## Storage
