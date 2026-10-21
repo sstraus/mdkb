@@ -13,6 +13,12 @@
 
 ### Fixed
 
+- **Older stores migrate before prior reclustering reads the misfire counter.**
+  Add the column before the v27 data pass, so a search of a candidate-bearing
+  pre-v27 store no longer fails with `no such column: misfired_count` and rolls
+  back its migration. Found by the maintainer on the gh-metrics and
+  engineering-blog indexes (story 017-9dac).
+
 - **No-project lifecycle hooks consume their input before exiting.** Drain the
   host payload even when no project can hold a store, so a successful no-op
   does not close the pipe during the host's write. Found by the full rb test

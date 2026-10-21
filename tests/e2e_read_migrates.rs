@@ -48,6 +48,92 @@ fn seeded_store() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, root)
 }
 
+/// Catches the v27 data migration calling modern cluster SQL before the
+/// v31 misfire column exists, both for linked reads and unlinked inserts.
+#[test]
+fn legacy_prior_reclustering_requires_misfire_column_before_data_migration() {
+    for version in [20, 22, 26] {
+        for linked in [true, false] {
+            let (_dir, root) = seeded_store();
+            let home = tempfile::tempdir().unwrap();
+            let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).unwrap();
+            conn.execute_batch(
+                r#"INSERT INTO prior_clusters
+                    (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                     confirmed_count, created_at, last_seen_at)
+                   VALUES ('legacy-cluster', 'legacy-key', 'prompt',
+                           '{"prompt_contains":"deploy"}', 'Check deployment evidence.', '{}', 3, 1, 1);
+                   INSERT INTO prior_candidates
+                    (id, cluster_id, trigger_kind, trigger_matcher, lesson, scope, source_session, created_at)
+                   VALUES ('legacy-candidate', NULL, 'prompt', '{"prompt_contains":"deploy"}',
+                           'Check deployment evidence.', '{}', 'legacy-session', 1);
+                   ALTER TABLE prior_clusters DROP COLUMN misfired_count;"#,
+            ).unwrap();
+            if linked {
+                conn.execute(
+                    "UPDATE prior_candidates SET cluster_id = 'legacy-cluster'",
+                    [],
+                )
+                .unwrap();
+            }
+            if version < 24 {
+                conn.execute("ALTER TABLE prior_clusters DROP COLUMN error_signature", [])
+                    .unwrap();
+            }
+            conn.execute("UPDATE schema_version SET version = ?1", [version])
+                .unwrap();
+            drop(conn);
+
+            let out = Command::new(BIN)
+                .args([
+                    "search",
+                    "findable after migration",
+                    "--scope",
+                    "memory",
+                    "--root",
+                ])
+                .arg(&root)
+                .env("HOME", home.path())
+                .env("MDKB_NO_SPAWN", "1")
+                .env("MDKB_NO_DAEMON", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "v{version}, linked={linked}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("Stale probe"));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("migrat"));
+            assert_eq!(schema_version(&root), SCHEMA_VERSION);
+            let ctx = Context::open_read_only(&root).unwrap();
+            let (cluster_id, evidence, sessions, misfires): (String, i64, i64, i64) = ctx
+                .conn
+                .query_row(
+                    "SELECT c.cluster_id, k.evidence_count, k.distinct_sessions, k.misfired_count
+                 FROM prior_candidates c JOIN prior_clusters k ON k.id = c.cluster_id
+                 WHERE c.id = 'legacy-candidate'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!((evidence, sessions, misfires), (1, 1, 0));
+            if linked {
+                assert_eq!(cluster_id, "legacy-cluster");
+            }
+            let confirmed: i64 = ctx
+                .conn
+                .query_row(
+                    "SELECT confirmed_count FROM prior_clusters WHERE id = 'legacy-cluster'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(confirmed, 3);
+        }
+    }
+}
+
 fn set_schema_version(root: &Path, v: i32) {
     let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
     conn.execute("UPDATE schema_version SET version = ?1", [v])
