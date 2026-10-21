@@ -2027,6 +2027,42 @@ mod tests {
         assert_eq!(invalidations(&db), before + 1);
     }
 
+    /// Catches: the single-dispatch optimization caching `never` when a
+    /// warning is first emitted outside the capture's thread-local default.
+    #[test]
+    fn capture_keeps_a_warning_first_emitted_without_a_subscriber() {
+        const CHILD: &str = "MDKB_TEST_CAPTURE_SINGLE_DISPATCH";
+        if std::env::var_os(CHILD).is_none() {
+            // Subscriber registration is process-global. Other tests must not
+            // supply the second dispatch that would mask this regression.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "store::heal::tests::capture_keeps_a_warning_first_emitted_without_a_subscriber",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert!(captured_logs(|| {}).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let (_, now) =
+            quarantine_aged_with(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1, false);
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+        let logs = captured_logs(|| {
+            sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+        });
+        assert!(logs.contains("is past its retention"), "{logs}");
+    }
+
     /// The one warning per sweep names the copy itself, not its `-wal`.
     #[test]
     fn an_expired_unsalvaged_copy_is_warned_about_once_by_its_own_name() {
