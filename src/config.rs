@@ -1200,7 +1200,7 @@ impl Config {
         Ok(config)
     }
 
-    pub(crate) fn is_removed_rerank_error(error: &Error) -> bool {
+    pub(crate) fn is_removed_rerank_error(error: &crate::error::Error) -> bool {
         matches!(error.kind(), ErrorKind::ConfigInvalid { field, message }
             if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))
     }
