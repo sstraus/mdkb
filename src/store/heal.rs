@@ -2037,6 +2037,13 @@ mod tests {
             sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
         });
 
+        if logs.is_empty() {
+            let probe = captured_logs(|| {
+                eprintln!("capture WARN enabled: {}", tracing::enabled!(tracing::Level::WARN));
+                sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+            });
+            eprintln!("second sweep capture: {probe:?}");
+        }
         assert!(
             logs.contains(&format!("quarantine {name} is past its retention")),
             "the copy must be named in the warning: {logs}"
