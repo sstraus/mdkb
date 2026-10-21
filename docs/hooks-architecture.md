@@ -268,15 +268,15 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `user_prompt_submit_deadline_ms` | u64 | `1000` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. The hook client waits this plus 250 ms, so a raised value is honoured on the daemon path. `0` disables the daemon cut; the client then waits the default plus 250 ms |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
-| `recall_rerank_it` | bool | `true` | Rerank MiniLM's top five with jina-reranker-v2 int8 on non-sigil Italian prompts; falls back to the MiniLM result on any failure |
-| `recall_rerank_en` | bool | `false` | The same for English prompts; off until a floor is fitted on a real English store |
-| `recall_rerank_deadline_ms` | u64 | `700` | Reranker's own deadline, clamped to the nearer of the hook deadline and the 1 s hook-client socket timeout, minus the time already spent and 150 ms |
-| `recall_rerank_min_score_it` | f32 | `-1.05` | Reranker logit an entry needs for an Italian prompt |
-| `recall_rerank_min_score_en` | f32 | `-1.95` | Same for an English prompt (language by function-word vote; unknown = Italian) |
+| `recall_rerank_languages` | list of language codes | `[]` | Explicit opt-in to jina-v2-int8 reranking for automatic prompts. Detector supports `it`/`en`; a tie uses Italian. Empty means no reranker download or model load; failures keep MiniLM recall |
+| `recall_rerank_deadline_ms` | u64 | `700` | Reranker's own deadline, clamped to the remaining effective hook deadline minus 150 ms |
+| `recall_rerank_min_scores` | language-to-f32 table | `{ it = -1.05, en = -1.95 }` | Every selected language needs a finite floor. Explicit tables replace the defaults; unsupported language codes and missing floors fail validation. The English fit admitted 3/24 held-out negatives |
 | `user_prompt_submit_shadow` | bool | `false` | Run the always-on path on skipped prompts, record it, inject nothing |
 | `daemon_required` | bool | `false` | Disable the in-process command-hook fallback |
 | `code_hits_in_pretooluse` | bool | `true` | Return indexed definition hits before suggesting a command |
 | `doc_graph_in_recall` | bool | `true` | Add bounded one-hop document neighbors to recall |
+
+Removed `recall_rerank_it` / `recall_rerank_en` switches fail config loading and name `recall_rerank_languages`. Removed scalar floor keys name `recall_rerank_min_scores`. No legacy values are translated. `mdkb embed` fetches the cross-encoder only for a nonempty language list. A daemon started with the empty default never loads its weights; restart a daemon that previously loaded the model to release its resident memory.
 
 ## Opt-out Mechanisms
 

@@ -29,11 +29,7 @@ const RESERVE_AFTER_RERANK_MS: u64 = 150;
 /// only burns cores the rest of the hook wants.
 const MIN_RERANK_BUDGET_MS: u64 = 100;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Language {
-    It,
-    En,
-}
+pub use crate::config::RecallRerankLanguage as Language;
 
 /// Function words of each language. A word that sits in both lists (`in`, `me`,
 /// `i`: the Italian plural article and the English pronoun) votes for neither; words that are a function word in one language and a
@@ -81,18 +77,19 @@ pub fn prompt_language(prompt: &str) -> Language {
 
 /// Whether `prompt`'s language has the reranker switched on.
 pub fn enabled_for(cfg: &HooksConfig, prompt: &str) -> bool {
-    match prompt_language(prompt) {
-        Language::It => cfg.recall_rerank_it,
-        Language::En => cfg.recall_rerank_en,
-    }
+    cfg.recall_rerank_languages
+        .iter()
+        .any(|code| code == prompt_language(prompt).code())
 }
 
 /// The top score `prompt` must reach to inject recall.
 pub fn min_score_for(cfg: &HooksConfig, prompt: &str) -> f32 {
-    match prompt_language(prompt) {
-        Language::It => cfg.recall_rerank_min_score_it,
-        Language::En => cfg.recall_rerank_min_score_en,
-    }
+    // Config::validate requires the selected language's floor. A caller that
+    // bypasses validation must still fail closed instead of injecting entries.
+    cfg.recall_rerank_min_scores
+        .get(prompt_language(prompt).code())
+        .copied()
+        .unwrap_or(f32::INFINITY)
 }
 
 /// How long the reranker may run, or `None` when what is left of the hook
@@ -212,11 +209,11 @@ mod tests {
         // the floor 0.9 lower, which admits the negatives the Italian fit set
         // measured between the two.
         let cfg = HooksConfig::default();
-        assert!(cfg.recall_rerank_min_score_it > cfg.recall_rerank_min_score_en);
+        assert!(cfg.recall_rerank_min_scores["it"] > cfg.recall_rerank_min_scores["en"]);
         assert_eq!(prompt_language("src/mcp/dispatch.rs"), Language::It);
         assert_eq!(
             min_score_for(&cfg, "src/mcp/dispatch.rs").to_bits(),
-            cfg.recall_rerank_min_score_it.to_bits()
+            cfg.recall_rerank_min_scores["it"].to_bits()
         );
         assert_eq!(prompt_language(""), Language::It);
     }

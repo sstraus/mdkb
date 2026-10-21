@@ -187,6 +187,9 @@ mdkb setup hooks claude --scope local --http-url http://127.0.0.1:8080
 # Codex CLI (writes ~/.codex/hooks.json)
 mdkb setup hooks codex
 
+# ego prompt context (writes $EGO_HOME/config.toml or ~/.ego/config.toml)
+mdkb setup hooks ego
+
 # Preview the merged settings JSON without writing
 mdkb setup hooks claude --scope local --dry-run
 
@@ -210,6 +213,13 @@ query. Set `user_prompt_submit_require_sigil = true` under `[hooks]` to opt out:
 a prompt without `*` then passes through unchanged. Session warmup and the
 other enabled hooks do not require the sigil.
 
+ego setup registers the installed binary as `mdkb_prompt_command`; it preserves
+a different existing value unless `--force` is given. Use `--dry-run` to preview
+the TOML. Hosts without transcript files can send bounded inline Stop episodes
+for settlement. See [ego setup and event contracts](docs/hooks.md#ego-prompt-context).
+Lifecycle commands outside a project consume their input and exit successfully
+without creating a store.
+
 #### The two recall floors
 
 The sigil selects a **threshold**, not a feature. Both settings run the same
@@ -223,6 +233,27 @@ it while a miss on a sigil prompt costs one search.
 | `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. Calibrated from the positive recall curve — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
 | `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
+
+Cross-encoder reranking is separate and **off by default**. With
+`hooks.recall_rerank_languages = []`, recall stays MiniLM-only: `mdkb embed`
+does not fetch reranker weights and the daemon does not load the cross-encoder.
+To opt in for Italian prompts only:
+
+```toml
+[hooks]
+recall_rerank_languages = ["it"]
+recall_rerank_min_scores = { it = -1.05, en = -1.95 }
+```
+
+Run `mdkb embed` after opting in to fetch the weights. Only `it` and `en` are
+recognised by the prompt-language detector; a tied vote uses Italian. Each
+selected language needs a finite floor in the table. An explicit table replaces
+the fitted defaults. The English floor came from a small synthetic store and
+admitted 3/24 held-out negatives, so review it before enabling English. Missing
+floors and unsupported codes are configuration errors. Old `recall_rerank_it` /
+`recall_rerank_en` keys are rejected, not translated; replace them with the list.
+Old `recall_rerank_min_score_it/en` keys must become the table above. A model
+already loaded by a previous opt-in stays resident until the daemon restarts.
 
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
 chose it on 2026-09-30 without a shadow week. The measurement that would have
@@ -722,15 +753,22 @@ is known, and what it skipped and why — because a repository that could not be
 opened is not an empty repository. `max_active_repos` in `daemon.toml`
 (default 5) bounds how many stores are held open at once.
 
-Finding the stores nested under a root means walking it, and how big that
-walk is follows from the operator's choice of root: a repository is tens of
-directories, a directory that merely holds repositories can be hundreds of
-thousands. The result is therefore cached, keyed by the directories it
-covered — so a repository the daemon itself opens changes that set and is
-discoverable at once. `discovery_cache_secs` in `daemon.toml` (default 60,
-`0` disables the cache) bounds the one case nothing else can catch: a store
-created by another process, such as an `mdkb init` from the CLI or a clone
-carrying a committed `.mdkb/`.
+Nested discovery prunes Git/store internals, `target`, `node_modules`, `.tmp`,
+`build`, `dist`, `coverage`, `__pycache__`, directories ending in `__wt`, local
+ignore rules, and configured ignored paths. Explicit known roots below a pruned
+ancestor remain reachable and are walked independently. Discovery does not
+follow directory symlinks. Register or explicitly name a repository under a
+pruned generated/worktree tree rather than expecting an ancestor scan to find it.
+
+The daemon caches discovery per covered root set and coalesces simultaneous
+misses, so repeated clients do not repeat the same walk. A repository the daemon
+opens is known immediately. `discovery_cache_secs` in `daemon.toml` (default 60,
+`0` disables this cache) bounds discovery of a store created by another process.
+Repository listing rows also reuse unchanged filesystem signatures for at most
+60 seconds, avoiding repeated database opens and Git subprocesses. Database/WAL
+or Git metadata changes invalidate those rows; this separate row cache is not
+controlled by `discovery_cache_secs`. Listings remain read-only and do not
+migrate stores.
 
 ### Memory
 
@@ -804,6 +842,13 @@ mdkb eval recall --mode hybrid --min-recall 0.9   # exit 1 below the floor
 ```
 
 Baseline numbers, the fixture authoring rule and what CI enforces: [docs/retrieval-eval.md](docs/retrieval-eval.md).
+
+The [recall-options experiment](docs/recall-options-eval.md#mac-prompt-path-cost-2026-10-21)
+separates ungated retrieval from actual injected recall and records native Mac
+pipeline latency/RSS. Its configurable-embedder gate failed: e5-small did not
+show a significant paired Italian injection-recall gain and exceeded the 700 ms
+p95 limit. MiniLM remains the retriever; this experiment adds no model-selection
+configuration.
 
 ### Stats
 
@@ -900,7 +945,26 @@ Blank lines between the annotation and the pattern are tolerated. The annotation
 
 Uses the same syntax as `.gitignore`, including `!pattern` for re-inclusion. Place one at the repo root.
 
+### Background indexing
+
+Ordinary watcher edits index only delivered document paths. Admission uses the
+same collection globs and ignore policy as a full walk, including common Git
+excludes in linked worktrees. Build, Git and database churn does not trigger a
+whole-tree scan; directory and ignore-policy changes still reconcile membership.
+Pending paths and overflow recovery are bounded per repository. See
+[watcher recovery and troubleshooting](docs/hooks.md#edited-files-not-reindexing).
+
 ## Storage
+
+### Older-store migration
+
+Normal CLI access to an older store can announce and perform a schema migration;
+strict read-only access and repository listings do not migrate it. Candidate-bearing
+pre-v27 stores now receive the prior misfire column before reclustering, avoiding
+`no such column: misfired_count` during an upgrade. This corrects migration order,
+not the current schema version. No manual column edit or index deletion is needed
+for that defect. Use `mdkb repos refresh --only outdated` for a deliberate upgrade
+of known older stores with verified backups.
 
 Project state stays local in `.mdkb/`:
 

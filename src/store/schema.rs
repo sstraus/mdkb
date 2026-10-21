@@ -1111,6 +1111,24 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         }
     }
 
+    // Add the v31 column before v27 reclustering: that data migration calls
+    // current cluster readers and writers, which already require this column.
+    // A trigger can fire out of context while the underlying lesson remains
+    // true. Keep that verdict separate from a refutation of the lesson.
+    if from_version < 31 && table_exists(conn, "prior_clusters") {
+        let has_misfired: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'misfired_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_misfired {
+            conn.execute(
+                "ALTER TABLE prior_clusters ADD COLUMN misfired_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+    }
+
     // Migration from v26 to v27: regroup the candidates already on disk under
     // the clustering rule they were not written under.
     //
@@ -1232,22 +1250,6 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // has actually happened.
     if from_version < 30 {
         conn.execute_batch(RELATION_CANDIDATES_SQL)?;
-    }
-
-    // A trigger can fire out of context while the underlying lesson remains
-    // true. Keep that verdict separate from a refutation of the lesson.
-    if from_version < 31 && table_exists(conn, "prior_clusters") {
-        let has_misfired: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'misfired_count')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_misfired {
-            conn.execute(
-                "ALTER TABLE prior_clusters ADD COLUMN misfired_count INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
     }
 
     if from_version < 32 {

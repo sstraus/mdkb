@@ -159,6 +159,11 @@ On the box the hf-hub client fails TLS (`UnknownIssuer`); `box-run.sh` prefetche
 
 ## Reranker on MiniLM top-5, held out (story 202-4c67)
 
+The following describes the historical shipped configuration. Story 018-90b0
+later made reranking opt-in with `hooks.recall_rerank_languages = []` by default
+and moved the fitted floors to `hooks.recall_rerank_min_scores`. The old switch
+and scalar floor keys are rejected; see the current hook configuration docs.
+
 Shipped: jina-reranker-v2 int8 on MiniLM's top five, per-language floor on the reranker score, per entry (`hooks.recall_rerank_min_score_it` -1.05, `..._en` -1.95). Floors are the lowest 0.05 step above the best negative of the 2026-09-30 fit data (IT best -1.081, EN best -1.986). Per-entry admission injects 20 entries for 12 IT hits on the fit pool; admitting all five once the top passes injects 75 for 14.
 
 Held-out set, written after the fit, four-gram check against the corpus passed: 44 IT positives and 24 IT negatives, 36 EN positives and 24 EN negatives. Harness: `scripts/eval-recall-options/a6.py` (`pool`, `report`). Floors not refitted on it. Wilson 95% intervals.
@@ -172,7 +177,9 @@ Caveats. The IT positives were written after reading the corpus chunks, so vocab
 
 Latency on this Mac (M4 Max, own daemon, 37 memories of ~1.4 kB, top-5 pool, at host load average 36-65 from other jobs, so contended): unbounded rerank phase p50 972 ms, p95 1513 ms, max 2424 ms (153 reranked hooks); daemon RSS 1.45-2.2 GB with the model loaded (6.6 MB before). At the 700 ms deadline most calls time out (65 timeout, 165 busy, 9 finished of 256) and the hook falls back to the MiniLM result; no hook exceeded 866 ms. An unloaded Mac run was not possible. The hook client then waited a fixed 1 s, not the 1500 ms hook deadline, so the rerank budget was clamped to that. Story 203-353e replaced the fixed wait: the client waits the hook deadline plus 250 ms, the default deadline is 1000 ms, and the rerank budget clamps to the deadline.
 
-## e5-small retriever under the reranker (2026-10-16, plan configurable-embedder Step 1)
+## Mac rerun 2026-10
+
+### e5-small retriever under the reranker (2026-10-16, configurable-embedder Step 1)
 
 Question: does replacing MiniLM with e5-small as the retriever for the jina reranker beat the shipped jina-on-MiniLM path enough to make the embedding model configurable? The gate was fixed before the run: IT recall beats the shipped path with a paired sign test p < 0.05, EN recall >= 0.417, p95 embed+rerank <= 700 ms on the Mac.
 
@@ -184,7 +191,32 @@ Data: the 2026-09-30 fit set (40 IT positives, 38 IT negatives, 36 EN positives,
 | e5-small top-5 | -0.75 | 12/40 = 0.300 (0.18-0.45) | 0.325 | 0.319 / 0.046 | +2 -2, p = 1.00 | 18/36 = 0.500 |
 | e5-small top-10 | -0.75 | 15/40 = 0.375 (0.24-0.53) | 0.475 | 0.397 / 0.052 | +4 -1, p = 0.38 (top5-hit: +7 -2, p = 0.18) | 18/36 = 0.500 |
 
-Result: **FAIL.** No e5 configuration separates from the shipped path. e5-small top-5 is a tie. e5-small top-10 is the only gain, and it is not significant; it also doubles the reranker work (0.44 s to 0.88 s on 32 cores, "Latency on the rb box"), and the shipped top-5 path already times out on this Mac under load (p50 972 ms, p95 1513 ms, see the held-out section above). The latency arm of the gate was therefore not re-measured: it cannot change the verdict. The EN arm passes for every pool, because the 12-memory EN store makes the pool almost irrelevant.
+Result: **FAIL.** No e5 configuration separates from the shipped path. e5-small top-5 is a tie. e5-small top-10 is the only gain, and it is not significant; it also doubles the reranker work (0.44 s to 0.88 s on 32 cores, "Latency on the rb box"), and the shipped top-5 path already times out on this Mac under load (p50 972 ms, p95 1513 ms, see the held-out section above). At that stage the latency arm was not re-measured because it could not change the verdict. The 2026-10-21 Mac measurements below now complete that evidence. The EN arm passes for every pool, because the 12-memory EN store makes the pool almost irrelevant.
+
+### Mac prompt-path cost (2026-10-21)
+
+The paired sign tests above use injected-entry recall, not ungated retrieval or the older top5-hit measure. The baseline is compared with itself; the two candidates have p = 1.00 and p = 0.38. Neither meets p < 0.05. The pre-registered gate is conjunctive: this failed recall arm is sufficient to stop, regardless of latency or RSS.
+
+| Configuration | Paired IT sign test vs baseline | Mac embed+rank+rerank p50 | Mac embed+rank+rerank p95 | Process peak RSS |
+|---|---|---|---|---|
+| MiniLM+jina int8 top-5 (baseline) | baseline | 178.1 ms | 721.4 ms | 5,866,979,328 bytes (5.46 GiB) |
+| e5-small+jina int8 top-5 | +2/-2, p = 1.00 | 432.5 ms | 753.6 ms | 7,165,657,088 bytes (6.67 GiB) |
+| e5-small+jina int8 top-10 | +4/-1, p = 0.38 | 839.2 ms | 1478.7 ms | 7,413,891,072 bytes (6.90 GiB) |
+
+Method: native release build on the Mac, cached models, one fresh process per configuration, both models resident together. The new `pipeline` mode of `examples/recall_options_eval.rs` embeds the real corpus before timing. Each prompt interval measures query embedding, dense cosine ranking over that corpus, and jina-v2-int8 reranking of that retriever's actual top-k candidates. One warm-up prompt is excluded. First run three prompts per configuration, then change only the count to all 78 IT prompts (40 positives and 38 negatives). Percentiles are computed from those 78 complete intervals, not added from separately timed stages. The run does not include hook IPC, lock waits, or model loading. It does not refit recall floors.
+
+`/usr/bin/time -l` measures peak RSS over the whole process, including model loading and corpus embedding; these are not steady-state daemon footprints. The harness `getrusage` peaks agree within 98,304 bytes. The jobs run serially through build-slot, without thread overrides. Start load averages (1/5/15 minute) for the full baseline, e5 top-5 and e5 top-10 runs were 37.3/35.9/34.7, 68.3/43.3/37.4 and 97.8/54.3/41.8. Those windows include the preceding measurements and ONNX worker activity; this is not an unloaded-host comparison or a diagnosed external-load effect. Full-process wall times were 27.0 s, 45.0 s and 87.6 s. Each subprocess had a 600 s bound.
+
+Reproduce after building the example in release mode, with the private data directory and cached model files:
+
+```sh
+FASTEMBED_CACHE_DIR=<cache> /usr/bin/time -l <binary> pipeline minilm-l6 5 78 <data-dir> assets/eval/memory-recall.json
+# Repeat in a fresh process with e5-small 5, then e5-small 10.
+```
+
+Raw JSON samples, time output and run metadata are retained in `~/Gits/.tmp/results/mdkb-b1-evidence/` and `~/Gits/.tmp/results/mdkb-b1-measure.log`. All three measured p95 values exceed 700 ms. Both e5 candidates therefore fail the latency arm as well as the paired recall arm; EN recall remains 0.500. Verdict: **FAIL**.
+
+**Disposition: Closed — gate failed.** Do not implement Steps 2-8. Delete their queued stories (006-5443, 007-0cfa, 008-f09e, 009-fef1, 010-bb4b, 011-3668 and 012-bcf2). Keep the jina-only follow-ups: warn when reranker weights are missing, and investigate reranker idle unload. These are not evidence that the configurable retriever passed.
 
 Retrieval is not the weak part. Without any gate, e5-small finds the right chunk far more often than MiniLM for an Italian prompt, and about as often as for the same prompt translated to English, so the multilingual model works:
 

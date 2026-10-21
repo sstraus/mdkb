@@ -1073,16 +1073,18 @@ mod fetch_reranker_weights_tests {
         // Catches: the failure logged and dropped, so `mdkb embed` exits 0
         // with no reranker weights and the user never learns why recall is
         // MiniLM-only.
-        let on = crate::config::HooksConfig::default();
+        let on = crate::config::HooksConfig {
+            recall_rerank_languages: vec!["it".into()],
+            ..Default::default()
+        };
         let error = fetch_reranker_weights_with(&on, || Err(Error::other("offline")))
             .unwrap_err()
             .to_string();
         assert!(error.contains("offline"), "{error}");
         assert!(error.contains("embeddings are done"), "{error}");
 
-        let mut off = on;
-        off.recall_rerank_it = false;
-        off.recall_rerank_en = false;
+        // Catches a default config still fetching the 280 MB reranker weights.
+        let off = crate::config::HooksConfig::default();
         fetch_reranker_weights_with(&off, || panic!("downloaded with the reranker off")).unwrap();
     }
 }
