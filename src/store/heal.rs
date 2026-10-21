@@ -1107,8 +1107,6 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
             .unwrap_or(&name);
         if !salvaged.contains(copy_name) {
             if copy_name == name {
-                #[cfg(test)]
-                eprintln!("sweep warning branch: {name}");
                 tracing::warn!(
                     "quarantine {name} is past its retention but its salvage never succeeded; keeping it — it may hold the only copy of those memory entries"
                 );
@@ -2075,26 +2073,6 @@ mod tests {
             sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
         });
 
-        if logs.is_empty() {
-            tracing::callsite::rebuild_interest_cache();
-            let probe = captured_logs(|| {
-                tracing::warn!("direct capture probe");
-                eprintln!(
-                    "fixture exists={}, contents={:?}",
-                    corrupt.exists(),
-                    std::fs::read_dir(dir.path())
-                        .unwrap()
-                        .map(|e| e.unwrap().file_name())
-                        .collect::<Vec<_>>()
-                );
-                eprintln!(
-                    "capture WARN enabled: {}",
-                    tracing::enabled!(tracing::Level::WARN)
-                );
-                sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
-            });
-            eprintln!("second sweep capture: {probe:?}");
-        }
         assert!(
             logs.contains(&format!("quarantine {name} is past its retention")),
             "the copy must be named in the warning: {logs}"
@@ -2563,14 +2541,21 @@ mod tests {
         thread_local! {
             static BUFFER: Buf = Buf::default();
         }
-        static DISPATCH: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
-        let dispatch = DISPATCH.get_or_init(|| {
-            tracing::Dispatch::new(
+        static DISPATCH: std::sync::OnceLock<(tracing::Dispatch, tracing::Dispatch)> =
+            std::sync::OnceLock::new();
+        let (dispatch, _registry_pin) = DISPATCH.get_or_init(|| {
+            let capture = tracing::Dispatch::new(
                 tracing_subscriber::fmt()
                     .with_writer(|| BUFFER.with(Clone::clone))
                     .with_ansi(false)
                     .finish(),
-            )
+            );
+            // tracing-core's single-dispatch fast path consults the emitting
+            // thread's default, not the registered dispatch. A first warning
+            // outside capture can therefore cache `never` permanently. Keep
+            // two live dispatches so registration always consults the registry.
+            let registry_pin = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            (capture, registry_pin)
         });
         let buf = BUFFER.with(Clone::clone);
         buf.0.lock().unwrap().clear();
