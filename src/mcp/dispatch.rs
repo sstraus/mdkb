@@ -8921,13 +8921,15 @@ mod tests {
     async fn default_config_never_calls_the_reranker_model_load_boundary() {
         // Catches an opt-out default or unconditional score call loading the
         // cross-encoder even though the user never selected a language.
-        let tmp = TempDir::new().unwrap();
-        let (handle, calls) = counted_rerank_handle(&tmp, |_| {});
-        seed_memory_entry(&handle, "default-minilm").await;
         for (prompt, session) in [
             (RECALL_PROMPT, "default-en"),
             ("perche il topic non funziona", "default-it"),
         ] {
+            // hook_event_row returns the first matching row, so each request
+            // needs its own log to assert that request's telemetry.
+            let tmp = TempDir::new().unwrap();
+            let (handle, calls) = counted_rerank_handle(&tmp, |_| {});
+            seed_memory_entry(&handle, "default-minilm").await;
             let (result, row) = prompt_row(&handle, prompt, session).await;
             if prompt == RECALL_PROMPT {
                 assert!(
@@ -8936,8 +8938,8 @@ mod tests {
                 );
             }
             assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -8952,10 +8954,16 @@ mod tests {
         assert!(additional_context(&result).contains("opted-in"), "{result}");
         assert_eq!(row["phases"]["rerank_outcome"], "ok", "{row}");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "opt-in-en").await;
+        // Separate log: prompt_row reads the first event for each root.
+        let english_tmp = TempDir::new().unwrap();
+        let (english_handle, english_calls) = counted_rerank_handle(&english_tmp, |cfg| {
+            cfg.hooks.recall_rerank_languages = vec!["it".into()];
+        });
+        seed_memory_entry(&english_handle, "opted-in").await;
+        let (result, row) = prompt_row(&english_handle, RECALL_PROMPT, "opt-in-en").await;
         assert!(additional_context(&result).contains("opted-in"), "{result}");
         assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(english_calls.load(Ordering::SeqCst), 0);
     }
 
     /// One prompt through the dispatcher, with the row it logged.
