@@ -310,6 +310,8 @@ mod tests {
             snippets: vec![],
             status: None,
             superseded_by: None,
+            source: None,
+            read_only: false,
             repo_root: None,
         }
     }
@@ -332,7 +334,7 @@ mod tests {
         let fused = rrf_fusion(&bm25, &vector, &config);
 
         // Docs appearing in both lists should be ranked higher
-        assert!(!fused.is_empty());
+        assert_ne!(fused, [] as [(i64, f64); 0]);
         // Both doc 1 and doc 2 appear in both lists
         let top_ids: Vec<i64> = fused.iter().take(2).map(|(id, _)| *id).collect();
         assert!(top_ids.contains(&1));
@@ -350,7 +352,7 @@ mod tests {
         let config = HybridConfig::default();
 
         let fused = rrf_fusion(&bm25, &vector, &config);
-        assert!(fused.is_empty());
+        assert_eq!(fused, [] as [(i64, f64); 0]);
     }
 
     #[test]
@@ -393,7 +395,7 @@ mod tests {
     fn test_normalize_scores_empty() {
         let mut scores: Vec<(i64, f64)> = vec![];
         normalize_scores(&mut scores);
-        assert!(scores.is_empty());
+        assert_eq!(scores, [] as [(i64, f64); 0]);
     }
 
     #[test]
@@ -585,7 +587,7 @@ mod tests {
         // 0 items: no-op
         let mut empty: Vec<i32> = vec![];
         lost_in_middle_reorder(&mut empty);
-        assert!(empty.is_empty());
+        assert_eq!(empty, [] as [i32; 0]);
 
         // 1 item: no-op
         let mut single = vec![42];

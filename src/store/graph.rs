@@ -1023,7 +1023,10 @@ mod tests {
         add_alias(&conn, doc, "person:alice", "id").unwrap();
         add_alias(&conn, doc, "person:alice", "aliases").unwrap();
 
-        assert!(alias_collisions(&conn).unwrap().is_empty());
+        assert_eq!(
+            alias_collisions(&conn).unwrap(),
+            [] as [crate::store::graph::AliasCollision; 0]
+        );
         assert_eq!(
             resolve_ref_to_doc(&conn, "person:alice").unwrap(),
             Some(doc)
@@ -1216,7 +1219,7 @@ mod tests {
         add_edge(&conn, _b, "c", "themes", KIND_FRONTMATTER, None).unwrap();
 
         let nbrs = neighbors(&conn, a, None, 2).unwrap();
-        assert!(!nbrs.is_empty());
+        assert_ne!(nbrs, [] as [crate::store::graph::Neighbor; 0]);
         for n in &nbrs {
             assert!(
                 !n.via.is_empty(),

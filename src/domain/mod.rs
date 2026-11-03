@@ -182,9 +182,25 @@ pub struct SearchResult {
     #[serde(default)]
     pub superseded_by: Option<String>,
 
+    /// External owner; absent for file-backed documents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// External documents can only be changed through owner ingest.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub read_only: bool,
+
     /// Repository root path (set in daemon mode for cross-repo search provenance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_root: Option<String>,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "Serde skip_serializing_if predicates receive the field by reference"
+)]
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Index status information.

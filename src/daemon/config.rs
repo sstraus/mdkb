@@ -111,6 +111,10 @@ pub struct DaemonConfig {
     /// See [`DEFAULT_DISCOVERY_CACHE_SECS`]. `0` disables the cache.
     pub discovery_cache_secs: u64,
 
+    /// Days of inactivity before an unpinned healthy repo leaves the map.
+    /// Default: 30. `0` disables expiry. Configured repos and scopes never expire.
+    pub repo_expiry_days: u64,
+
     /// Directories whose stores are never discovered and never part of
     /// `root="*"`: a path here silences every store at or below it. Hand-owned
     /// like the rest of this file; `~/` is expanded.
@@ -138,6 +142,49 @@ pub struct DaemonConfig {
     /// `~/.mdkb`.
     #[serde(skip)]
     pub state_dir: Option<PathBuf>,
+
+    /// Developer diagnostics. Machine-wide on purpose: a per-repo switch would
+    /// have to be repeated in every store the hooks touch.
+    pub telemetry: DaemonTelemetry,
+}
+
+/// `[telemetry]` in `daemon.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonTelemetry {
+    /// Write `hook-events.jsonl` and `hook-slow.jsonl` in each store a hook runs
+    /// against. Off by default: the rows are input for tuning mdkb itself, and
+    /// writing them in every repo costs I/O per tool call and shows up as a file
+    /// diff in the agent UI.
+    pub hook_events: bool,
+}
+
+/// Environment override for [`DaemonTelemetry::hook_events`], so a test or a
+/// one-off run can turn the hook logs on without editing `daemon.toml`.
+pub const HOOK_TELEMETRY_ENV: &str = "MDKB_HOOK_TELEMETRY";
+
+/// Whether hooks write their diagnostic logs.
+///
+/// Reads `daemon.toml` on every call: the daemon reloads that file on change and
+/// a hook client is a short-lived process, so there is no long-lived copy to go
+/// stale. An unreadable file means off. The crate's own unit tests always log,
+/// because they assert on the rows; the gate itself is tested through
+/// [`hook_telemetry_from`].
+pub fn hook_telemetry_enabled() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    let config = DaemonConfig::load_or_default(&DaemonConfig::config_path()).unwrap_or_default();
+    hook_telemetry_from(std::env::var_os(HOOK_TELEMETRY_ENV).as_deref(), &config)
+}
+
+/// The decision behind [`hook_telemetry_enabled`], with its inputs explicit.
+pub fn hook_telemetry_from(env: Option<&std::ffi::OsStr>, config: &DaemonConfig) -> bool {
+    match env.and_then(|v| v.to_str()) {
+        Some("1" | "true") => true,
+        Some("0" | "false") => false,
+        _ => config.telemetry.hook_events,
+    }
 }
 
 /// A pre-registered repository entry.
@@ -168,10 +215,12 @@ impl Default for DaemonConfig {
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            repo_expiry_days: 30,
             ignore: Vec::new(),
             scopes: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
+            telemetry: DaemonTelemetry::default(),
         }
     }
 }
@@ -401,8 +450,39 @@ fn expand_tilde(path: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hook_telemetry_is_off_unless_the_config_or_env_turns_it_on() {
+        use std::ffi::OsStr;
+        let off = DaemonConfig::default();
+        let on: DaemonConfig = toml::from_str("[telemetry]\nhook_events = true\n").unwrap();
+
+        assert!(!hook_telemetry_from(None, &off), "default must be off");
+        assert!(hook_telemetry_from(None, &on));
+        assert!(hook_telemetry_from(Some(OsStr::new("1")), &off));
+        assert!(
+            !hook_telemetry_from(Some(OsStr::new("0")), &on),
+            "env 0 wins over the file"
+        );
+        assert!(
+            !hook_telemetry_from(Some(OsStr::new("")), &off),
+            "an empty variable is not a vote"
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
+
+    /// Catches silently ignoring the expiry setting or making old configs opt out.
+    #[test]
+    fn repo_expiry_config_defaults_to_30_days_and_accepts_off() {
+        let old: DaemonConfig = toml::from_str("").unwrap();
+        assert_eq!(old.repo_expiry_days, 30);
+        for days in [0, 7, 90] {
+            let parsed: DaemonConfig =
+                toml::from_str(&format!("repo_expiry_days = {days}")).unwrap();
+            assert_eq!(parsed.repo_expiry_days, days);
+        }
+    }
 
     /// The point of the whole function: an operator, and this suite, must be
     /// able to say where home is. `BaseDirs` alone answers a Win32 API that
@@ -451,13 +531,14 @@ mod tests {
         let config = DaemonConfig::default();
         assert_eq!(config.max_active_repos, 5);
         assert!(config.socket_path.is_none());
-        assert!(config.whitelist_dirs.is_empty());
+        assert_eq!(config.whitelist_dirs, [] as [String; 0]);
         assert!(config.repos.is_empty());
     }
 
     #[test]
     fn test_daemon_config_serialization_roundtrip() {
         let config = DaemonConfig {
+            telemetry: DaemonTelemetry::default(),
             socket_path: Some("~/.mdkb/daemon.sock".to_string()),
             max_active_repos: 10,
             whitelist_dirs: vec!["~/Gits".to_string(), "~/Projects".to_string()],
@@ -472,6 +553,7 @@ mod tests {
                 },
             ],
             discovery_cache_secs: 90,
+            repo_expiry_days: 30,
             ignore: Vec::new(),
             scopes: vec![ScopeRule {
                 prefix: "~/Gits/home".to_string(),
@@ -543,7 +625,7 @@ whitelist_dirs = ["~/Code"]
     fn test_daemon_config_deserialization_empty() {
         let config: DaemonConfig = toml::from_str("").unwrap();
         assert_eq!(config.max_active_repos, DEFAULT_MAX_ACTIVE_REPOS);
-        assert!(config.whitelist_dirs.is_empty());
+        assert_eq!(config.whitelist_dirs, [] as [String; 0]);
     }
 
     #[test]
@@ -558,6 +640,7 @@ whitelist_dirs = ["~/Code"]
         let path = tmp.path().join("daemon.toml");
 
         let config = DaemonConfig {
+            telemetry: DaemonTelemetry::default(),
             socket_path: None,
             max_active_repos: 7,
             whitelist_dirs: vec!["~/Gits".to_string()],
@@ -566,6 +649,7 @@ whitelist_dirs = ["~/Code"]
                 scope: None,
             }],
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            repo_expiry_days: 30,
             ignore: Vec::new(),
             scopes: Vec::new(),
             priors: toml::Table::new(),

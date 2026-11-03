@@ -431,7 +431,7 @@ mod tests {
             id: "wal".into(),
             at: 50,
         }];
-        assert!(outcomes(&c, &e).is_empty());
+        assert_eq!(outcomes(&c, &e), [] as [(i64, String, &str); 0]);
     }
 
     #[test]
@@ -453,7 +453,7 @@ mod tests {
             text: "[wal-archive] Old".into(),
             at: 200,
         }];
-        assert!(outcomes(&c, &e).is_empty());
+        assert_eq!(outcomes(&c, &e), [] as [(i64, String, &str); 0]);
     }
 
     #[test]
@@ -496,13 +496,13 @@ mod tests {
             text: "no, use the other checkpoint".into(),
             at: 150,
         }];
-        assert!(outcomes(&c, &e).is_empty());
+        assert_eq!(outcomes(&c, &e), [] as [(i64, String, &str); 0]);
     }
 
     #[test]
     fn no_signal_leaves_every_candidate_unlabelled() {
         let c = [cand(1, 100, "wal", true), cand(1, 100, "other", false)];
-        assert!(outcomes(&c, &[]).is_empty());
+        assert_eq!(outcomes(&c, &[]), [] as [(i64, String, &str); 0]);
     }
 
     #[test]

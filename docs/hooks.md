@@ -27,6 +27,45 @@ from stale training data. Hooks make recall proactive:
 All hooks are fire-and-forget: internal errors are logged to stderr and
 swallowed — the host CLI is never blocked by mdkb.
 
+## Find labels and other literal values
+
+Use the CLI literal scope before grep when you know text from the UI:
+
+```bash
+mdkb search 'Fork from here' --scope text
+mdkb search 'fork from here' --scope text --ignore-case --root tuicommander
+mdkb search 'Fork from here' --scope text --file src/ --limit 30
+```
+
+The code-index parser stores AST string literals, JSX text, and JSON values with
+file:line locations and the smallest enclosing symbol when one exists.
+Matching is a case-sensitive fixed substring, not a regular expression;
+`--ignore-case` uses Unicode lowercase matching. The default CLI `mdkb search`
+also includes literal hits. Use `--scope text` to exclude documents and memory,
+or `--scope symbols` for definitions rather than values. `--scope strings` is an
+alias for `text`. `--root` uses the same repository selector as other CLI searches.
+
+Run `mdkb code index` once to populate literals in an older index. Search reads
+the index, not source files: the existing post-edit hook and daemon watcher
+refresh changed files. Human output and JSON report the oldest file indexing
+timestamp so a caller can identify stale data and request a refresh.
+JSON for `--scope text` has `hits`, `truncated`, and `indexed_at`; default search
+adds this result under `text`, beside the existing `documents` and `memory` keys.
+A repository with no literal-capable code index has `text: null` in default JSON.
+The MCP search scopes are unchanged; these commands describe the CLI surface.
+
+Literal discovery uses the code index's ignore rules and nested-store boundaries.
+JSON now participates in code indexing for its values, not its property keys.
+To bound index growth, literals shorter than 4 characters or longer than 1024
+bytes are omitted. Each file contributes at most 4096 literals and 256 KiB of
+literal content. Generated markers in the first five lines, `.min.js`, `.min.ts`,
+`.generated.ts`, and any source line longer than 4096 bytes suppress literal
+extraction for that file. The existing 1 MiB file-size cap still applies.
+Interpolated templates contribute static fragments, not a fabricated runtime
+value. Double-quoted JSON-compatible strings decode escapes; other spellings
+retain source escapes. This is not a full-text scan: use grep for comments,
+short strings, generated files, or files outside the code index's language set.
+
 ## Install
 
 ```bash
@@ -52,23 +91,53 @@ mdkb setup hooks codex
 Restart the host CLI after setup. Re-running is idempotent: existing
 hook entries are replaced, unrelated settings are preserved.
 
-### ego prompt context
+Codex handlers carry `statusMessage` (`mdkb session-start`, `mdkb stop`, …),
+which Codex `/hooks` shows as the hook title. Codex hashes the whole handler for
+trust, so after setup adds or changes that label, Codex marks the mdkb hooks as
+modified. Review them once in `/hooks`; they do not run until you trust them.
+
+### ego generic lifecycle hooks
 
 ```bash
 mdkb setup hooks ego --dry-run
 mdkb setup hooks ego
-# Replace a different existing registration only when intended:
-mdkb setup hooks ego --force
+mdkb setup remove hooks ego
 ```
 
-This sets the top-level `mdkb_prompt_command` to an installed mdkb binary in
-`$EGO_HOME/config.toml`, or `~/.ego/config.toml` when `EGO_HOME` is unset. Setup
-finds an installed binary rather than registering an ephemeral build artifact;
-install mdkb first if none can be found. It preserves unrelated TOML, comments,
-and symlinked config targets. A matching value is unchanged; a different value
-is kept unless `--force` is given. `--dry-run` prints the merged TOML and writes
-nothing. This is ego's prompt-context registration, not a Claude/Codex lifecycle
-hook configuration. Hosts that deliver Stop observations use the
+This targets ego's generic hook contract from story 718-0496, not the removed
+`mdkb_prompt_command` bridge. Upgrade ego to a build with that contract before
+setup. Setup does not probe or require an installed ego binary.
+
+Setup merges six `[[hooks]]` entries: `SessionStart`, `UserPromptSubmit`,
+`PreToolUse`, `PostToolUse`, `PostToolUseFailure`, and `Stop`. Each command handler
+uses the installed mdkb binary, exact `args = ["hook", "<event>"]`, and a ten-second
+timeout. Both post-tool events call `mdkb hook post-tool-use`; the input
+`hook_event_name` distinguishes failure. Setup also adds the binary to
+`exec_paths` and five exact `exec(/path/to/mdkb hook <event>)` rules to
+`permissions.allow`. These rules admit only those hook commands; they do not
+change ego's sandbox or other permission boundaries.
+
+The config is `$EGO_HOME/config.toml`, or `~/.ego/config.toml` when `EGO_HOME`
+is unset. Setup finds an installed mdkb binary instead of registering an ephemeral
+build artifact. It removes any legacy `mdkb_prompt_command` key. It preserves
+unrelated TOML values, comments, and config symlink targets. Repeated setup or
+removal does not add duplicates. A user-modified hook (for example, one with a
+matcher or a different timeout) is not replaced or removed. Removal deletes only
+the exact generated hooks and matching execution allowances for the selected
+mdkb binary. `--force` remains accepted but is not needed: setup merges entries.
+`--dry-run` prints the merged TOML without writing it. Restart ego after setup.
+
+For version-1 hook input, MDKB returns `hookSpecificOutput.additionalContext`
+only for `SessionStart`, `UserPromptSubmit`, and `PostToolUse`, with an exact
+`hookEventName` match. `PreToolUse` and `PostToolUseFailure` observations use
+`version = 1`, `decision = "continue"`, and `feedback` instead: ego accepts these
+as evidence, not model context. Internal reindex queue fields are not returned
+to this closed protocol. Empty results produce no stdout. Claude Code and Codex
+keep their existing output contract.
+
+Ego's `Stop.transcript` is plain inline text, not a Claude transcript-file path
+or MDKB's `episode_jsonl` format. The Stop hook settles without claiming prior
+mining from that text. Hosts that need mining must provide the documented
 [inline episode contract](#inline-episodes-ego-and-other-hosts-without-transcript-files).
 
 ### Disable individual events at install time

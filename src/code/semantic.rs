@@ -692,7 +692,7 @@ mod tests {
         // Dropping everything leaves a valid, empty store, and sweeping that
         // empty store again is a no-op rather than an error.
         assert_eq!(store.retain(|_| false).unwrap(), 3);
-        assert!(store.load().unwrap().is_empty());
+        assert_eq!(store.load().unwrap(), [] as [(u32, Vec<f32>); 0]);
         assert_eq!(store.count().unwrap(), 0);
         assert_eq!(store.retain(|_| true).unwrap(), 0);
     }
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(store.count().unwrap(), 0);
 
         let loaded = store.load().unwrap();
-        assert!(loaded.is_empty());
+        assert_eq!(loaded, [] as [(u32, Vec<f32>); 0]);
     }
 
     #[test]
@@ -815,7 +815,7 @@ mod tests {
 
         assert_eq!(store.count().unwrap(), 0);
         let loaded = store.load().unwrap();
-        assert!(loaded.is_empty());
+        assert_eq!(loaded, [] as [(u32, Vec<f32>); 0]);
     }
 
     #[test]
@@ -1021,7 +1021,7 @@ mod tests {
         let removed = store.remove_by_ids(&to_remove).unwrap();
         assert_eq!(removed, 3);
         assert_eq!(store.count().unwrap(), 0);
-        assert!(store.load().unwrap().is_empty());
+        assert_eq!(store.load().unwrap(), [] as [(u32, Vec<f32>); 0]);
     }
 
     // --- SemanticSearch-level tests (no model needed) ---

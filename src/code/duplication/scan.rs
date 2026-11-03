@@ -333,7 +333,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(scanned.is_empty());
+        assert_eq!(scanned, [] as [crate::code::duplication::scan::Scanned; 0]);
         assert_eq!(files.reads, ["src/gone.rs"]);
     }
 
@@ -372,7 +372,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(scanned.is_empty());
+        assert_eq!(scanned, [] as [crate::code::duplication::scan::Scanned; 0]);
         assert_eq!(dup.count().unwrap(), 0, "nothing to cache");
     }
 

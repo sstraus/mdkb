@@ -42,6 +42,7 @@ pub fn get_content(conn: &Connection, hash: &str) -> Result<Option<String>> {
 /// atomicity. If the process crashes mid-operation, the database will
 /// remain in a consistent state.
 pub fn index_document(conn: &Connection, doc: &Document, content: &str) -> Result<i64> {
+    super::external::refuse_collection(&doc.collection)?;
     // Use IMMEDIATE transaction to get write lock early and avoid deadlocks
     conn.execute("BEGIN IMMEDIATE", [])?;
 
@@ -239,6 +240,12 @@ pub fn get_document_by_path(
 
 /// Delete a document by ID.
 pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
+    super::external::refuse_document(conn, id)?;
+    delete_external_in_tx(conn, id)
+}
+
+/// Ingest-only deletion after its revision record is unlinked.
+pub(super) fn delete_external_in_tx(conn: &Connection, id: i64) -> Result<bool> {
     // Capture the content hash before the row (and, via trigger, its FTS entry)
     // is gone, so the body can be reclaimed if it becomes orphaned.
     let hash: Option<String> = conn
@@ -496,6 +503,16 @@ pub fn get_content_batch(
 /// Index a document within an existing transaction (no transaction management).
 /// Use this when you're managing the transaction externally.
 pub fn index_document_in_tx(conn: &Connection, doc: &Document, content: &str) -> Result<i64> {
+    super::external::refuse_collection(&doc.collection)?;
+    index_document_inner(conn, doc, content)
+}
+
+/// Ingest-only write, with the revision transaction already held.
+pub(super) fn index_external_in_tx(
+    conn: &Connection,
+    doc: &Document,
+    content: &str,
+) -> Result<i64> {
     index_document_inner(conn, doc, content)
 }
 
@@ -604,7 +621,7 @@ mod tests {
         let content = "# Hello World\n\nThis is content.";
 
         let hash = store_content(&conn, content).expect("store should succeed");
-        assert!(!hash.is_empty());
+        assert_ne!(hash, "");
 
         let retrieved = get_content(&conn, &hash)
             .expect("get should succeed")
@@ -658,7 +675,7 @@ mod tests {
         assert_eq!(retrieved.collection, "docs");
         assert_eq!(retrieved.relative_path, "readme.md");
         assert_eq!(retrieved.title, Some("README".to_string()));
-        assert!(!retrieved.hash.is_empty());
+        assert_ne!(retrieved.hash, "");
     }
 
     #[test]

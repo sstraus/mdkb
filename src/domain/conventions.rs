@@ -255,14 +255,20 @@ mod tests {
         // `*.markdown` is not the shape mdkb ever wrote. Guessing at it would
         // be inventing an intent.
         let existing = vec![with_pattern("_root", "convention", "*.markdown")];
-        assert!(detect_pattern_upgrades(&existing).is_empty());
+        assert_eq!(
+            detect_pattern_upgrades(&existing),
+            [] as [crate::domain::conventions::PatternUpgrade; 0]
+        );
     }
 
     #[test]
     fn an_already_current_pattern_is_not_reported_as_an_upgrade() {
         // A notice on every update is a notice nobody reads.
         let existing = vec![with_pattern("_root", "convention", "**/*.md")];
-        assert!(detect_pattern_upgrades(&existing).is_empty());
+        assert_eq!(
+            detect_pattern_upgrades(&existing),
+            [] as [crate::domain::conventions::PatternUpgrade; 0]
+        );
     }
 
     #[test]

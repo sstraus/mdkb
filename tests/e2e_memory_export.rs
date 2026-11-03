@@ -79,7 +79,7 @@ fn export_writes_one_file_per_entry() {
 
     assert_eq!(result.exported, 3, "should export 3 entries");
     assert_eq!(result.skipped, 0);
-    assert!(result.errors.is_empty());
+    assert_eq!(result.errors, [] as [String; 0]);
 
     for id in &["alpha", "beta", "gamma"] {
         let file = out_dir.join(format!("{id}.md"));
@@ -257,7 +257,7 @@ fn import_dir_skip_duplicates() {
     // Import with skip
     let imp2 = handle_memory_import_dir(&env.ctx, &out_dir, false, true).expect("import2");
     assert_eq!(imp2.skipped, 1);
-    assert!(imp2.errors.is_empty());
+    assert_eq!(imp2.errors, [] as [String; 0]);
 }
 
 #[test]

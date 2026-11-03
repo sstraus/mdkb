@@ -4,6 +4,7 @@ pub mod chunks;
 pub mod collections;
 pub mod documents;
 pub mod evolution;
+pub mod external;
 pub mod graph;
 pub mod heal;
 pub mod hybrid;

@@ -16,13 +16,11 @@ const GRAMMAR_HINT: &str = "Run `mdkb cheatsheet` for the root grammar.";
 
 /// One item of a `root` selector.
 ///
-/// The two are told apart syntactically, by [`Path::is_absolute`] alone, before
-/// anything is looked up or touched on disk. That is what keeps an absolute
-/// path behaving exactly as it always did: a path to a repo the map has never
-/// heard of is still a path, and a repo name can never shadow one.
+/// Absolute, dot-relative, and home-relative syntax selects paths.
+/// Other strings remain repository names or path suffixes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootTerm {
-    /// An absolute path, used as written.
+    /// A filesystem path, resolved to its nearest existing store or known repo.
     Path(PathBuf),
     /// A repo name, resolved against the known roots by last path component, or
     /// by trailing components when it contains `/`.
@@ -63,6 +61,11 @@ impl RootSelector {
     /// thing; an unknown or ambiguous NAME is a resolution failure, not a
     /// parse failure, because parsing does not know the map.
     pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        Self::parse_at(raw, Path::new("."))
+    }
+
+    /// Relative paths use the caller's directory, not a global daemon's cwd.
+    pub(crate) fn parse_at(raw: Option<&str>, base: &Path) -> Result<Self, String> {
         let Some(raw) = raw else {
             return Ok(Self::Default);
         };
@@ -87,7 +90,7 @@ impl RootSelector {
             return Ok(Self::Scope(name.to_string()));
         }
 
-        if trimmed.contains(',') && Path::new(trimmed).exists() {
+        if trimmed.contains(',') && base.join(trimmed).exists() {
             return Err(format!(
                 "root=\"{trimmed}\" is both an existing path and a comma-separated list, \
                  so it cannot be resolved either way. A comma separates repos; a path \
@@ -110,11 +113,26 @@ impl RootSelector {
                      other items. {GRAMMAR_HINT}"
                 ));
             }
-            terms.push(if Path::new(segment).is_absolute() {
-                RootTerm::Path(PathBuf::from(segment))
-            } else {
-                RootTerm::Name(segment.to_string())
-            });
+            terms.push(
+                if Path::new(segment).is_absolute()
+                    || segment == "."
+                    || segment == ".."
+                    || segment.starts_with("./")
+                    || segment.starts_with("../")
+                    || segment.starts_with("~/")
+                {
+                    let path = if let Some(relative) = segment.strip_prefix("~/") {
+                        crate::daemon::config::home_dir()
+                            .map_err(|err| format!("Cannot resolve home-relative root: {err}"))?
+                            .join(relative)
+                    } else {
+                        base.join(segment)
+                    };
+                    RootTerm::Path(path)
+                } else {
+                    RootTerm::Name(segment.to_string())
+                },
+            );
         }
         Ok(Self::List(terms))
     }
@@ -122,8 +140,8 @@ impl RootSelector {
     /// The roots this selector names.
     ///
     /// `known` is every root the daemon knows; `open` is the subset with a live
-    /// handle, which is what [`Self::Default`] has always meant. Neither is read
-    /// for a path term, so an absolute path resolves with an empty map.
+    /// handle, which is what [`Self::Default`] has always meant. A path selects
+    /// its deepest containing known root or existing store, even if unregistered.
     ///
     /// Duplicates are collapsed, keeping first position: a list that names one
     /// repo twice is one repo, not a doubled fan-out.
@@ -232,8 +250,8 @@ impl RootSelector {
     /// stores, or only the roots already on the map?
     ///
     /// `Default` and `*` mean "every store under here", which is a question
-    /// only the walk can answer. An explicit PATH is itself and reads no map
-    /// at all; a NAME is looked up among known roots, and a store nobody has
+    /// only the walk can answer. An explicit PATH probes its ancestors for a store;
+    /// a NAME is looked up among known roots, and a store nobody has
     /// recorded can still be named, so that one needs discovery too.
     ///
     /// The walk visits every directory beneath every known root — on this
@@ -314,12 +332,47 @@ pub fn workspace_anchor(scope: &[PathBuf], roots: &[PathBuf]) -> Option<PathBuf>
     anchors.next().is_none().then(|| first.clone())
 }
 
-/// Resolve one term. A path is itself; a name is looked up by last component,
+/// Resolve one term. A path selects its nearest store or known ancestor; a name is
+/// looked up by last component,
 /// or by trailing path components when it holds a `/` (`tuicommander/plugins`),
 /// which is how a name several repos share is made unambiguous.
 fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
     let name = match term {
-        RootTerm::Path(path) => return Ok(path.clone()),
+        RootTerm::Path(path) => {
+            let canonical = crate::domain::canonicalize_plain(path)
+                .map_err(|err| format!("Cannot resolve root path \"{}\": {err}", path.display()))?;
+            // Reuse the registry's identity rule at the git boundary, preserving
+            // the descendant suffix for nearest-registered-store selection.
+            let canonical = if let Some(git_root) = crate::git::find_git_root(&canonical) {
+                crate::daemon::registry::canonicalize_root(&git_root)
+                    .map_err(|err| {
+                        format!("Cannot resolve root path \"{}\": {err}", path.display())
+                    })?
+                    .join(canonical.strip_prefix(&git_root).expect("git ancestor"))
+            } else {
+                canonical
+            };
+            let mut existing = crate::git::find_existing_store(&canonical);
+            while let Some(root) = existing.as_ref() {
+                // A config-only .mdkb directory is not an initialized store.
+                if root.join(".mdkb/index.sqlite").is_file() {
+                    break;
+                }
+                existing = root.parent().and_then(crate::git::find_existing_store);
+            }
+            return known
+                .iter()
+                .chain(existing.iter())
+                .filter(|root| canonical.starts_with(root))
+                .max_by_key(|root| root.components().count())
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "Path \"{}\" is not inside a known repo. {GRAMMAR_HINT}",
+                        path.display()
+                    )
+                });
+        }
         RootTerm::Name(name) => name,
     };
 
@@ -374,15 +427,23 @@ pub enum SearchScope {
     Code,
     Symbols,
     Duplicates,
+    Source,
+    Literals,
+    SemanticCode,
+    Knowledge,
 }
 
 impl SearchScope {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 9] = [
         Self::Docs,
         Self::Memory,
         Self::Code,
         Self::Symbols,
         Self::Duplicates,
+        Self::Source,
+        Self::Literals,
+        Self::SemanticCode,
+        Self::Knowledge,
     ];
 
     /// Can this scope be answered across several repos at once?
@@ -398,7 +459,10 @@ impl SearchScope {
     /// workspace was itself a store — while `get` from the same place
     /// anchored to that workspace and answered.
     pub const fn fans_out(self) -> bool {
-        matches!(self, Self::Docs | Self::Memory)
+        matches!(
+            self,
+            Self::Docs | Self::Memory | Self::Literals | Self::Knowledge
+        )
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -408,6 +472,10 @@ impl SearchScope {
             Self::Code => "code",
             Self::Symbols => "symbols",
             Self::Duplicates => "duplicates",
+            Self::Source => "source",
+            Self::Literals => "literals",
+            Self::SemanticCode => "semantic-code",
+            Self::Knowledge => "knowledge",
         }
     }
 }
@@ -426,18 +494,39 @@ impl TryFrom<&str> for SearchScope {
 /// Parameters for the search tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SearchParams {
-    /// Search query text.
+    /// Required query unless source/literals use patterns; optional for the duplicates audit.
+    #[serde(default)]
     pub query: String,
 
-    /// Repo to search: a name, an absolute path, a comma list of either, or "*" for every known repo; omit for this workspace.
+    /// Source/literals OR alternatives, mutually exclusive with query.
+    #[serde(default)]
+    pub patterns: Option<Vec<String>>,
+
+    /// Exact file or directory prefix for source/literals/symbols; raw prefix for duplicates.
+    #[serde(default)]
+    pub path: Option<String>,
+
+    /// Source-only regular expressions.
+    #[serde(default)]
+    pub regex: bool,
+
+    /// Case-insensitive source or literal matching.
+    #[serde(default)]
+    pub ignore_case: bool,
+
+    /// "v2" adds coverage to symbols/docs/memory; omission preserves legacy output.
+    #[serde(default)]
+    pub contract: Option<String>,
+
+    /// Repo to search: a name, absolute path or relative directory, comma list, or "*" for every known repo; omit for this workspace.
     #[serde(default)]
     pub root: Option<String>,
 
-    /// Maximum number of results (default: 10).
+    /// Maximum results.
     #[serde(default = "default_limit")]
     pub limit: usize,
 
-    /// Optional collection filter.
+    /// Collection filter.
     #[serde(default)]
     pub collection: Option<String>,
 
@@ -445,7 +534,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs", "memory", "code", "symbols", or "duplicates". Omit to search docs+memory. A field's [tag] lists the scopes it applies under; other scopes ignore it.
+    /// source: live lines; literals: AST values; symbols: definitions; semantic-code: concepts; docs; memory; knowledge: docs+memory; duplicates: audit. Legacy code and omitted docs+memory remain accepted. Field [tags] mark applicable scopes.
     #[serde(default)]
     pub scope: Option<String>,
 
@@ -453,7 +542,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// [code|duplicates] Minimum similarity 0.0-1.0. Omit to use the configured threshold. Under "duplicates" it also enables the semantic pass, which loads a model and takes minutes on a large repository — omit it for the fast structural sweep.
+    /// [code|semantic-code|duplicates] Minimum similarity 0.0-1.0; omit for configured default. For duplicates, enables a model-backed semantic pass that can take minutes; omit for a structural sweep.
     #[serde(default)]
     pub threshold: Option<f32>,
 
@@ -461,11 +550,11 @@ pub struct SearchParams {
     #[serde(default)]
     pub file: Option<String>,
 
-    /// [memory] Minimum confidence 0.0-1.0; entries below it are excluded, in the default docs+memory search too. Omit or 0.0 = no filter.
+    /// [memory] Minimum confidence 0.0-1.0, also applied to default docs+memory; omit or 0 for no filter.
     #[serde(default)]
     pub min_confidence: Option<f64>,
 
-    /// [duplicates] Git ref: report only clusters touching what changed since it, still scored against the whole index — what did this change duplicate.
+    /// [duplicates] Git ref: report clusters touching later changes, scored against the whole index.
     #[serde(default)]
     pub since: Option<String>,
 }
@@ -1193,8 +1282,7 @@ mod tests {
 
     #[test]
     fn only_the_selectors_that_can_change_answer_pay_for_discovery() {
-        // An explicit path is itself: `resolve_term` returns it without ever
-        // reading the known set, so the walk cannot change the result.
+        // Explicit paths probe ancestors, without recursively discovering stores.
         assert!(!RootSelector::parse(Some(ABS_A)).unwrap().needs_discovery());
         assert!(
             !RootSelector::parse(Some(&format!("{ABS_A},{ABS_B}")))

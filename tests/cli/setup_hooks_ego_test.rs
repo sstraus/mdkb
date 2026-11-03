@@ -1,187 +1,201 @@
-//! Integration tests for `mdkb setup hooks ego` — ego `config.toml` writer.
-
+//! CLI regressions for ego generic hook registration.
 use std::fs;
-use std::sync::MutexGuard;
+use std::path::Path;
+use std::process::{Command, Output};
 
-use mdkb::cli::setup_ego::{EgoSetupOutcome, handle_setup_hooks_ego};
-use tempfile::TempDir;
+const EVENTS: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+];
 
-use super::common::env_lock;
-
-const KEY: &str = "mdkb_prompt_command";
-
-/// Point EGO_HOME at a scratch dir so Boss's real ~/.ego is never touched.
-fn isolated_ego_home() -> (MutexGuard<'static, ()>, TempDir) {
-    let guard = env_lock();
-    let ego_home = tempfile::tempdir().expect("tempdir ego home");
-    unsafe {
-        std::env::set_var("EGO_HOME", ego_home.path());
-        std::env::set_var("HOME", ego_home.path().join("unused-home"));
-        std::env::set_var("MDKB_BINARY_OVERRIDE", env!("CARGO_BIN_EXE_mdkb"));
-    }
-    (guard, ego_home)
-}
-
-fn config_path(ego_home: &TempDir) -> std::path::PathBuf {
-    ego_home.path().join("config.toml")
-}
-
-fn key_value(path: &std::path::Path) -> Option<String> {
-    let doc: toml::Value = fs::read_to_string(path).unwrap().parse().unwrap();
-    doc.get(KEY).and_then(|v| v.as_str()).map(str::to_owned)
-}
-
-const USER_CONFIG: &str = "# my ego settings\nmodel = \"ollama/qwen3\"   # keep this comment\n\n[ui.statusline]\ntemplate = \"{{ prompt }}\"\n\n# trailing note\n[mcp.servers.docs]\ncommand = \"/usr/bin/docs\"\n";
-
-/// Catches: the installer rewrites or drops user config.
-#[test]
-fn unrelated_tables_and_comments_stay_byte_identical() {
-    let (_guard, home) = isolated_ego_home();
-    fs::write(config_path(&home), USER_CONFIG).unwrap();
-
-    let result = handle_setup_hooks_ego(false, false).expect("setup ok");
-    assert_eq!(result.outcome, EgoSetupOutcome::Written);
-
-    let written = fs::read_to_string(config_path(&home)).unwrap();
-    // TOML permits literal Windows paths as well as escaped basic strings.
-    // Check bytes outside the inserted assignment, not its quote style.
-    let assignments: Vec<_> = written
-        .split_inclusive('\n')
-        .filter(|line| line.starts_with(&format!("{KEY} = ")))
-        .collect();
-    assert_eq!(assignments.len(), 1, "{written}");
-    assert_eq!(written.replacen(assignments[0], "", 1), USER_CONFIG);
-    assert_eq!(
-        key_value(&config_path(&home)).as_deref(),
-        Some(env!("CARGO_BIN_EXE_mdkb"))
-    );
-}
-
-/// Catches: a second run appends a duplicate key (invalid TOML) or rewrites the file.
-#[test]
-fn second_run_leaves_one_entry_and_the_file_untouched() {
-    let (_guard, home) = isolated_ego_home();
-    fs::write(config_path(&home), USER_CONFIG).unwrap();
-
-    handle_setup_hooks_ego(false, false).unwrap();
-    let first = fs::read_to_string(config_path(&home)).unwrap();
-    let result = handle_setup_hooks_ego(false, false).unwrap();
-    let second = fs::read_to_string(config_path(&home)).unwrap();
-
-    assert_eq!(result.outcome, EgoSetupOutcome::Unchanged);
-    assert_eq!(first, second);
-    assert_eq!(second.matches(KEY).count(), 1);
-}
-
-/// Catches: setup clobbers a path the user chose.
-#[test]
-fn user_edited_value_survives_without_force() {
-    let (_guard, home) = isolated_ego_home();
-    let edited = format!("{KEY} = \"/opt/custom/mdkb\"\n[ui]\nx = 1\n");
-    fs::write(config_path(&home), &edited).unwrap();
-
-    let result = handle_setup_hooks_ego(false, false).unwrap();
-
-    assert_eq!(
-        result.outcome,
-        EgoSetupOutcome::KeptExisting("/opt/custom/mdkb".into())
-    );
-    assert_eq!(fs::read_to_string(config_path(&home)).unwrap(), edited);
-}
-
-/// Catches: --force is ignored, or it rewrites more than the one value.
-#[test]
-fn force_replaces_only_the_key_value() {
-    let (_guard, home) = isolated_ego_home();
-    fs::write(
-        config_path(&home),
-        format!("# top\n{KEY} = \"/opt/custom/mdkb\"  # old\n[ui]\nx = 1\n"),
-    )
-    .unwrap();
-
-    let result = handle_setup_hooks_ego(true, false).unwrap();
-
-    assert_eq!(result.outcome, EgoSetupOutcome::Written);
-    let written = fs::read_to_string(config_path(&home)).unwrap();
-    assert!(written.starts_with("# top\n"), "{written}");
-    assert!(written.ends_with("[ui]\nx = 1\n"), "{written}");
-    assert_eq!(written.matches(KEY).count(), 1);
-    assert_eq!(
-        key_value(&config_path(&home)).as_deref(),
-        Some(env!("CARGO_BIN_EXE_mdkb"))
-    );
-}
-
-/// Catches: a missing config file (fresh ego install) errors instead of being created.
-#[test]
-fn absent_config_file_is_created_with_only_the_key() {
-    let (_guard, home) = isolated_ego_home();
-
-    handle_setup_hooks_ego(false, false).unwrap();
-
-    let written = fs::read_to_string(config_path(&home)).unwrap();
-    let doc: toml::Value = written.parse().unwrap();
-    assert_eq!(doc.as_table().unwrap().len(), 1, "{written}");
-    assert_eq!(doc[KEY].as_str(), Some(env!("CARGO_BIN_EXE_mdkb")));
-}
-
-/// Catches: --dry-run writes the file.
-#[test]
-fn dry_run_writes_nothing() {
-    let (_guard, home) = isolated_ego_home();
-
-    let result = handle_setup_hooks_ego(false, true).unwrap();
-
-    assert!(result.dry_run);
-    assert!(result.merged_toml.contains(KEY));
-    assert!(!config_path(&home).exists());
-}
-
-/// Catches: running setup from a build registers an ephemeral binary instead of the installed one.
-#[test]
-fn setup_from_build_registers_installed_binary_not_build_artifact() {
-    let root = tempfile::tempdir().unwrap();
-    let installed_dir = root.path().join("installed");
-    fs::create_dir(&installed_dir).unwrap();
-    let installed = installed_dir.join(if cfg!(windows) { "mdkb.exe" } else { "mdkb" });
-    // Use the real executable, not a mock command, as the installed PATH entry.
-    fs::copy(env!("CARGO_BIN_EXE_mdkb"), &installed).unwrap();
-    let mut paths = vec![installed_dir];
-    paths.extend(std::env::split_paths(
-        &std::env::var_os("PATH").unwrap_or_default(),
-    ));
-    let home = root.path().join("ego");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
-        .args(["setup", "hooks", "ego"])
-        .env("EGO_HOME", &home)
-        .env("PATH", std::env::join_paths(paths).unwrap())
-        .env_remove("MDKB_BINARY_OVERRIDE")
+fn run(home: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args(args)
+        .env("EGO_HOME", home)
+        .env("MDKB_BINARY_OVERRIDE", env!("CARGO_BIN_EXE_mdkb"))
         .output()
-        .unwrap();
+        .unwrap()
+}
+fn ok(home: &Path, args: &[&str]) -> Output {
+    let output = run(home, args);
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        mdkb::domain::canonicalize_plain(std::path::Path::new(
-            &key_value(&home.join("config.toml")).unwrap()
-        ))
-        .unwrap(),
-        mdkb::domain::canonicalize_plain(&installed).unwrap(),
-        "setup must register the installed PATH binary, not the current build artifact"
+    output
+}
+fn read(home: &Path) -> String {
+    fs::read_to_string(home.join("config.toml")).unwrap()
+}
+fn assert_hooks(raw: &str) {
+    let doc: toml::Value = raw.parse().unwrap();
+    assert!(doc.get("mdkb_prompt_command").is_none(), "{raw}");
+    let hooks = doc["hooks"].as_array().expect("generic hooks required");
+    assert_eq!(hooks.len(), EVENTS.len());
+    let binary = env!("CARGO_BIN_EXE_mdkb");
+    assert!(
+        doc["exec_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(binary))
     );
+    let allow = doc["permissions"]["allow"].as_array().unwrap();
+    for (hook, event) in hooks.iter().zip(EVENTS) {
+        assert_eq!(hook["event"].as_str(), Some(*event));
+        assert_eq!(hook["handler"]["type"].as_str(), Some("command"));
+        assert_eq!(hook["handler"]["command"].as_str(), Some(binary));
+        assert_eq!(hook["handler"]["timeout"].as_integer(), Some(10));
+        let args = hook["handler"]["args"].as_array().unwrap();
+        assert_eq!(args[0].as_str(), Some("hook"));
+        let event_arg = match *event {
+            "SessionStart" => "session-start",
+            "UserPromptSubmit" => "user-prompt-submit",
+            "PreToolUse" => "pre-tool-use",
+            "Stop" => "stop",
+            _ => "post-tool-use",
+        };
+        assert_eq!(args[1].as_str(), Some(event_arg));
+        assert!(
+            allow
+                .iter()
+                .any(|v| v.as_str() == Some(&format!("exec({binary} hook {event_arg})")))
+        );
+    }
+    assert_eq!(allow.len(), 5);
 }
 
-/// Catches: unparsable user config is overwritten instead of reported.
+/// Catches: setup still writes the removed vendor key instead of generic hooks.
 #[test]
-fn unparsable_config_is_an_error_and_left_alone() {
-    let (_guard, home) = isolated_ego_home();
-    fs::write(config_path(&home), "this = = broken").unwrap();
+fn generic_setup_replaces_legacy_key_and_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.toml"),
+        "# owner migration note\nmdkb_prompt_command = '/old/mdkb' # keep this note\n",
+    )
+    .unwrap();
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    let first = read(home.path());
+    assert_hooks(&first);
+    assert!(first.contains("# owner migration note"));
+    assert!(first.contains("# keep this note"));
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    assert_eq!(first, read(home.path()));
+}
 
-    assert!(handle_setup_hooks_ego(false, false).is_err());
+/// Catches: uninstall removes unrelated hooks or leaves duplicates and execution rules.
+#[test]
+fn generic_remove_preserves_unrelated_config_and_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let original = "# owner note\nmodel = 'test/model' # keep\nexec_paths = ['/other']\n[permissions]\nallow = ['exec(/other)'] # keep rule\n[[hooks]]\nevent = 'Stop'\n[hooks.handler]\ntype = 'command'\ncommand = '/other'\nargs = []\n";
+    fs::write(home.path().join("config.toml"), original).unwrap();
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    let installed = read(home.path());
+    assert!(installed.contains("# owner note"));
+    assert!(installed.contains("model = 'test/model' # keep"));
+    assert!(installed.contains("# keep rule"));
+    ok(home.path(), &["setup", "remove", "hooks", "ego"]);
+    let removed = read(home.path());
+    let doc: toml::Value = removed.parse().unwrap();
+    assert_eq!(doc["hooks"].as_array().unwrap().len(), 1);
     assert_eq!(
-        fs::read_to_string(config_path(&home)).unwrap(),
-        "this = = broken"
+        doc["hooks"][0]["handler"]["command"].as_str(),
+        Some("/other")
     );
+    assert_eq!(doc["exec_paths"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["permissions"]["allow"].as_array().unwrap().len(), 1);
+    assert!(removed.contains("# owner note"));
+    ok(home.path(), &["setup", "remove", "hooks", "ego"]);
+    assert_eq!(removed, read(home.path()));
+}
+
+/// Catches: dry-run or invalid TOML partially mutates the config.
+#[test]
+fn generic_setup_dry_run_and_invalid_config_never_write() {
+    let home = tempfile::tempdir().unwrap();
+    let preview = ok(home.path(), &["setup", "hooks", "ego", "--dry-run"]);
+    assert_hooks(&String::from_utf8(preview.stdout).unwrap());
+    assert!(!home.path().join("config.toml").exists());
+    fs::write(home.path().join("config.toml"), "broken = = true").unwrap();
+    assert!(
+        !run(home.path(), &["setup", "hooks", "ego"])
+            .status
+            .success()
+    );
+    assert_eq!(read(home.path()), "broken = = true");
+}
+
+/// Catches: atomic replacement destroys a symlink instead of updating its target.
+#[cfg(unix)]
+#[test]
+fn generic_setup_and_remove_preserve_symlink_target() {
+    let home = tempfile::tempdir().unwrap();
+    let target = home.path().join("owner.toml");
+    fs::write(&target, "# owner\nmodel = 'test/model'\n").unwrap();
+    std::os::unix::fs::symlink(&target, home.path().join("config.toml")).unwrap();
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    assert_hooks(&fs::read_to_string(&target).unwrap());
+    ok(home.path(), &["setup", "remove", "hooks", "ego"]);
+    assert!(
+        fs::symlink_metadata(home.path().join("config.toml"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(fs::read_to_string(target).unwrap().contains("# owner"));
+}
+
+/// Catches: the valid empty hooks array used by fresh configs is refused.
+#[test]
+fn generic_setup_accepts_empty_hook_array() {
+    let home = tempfile::tempdir().unwrap();
+    fs::write(
+        home.path().join("config.toml"),
+        "# owner hooks\nhooks = []\n",
+    )
+    .unwrap();
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    let raw = read(home.path());
+    assert_hooks(&raw);
+    assert!(raw.contains("# owner hooks"));
+}
+
+/// Catches: removal matches only the event and deletes user-modified hooks.
+#[test]
+fn generic_remove_preserves_modified_hook() {
+    let home = tempfile::tempdir().unwrap();
+    ok(home.path(), &["setup", "hooks", "ego"]);
+    let raw = read(home.path()).replacen("timeout = 10", "timeout = 20 # owner timeout", 1);
+    fs::write(home.path().join("config.toml"), raw).unwrap();
+    ok(home.path(), &["setup", "remove", "hooks", "ego"]);
+    let raw = read(home.path());
+    let doc: toml::Value = raw.parse().unwrap();
+    assert_eq!(doc["hooks"].as_array().unwrap().len(), 1);
+    assert_eq!(doc["hooks"][0]["handler"]["timeout"].as_integer(), Some(20));
+    assert!(raw.contains("# owner timeout"));
+}
+
+/// Catches: a wrong array/table type panics or partially writes registration.
+#[test]
+fn generic_invalid_field_types_are_reported_without_writes() {
+    for initial in [
+        "hooks = 'wrong'\n",
+        "exec_paths = 42\n",
+        "permissions = []\n",
+        "[permissions]\nallow = 'wrong'\n",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("config.toml"), initial).unwrap();
+        assert!(
+            !run(home.path(), &["setup", "hooks", "ego"])
+                .status
+                .success()
+        );
+        assert_eq!(read(home.path()), initial);
+    }
 }

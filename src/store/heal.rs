@@ -1923,7 +1923,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let healthy = dir.path().join("index.sqlite.corrupt-1");
         make_db(&healthy);
-        assert!(diagnose(&healthy).quick_check.is_empty());
+        assert_eq!(diagnose(&healthy).quick_check, [] as [String; 0]);
     }
 
     /// Catches: the size of the database or of its WAL left out of the report.
@@ -2050,7 +2050,7 @@ mod tests {
             );
             return;
         }
-        assert!(captured_logs(|| {}).is_empty());
+        assert_eq!(captured_logs(|| {}), "");
         let dir = tempfile::tempdir().unwrap();
         let (_, now) =
             quarantine_aged_with(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1, false);
@@ -2487,7 +2487,7 @@ mod tests {
 
         // Initialize the real capture infrastructure without registering the
         // probe callsite. A transient capture has already dropped its dispatch.
-        assert!(captured_logs(|| {}).is_empty());
+        assert_eq!(captured_logs(|| {}), "");
         let (entered, registration) = std::sync::mpsc::channel();
         let (resume, resumed) = std::sync::mpsc::channel();
         let dispatch = tracing::Dispatch::new(RegisteringSubscriber {

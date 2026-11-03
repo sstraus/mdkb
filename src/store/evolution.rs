@@ -109,6 +109,8 @@ pub fn add_evolution(
     scope: Option<&str>,
     reason: Option<&str>,
 ) -> Result<i64> {
+    super::external::refuse_document(conn, source_doc_id)?;
+    super::external::refuse_document(conn, target_doc_id)?;
     let now = Utc::now().timestamp();
 
     // Atomic: evolution record + status update must be consistent.
@@ -151,6 +153,7 @@ pub fn update_document_status(
     status: DocumentStatus,
     reason: Option<&str>,
 ) -> Result<()> {
+    super::external::refuse_document(conn, doc_id)?;
     conn.execute(
         "UPDATE documents SET status = ?1, status_reason = ?2 WHERE id = ?3",
         params![status.to_string(), reason, doc_id],

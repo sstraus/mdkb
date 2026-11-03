@@ -34,15 +34,20 @@ fn persisted_roots() -> Result<Vec<PathBuf>> {
 }
 
 /// The daemon's own list when one runs (the one source `daemon status` also
-/// reads), otherwise the persisted map. Neither walks the disk, and a daemon
-/// that is running but does not answer is an error, not a reason to guess.
+/// reads), otherwise the persisted map. A failed query must not prevent a
+/// read-only CLI search: use the last persisted list and disclose its source.
+/// Neither path walks the disk or changes the map.
 async fn known_roots() -> Result<Vec<PathBuf>> {
     match crate::cli::daemon::running_daemon_repos().await {
         Ok(Some(roots)) => Ok(roots),
         Ok(None) => persisted_roots(),
-        Err(e) => Err(Error::other(format!(
-            "the running daemon did not list its repos: {e}"
-        ))),
+        Err(e) => {
+            let roots = persisted_roots()?;
+            eprintln!(
+                "Daemon repo list unavailable ({e}); using persisted repos.json (may be stale)."
+            );
+            Ok(roots)
+        }
     }
 }
 
@@ -81,9 +86,10 @@ pub fn caller_root(cwd: &Path) -> PathBuf {
 
 pub async fn handle_list(format: OutputFormat) -> Result<()> {
     let rows = list_repos(&known_roots().await?);
-    match format {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&rows)?),
-        _ => print!("{}", render_text(&rows)),
+    if let OutputFormat::Json = format {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        print!("{}", render_text(&rows));
     }
     Ok(())
 }

@@ -361,6 +361,11 @@ mod tests {
             Language::Swift,
             Language::Lua,
             Language::Gdscript,
+            Language::Objc,
+            Language::Shell,
+            Language::Ruby,
+            Language::Sql,
+            Language::Json,
         ];
         for language in languages {
             let mut parser =

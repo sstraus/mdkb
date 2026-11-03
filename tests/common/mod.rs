@@ -17,6 +17,7 @@ pub struct McpTestHarness {
     pub root: PathBuf,
     next_id: u64,
     reader: BufReader<ChildStdout>,
+    global: bool,
 }
 
 impl McpTestHarness {
@@ -27,8 +28,24 @@ impl McpTestHarness {
 
     /// Create a new test harness with custom environment variables.
     pub fn with_env(env_vars: &[(&str, &str)]) -> Self {
+        Self::with_mode(env_vars, false)
+    }
+
+    /// Spawn the global stdio server with two registered, initialized stores.
+    pub fn global() -> Self {
+        Self::with_mode(&[], true)
+    }
+
+    fn with_mode(env_vars: &[(&str, &str)], global: bool) -> Self {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
+        let root = if global {
+            let root = temp_dir.path().join("repo");
+            std::fs::create_dir(&root).expect("Create first repo");
+            root
+        } else {
+            temp_dir.path().to_path_buf()
+        };
+        let home = temp_dir.path().join("home");
 
         // Initialize mdkb
         let status = Command::new(env!("CARGO_BIN_EXE_mdkb"))
@@ -38,6 +55,32 @@ impl McpTestHarness {
             .expect("Failed to run mdkb init");
         assert!(status.success(), "mdkb init failed");
 
+        if global {
+            let second = root.join("second");
+            std::fs::create_dir(&second).expect("Create second repo");
+            let status = Command::new(env!("CARGO_BIN_EXE_mdkb"))
+                .arg("init")
+                .current_dir(&second)
+                .status()
+                .expect("Initialize second repo");
+            assert!(status.success(), "second mdkb init failed");
+            let roots = [&root, &second]
+                .iter()
+                .map(|path| json!({"root": mdkb::domain::canonicalize_plain(path).unwrap()}))
+                .collect::<Vec<_>>();
+            std::fs::create_dir_all(home.join(".mdkb")).expect("Create isolated home");
+            std::fs::write(
+                home.join(".mdkb/daemon.toml"),
+                format!("whitelist_dirs = [{}]\n", json!(root)),
+            )
+            .expect("Allow fixture repositories in the isolated daemon");
+            std::fs::write(
+                home.join(".mdkb/repos.json"),
+                json!({"version": 1, "repos": roots}).to_string(),
+            )
+            .expect("Write isolated global repo map");
+        }
+
         // Spawn mdkb serve with optional env vars
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mdkb"));
         cmd.arg("serve")
@@ -45,6 +88,11 @@ impl McpTestHarness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if global {
+            cmd.arg("--global")
+                .env("HOME", &home)
+                .env("USERPROFILE", &home);
+        }
         for (key, val) in env_vars {
             cmd.env(key, val);
         }
@@ -59,6 +107,7 @@ impl McpTestHarness {
             root,
             next_id: 1,
             reader,
+            global,
         }
     }
 
@@ -76,7 +125,14 @@ impl McpTestHarness {
 
         let stdin = self.child.stdin.as_mut().expect("No stdin");
         let request_str = serde_json::to_string(&request).unwrap();
-        writeln!(stdin, "{}", request_str).expect("Failed to write request");
+        writeln!(stdin, "{}", request_str).unwrap_or_else(|error| {
+            use std::io::Read;
+            let mut stderr = String::new();
+            if let Some(mut pipe) = self.child.stderr.take() {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
+            panic!("Failed to write {method}: {error}; server stderr: {stderr}");
+        });
         stdin.flush().expect("Failed to flush");
 
         let mut response_line = String::new();
@@ -84,7 +140,27 @@ impl McpTestHarness {
         loop {
             match self.reader.read_line(&mut response_line) {
                 Ok(0) => panic!("Server closed stdout unexpectedly"),
-                Ok(_) => break,
+                Ok(_) => {
+                    let response: Value =
+                        serde_json::from_str(&response_line).unwrap_or_else(|e| {
+                            panic!("Invalid JSON response: {} - {}", e, response_line)
+                        });
+                    if self.global && response["method"] == "roots/list" {
+                        // Global mode requests client roots after initialization.
+                        // This fixture uses the persisted repo map, not client roots.
+                        writeln!(
+                            stdin,
+                            "{}",
+                            json!({"jsonrpc": "2.0", "id": response["id"], "result": {"roots": []}})
+                        )
+                        .expect("Reply to roots/list");
+                        stdin.flush().expect("Flush roots/list reply");
+                        response_line.clear();
+                        continue;
+                    }
+                    assert_eq!(response["id"], id, "Response ID mismatch: {response}");
+                    return response;
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
                         start.elapsed() <= Duration::from_secs(10),
@@ -96,11 +172,6 @@ impl McpTestHarness {
                 Err(e) => panic!("Read error: {}", e),
             }
         }
-
-        let response: Value = serde_json::from_str(&response_line)
-            .unwrap_or_else(|e| panic!("Invalid JSON response: {} - {}", e, response_line));
-        assert_eq!(response["id"], id, "Response ID mismatch");
-        response
     }
 
     /// Send a notification (no response expected).
@@ -128,6 +199,10 @@ impl McpTestHarness {
             }),
         );
         self.send_notification("notifications/initialized", json!({}));
+        if self.global {
+            // A global server has no single repo for the status readiness probe.
+            return response;
+        }
 
         // Poll until the server's startup reindex finishes and ctx is available.
         // The status tool needs ctx, so a successful call means the server is ready.

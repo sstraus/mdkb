@@ -39,7 +39,7 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
     SurfaceEntry {
         mcp_tool: "search",
         cli_command: Some("search"),
-        note: "",
+        note: "CLI search also includes indexed literals by default; --scope text and --ignore-case are CLI-only.",
     },
     SurfaceEntry {
         mcp_tool: "get",
@@ -162,6 +162,7 @@ pub fn render() -> String {
             out.push_str(&format!("  {:<20} note: {}\n", "", note.join(" ")));
         }
     }
+    out.push_str("\nDaemon JSON-RPC (no CLI/MCP write equivalent):\n  external.upsert\n  external.delete\n  external.list\n  Contract: docs/external-ingest.md\n");
     out
 }
 

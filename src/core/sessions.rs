@@ -18,7 +18,7 @@ use crate::store::{collections, documents};
 ///
 /// Walks `*.jsonl` files in the session directory (non-recursive),
 /// parses them into documents with chunking, and indexes the results.
-/// Uses mtime-based dedup to skip unchanged files.
+/// Uses per-chunk content hashes to skip unchanged documents.
 pub fn handle_session_index(
     ctx: &Context,
     sessions_path: &Path,
@@ -53,7 +53,7 @@ pub fn handle_session_index(
     let config = SessionParseConfig::default();
     let mut result = UpdateResult::default();
 
-    // Pre-load existing documents for mtime-based dedup
+    // Pre-load existing documents for content-hash dedup
     let existing_docs: HashMap<String, Document> =
         documents::list_documents(&ctx.conn, collection_name)?
             .into_iter()
@@ -62,7 +62,8 @@ pub fn handle_session_index(
 
     // Walk .jsonl files (non-recursive)
     let entries: Vec<_> = std::fs::read_dir(&session_dir)?
-        .filter_map(|e| e.ok())
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
         .filter(|e| {
             let path = e.path();
             path.is_file() && path.extension().map(|ext| ext == "jsonl").unwrap_or(false)
@@ -113,6 +114,14 @@ pub fn handle_session_index(
                 // new/changed tail. `documents.hash` is the same SHA-256 the document
                 // layer stores, so this is exact, not heuristic.
                 if let Some(existing_doc) = existing {
+                    if existing_doc.status.as_deref() == Some("archived") {
+                        // The source returned. Hash dedup and the document upsert
+                        // both preserve status, so restore it explicitly.
+                        ctx.conn.execute(
+                            "UPDATE documents SET status = 'current' WHERE id = ?1",
+                            [existing_doc.id],
+                        )?;
+                    }
                     if existing_doc.hash == documents::compute_hash(&sdoc.content) {
                         result.unchanged += 1;
                         continue;
@@ -142,10 +151,13 @@ pub fn handle_session_index(
             }
         }
 
-        // Archive session docs whose source jsonl is gone (deleted/rotated). Kept
-        // searchable via explicit --collection claude_sessions; never hard-deleted
-        // here (see `mdkb compact --prune-sessions`).
-        result.sessions_archived = documents::archive_missing_sessions(&ctx.conn, &present_paths)?;
+        // An unreadable transcript makes this snapshot incomplete. In that
+        // case, a missing chunk is not evidence that its source was deleted.
+        // Archive only after every live transcript was parsed successfully.
+        if result.errors.is_empty() {
+            result.sessions_archived =
+                documents::archive_missing_sessions(&ctx.conn, &present_paths)?;
+        }
         Ok(())
     })?;
 

@@ -479,7 +479,7 @@ mod tests {
     fn test_embed_documents_empty() {
         let service = EmbeddingService::new().unwrap();
         let embeddings = service.embed_documents(&[]).unwrap();
-        assert!(embeddings.is_empty());
+        assert_eq!(embeddings, [] as [Vec<f32>; 0]);
     }
 
     #[test]

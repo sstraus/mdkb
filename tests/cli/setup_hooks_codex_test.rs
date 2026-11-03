@@ -54,7 +54,7 @@ fn fresh_hooks_file_gets_managed_entries_for_each_event() {
     let result = handle_setup_hooks_codex("", false).expect("setup hooks codex ok");
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());
-    assert!(result.events_skipped.is_empty());
+    assert_eq!(result.events_skipped, [] as [String; 0]);
     assert!(!result.dry_run);
 
     let path = codex_hooks_path(home.path());
@@ -127,8 +127,14 @@ fn disable_flag_skips_named_events() {
 
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
     let v = read_json(&codex_hooks_path(&home));
-    assert!(mdkb_entries(&v, "SessionStart").is_empty());
-    assert!(mdkb_entries(&v, "PostToolUse").is_empty());
+    assert_eq!(
+        mdkb_entries(&v, "SessionStart"),
+        [] as [&serde_json::Value; 0]
+    );
+    assert_eq!(
+        mdkb_entries(&v, "PostToolUse"),
+        [] as [&serde_json::Value; 0]
+    );
     assert_eq!(mdkb_entries(&v, "UserPromptSubmit").len(), 1);
     assert_eq!(mdkb_entries(&v, "PreToolUse").len(), 1);
     assert_eq!(mdkb_entries(&v, "PostToolUseFailure").len(), 1);
@@ -283,5 +289,44 @@ fn codex_generated_command_has_daemon_then_fallback_guard() {
             actual_matcher, *expected_matcher,
             "{event_name}: matcher mismatch"
         );
+    }
+}
+
+/// Codex 0.166 `/hooks` titles a handler with its trimmed `statusMessage` and
+/// shows "Unnamed hook" without it (`codex-rs/tui/src/bottom_pane/hooks_browser_view.rs`).
+/// Catches: setup writes handlers without `statusMessage`, or a reinstall over an
+/// install from an older mdkb duplicates entries instead of relabelling them.
+#[test]
+fn codex_handlers_carry_a_label_and_reinstall_relabels_old_entries() {
+    let (_guard, _project, home) = isolated_project();
+
+    let hooks_path = codex_hooks_path(home.path());
+    fs::create_dir_all(hooks_path.parent().unwrap()).unwrap();
+    // Shape written by mdkb before the label existed (copied from a live ~/.codex/hooks.json).
+    let mut old_install = serde_json::json!({"hooks": {}});
+    for (event_name, cli_event, _) in HOOK_EVENTS {
+        old_install["hooks"][*event_name] = serde_json::json!([{
+            "_managedBy": "mdkb",
+            "hooks": [{"command": format!("'/old/mdkb' hook {cli_event}"), "type": "command"}]
+        }]);
+    }
+    fs::write(&hooks_path, old_install.to_string()).unwrap();
+
+    handle_setup_hooks_codex("", false).expect("first reinstall");
+    handle_setup_hooks_codex("", false).expect("second reinstall");
+
+    let v = read_json(&hooks_path);
+    for (event_name, cli_event, _) in HOOK_EVENTS {
+        let managed = mdkb_entries(&v, event_name);
+        assert_eq!(
+            managed.len(),
+            1,
+            "{event_name}: one mdkb entry: {managed:?}"
+        );
+        let label = managed[0]["hooks"][0]
+            .get("statusMessage")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default();
+        assert_eq!(label, format!("mdkb {cli_event}"), "{event_name}: label");
     }
 }

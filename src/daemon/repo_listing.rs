@@ -49,6 +49,8 @@ pub struct RepoRow {
     pub docs_indexed_at: Option<i64>,
     pub code_indexed_at: Option<i64>,
     pub head_at: Option<i64>,
+    /// Last successful open recorded in the repo map (UTC Unix seconds).
+    pub last_opened_at: Option<i64>,
     pub schema: Option<i32>,
     pub health: Health,
     /// HEAD moved past what the index describes.
@@ -69,6 +71,19 @@ const LISTING_WIDTH: usize = 8;
 /// the global rayon pool is capped to one worker once an embedder starts, and
 /// a daemon listing would then queue behind embedding batches.
 pub fn list_repos(roots: &[PathBuf]) -> Vec<RepoRow> {
+    let path = super::config::DaemonConfig::daemon_home().join("repos.json");
+    let opened = super::repo_map::read_last_opened(&path).unwrap_or_else(|why| {
+        tracing::warn!(path = %path.display(), "Reading repo activity failed: {why}");
+        Default::default()
+    });
+    list_repos_with_opened(roots, &opened)
+}
+
+/// Build shared rows with activity from the owning registry's map, not HOME.
+pub fn list_repos_with_opened(
+    roots: &[PathBuf],
+    opened: &std::collections::BTreeMap<PathBuf, i64>,
+) -> Vec<RepoRow> {
     let next = AtomicUsize::new(0);
     let rows: Mutex<Vec<Option<RepoRow>>> = Mutex::new(vec![None; roots.len()]);
     std::thread::scope(|scope| {
@@ -77,7 +92,9 @@ pub fn list_repos(roots: &[PathBuf]) -> Vec<RepoRow> {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(root) = roots.get(i) else { break };
-                    let row = cached_repo_row(root);
+                    let mut row = cached_repo_row(root);
+                    // Map activity has its own lifetime, independent of store caching.
+                    row.last_opened_at = opened.get(&super::repo_map::canonical_key(root)).copied();
                     rows.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(row);
                 }
             });
@@ -250,6 +267,7 @@ fn repo_row(root: &Path) -> RepoRow {
         docs_indexed_at: None,
         code_indexed_at: None,
         head_at: None,
+        last_opened_at: None,
         schema: None,
         health: Health::Healthy,
         stale: false,
@@ -396,6 +414,9 @@ pub fn render_text(rows: &[RepoRow]) -> String {
             date(r.head_at),
             r.schema.map_or_else(|| "-".to_string(), |v| v.to_string()),
         );
+        if let Some(at) = r.last_opened_at {
+            let _ = write!(out, "  opened@{}", date(Some(at)));
+        }
         if r.stale {
             out.push_str("  STALE (index differs from or predates local HEAD)");
         }

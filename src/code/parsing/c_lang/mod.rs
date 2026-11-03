@@ -14,24 +14,37 @@ use tree_sitter::Node;
 pub struct CParser {
     parser: CachingParser,
     context: ParserContext,
+    language: Language,
 }
 
 impl std::fmt::Debug for CParser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CParser").field("language", &"C").finish()
+        f.debug_struct("CParser")
+            .field("language", &self.language)
+            .finish_non_exhaustive()
     }
 }
 
 impl CParser {
     pub fn new() -> Result<Self, String> {
+        Self::with_grammar(Language::C, tree_sitter_c::LANGUAGE.into())
+    }
+
+    /// Objective-C shares C declarations but adds classes and method selectors.
+    pub fn new_objc() -> Result<Self, String> {
+        Self::with_grammar(Language::Objc, tree_sitter_objc::LANGUAGE.into())
+    }
+
+    fn with_grammar(language: Language, grammar: tree_sitter::Language) -> Result<Self, String> {
         let mut ts_parser = tree_sitter::Parser::new();
         ts_parser
-            .set_language(&tree_sitter_c::LANGUAGE.into())
-            .map_err(|e| format!("Failed to set C language: {e}"))?;
+            .set_language(&grammar)
+            .map_err(|e| format!("Failed to set {language} language: {e}"))?;
 
         Ok(Self {
             parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
+            language,
         })
     }
 
@@ -97,9 +110,80 @@ impl CParser {
         }
 
         match node.kind() {
+            "class_interface" | "class_implementation" | "protocol_declaration" => {
+                let Some(name_node) = node
+                    .named_children(&mut node.walk())
+                    .find(|child| child.kind() == "identifier")
+                else {
+                    return;
+                };
+                let name = &code[name_node.byte_range()];
+                symbols.push(self.create_symbol(
+                    counter.next_id(),
+                    name.to_owned(),
+                    if node.kind() == "protocol_declaration" {
+                        SymbolKind::Interface
+                    } else {
+                        SymbolKind::Class
+                    },
+                    file_id,
+                    node_range(node),
+                    (
+                        None,
+                        extract_c_family_doc(&node, code),
+                        module_path,
+                        Visibility::Public,
+                    ),
+                ));
+                self.context.enter_scope(ScopeType::Class);
+                self.context.set_current_class(Some(name.to_owned()));
+                for child in node.named_children(&mut node.walk()) {
+                    self.extract_symbols_from_node(
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (module_path, depth + 1),
+                    );
+                }
+                self.context.exit_scope();
+            }
+            "method_definition" | "method_declaration" => {
+                if let Some(name) = objc_selector(node, code) {
+                    let signature_end = node
+                        .named_children(&mut node.walk())
+                        .find(|child| child.kind() == "compound_statement")
+                        .map_or(node.end_byte(), |body| body.start_byte());
+                    symbols.push(self.create_symbol(
+                        counter.next_id(),
+                        name,
+                        SymbolKind::Method,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(code[node.start_byte()..signature_end].trim().to_owned()),
+                            extract_c_family_doc(&node, code),
+                            module_path,
+                            Visibility::Public,
+                        ),
+                    ));
+                }
+                // Do not treat declarations inside a method body as file globals.
+            }
             "function_definition" => {
                 if let Some(symbol) =
-                    self.process_function(node, code, file_id, counter, module_path)
+                    node.child_by_field_name("declarator")
+                        .and_then(|declarator| {
+                            self.process_function(
+                                node,
+                                declarator,
+                                code,
+                                file_id,
+                                counter,
+                                module_path,
+                            )
+                        })
                 {
                     let fn_name = symbol.name.as_ref().to_string();
                     symbols.push(symbol);
@@ -165,7 +249,9 @@ impl CParser {
 
             "declaration" => {
                 // Top-level variable/function declarations
-                if self.context.is_module_level() {
+                if self.context.is_module_level()
+                    || (self.language == Language::Objc && !self.context.is_in_function())
+                {
                     self.process_declaration(node, code, file_id, counter, symbols, module_path);
                 }
             }
@@ -188,12 +274,12 @@ impl CParser {
     fn process_function(
         &self,
         node: Node,
+        declarator: Node,
         code: &str,
         file_id: FileId,
         counter: &mut SymbolCounter,
         module_path: &str,
     ) -> Option<Symbol> {
-        let declarator = node.child_by_field_name("declarator")?;
         let name = extract_declarator_name(declarator, code)?;
         let doc = extract_c_family_doc(&node, code);
 
@@ -448,6 +534,13 @@ impl CParser {
         // instead reaches only the two simplest shapes.
         for declarator in node.children_by_field_name("declarator", &mut node.walk()) {
             if is_function_prototype(declarator) {
+                if self.language == Language::Objc {
+                    if let Some(symbol) =
+                        self.process_function(node, declarator, code, file_id, counter, module_path)
+                    {
+                        symbols.push(symbol);
+                    }
+                }
                 continue;
             }
             let Some(name) = extract_declarator_name(declarator, code) else {
@@ -516,6 +609,12 @@ impl CParser {
         if !check_recursion_depth(depth, *node) {
             return;
         }
+        // Objective-C selectors are not contiguous source slices, unlike C
+        // names. Until the call walker supports them, do not attribute calls
+        // inside methods to the enclosing module.
+        if node.kind() == "method_definition" {
+            return;
+        }
         let fn_ctx = if node.kind() == "function_definition" {
             node.child_by_field_name("declarator")
                 .and_then(|d| extract_declarator_name(d, code))
@@ -537,6 +636,19 @@ impl CParser {
             Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
+}
+
+/// Full selector, including every keyword and colon but not argument names.
+fn objc_selector(node: Node, code: &str) -> Option<String> {
+    let mut selector = String::new();
+    for child in node.named_children(&mut node.walk()) {
+        match child.kind() {
+            "identifier" => selector.push_str(&code[child.byte_range()]),
+            "method_parameter" if code[child.byte_range()].starts_with(':') => selector.push(':'),
+            _ => {}
+        }
+    }
+    (!selector.is_empty()).then_some(selector)
 }
 
 // ── Free helpers ────────────────────────────────────────────────────────
@@ -620,7 +732,7 @@ impl LanguageParser for CParser {
     }
 
     fn language(&self) -> Language {
-        Language::C
+        self.language
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {

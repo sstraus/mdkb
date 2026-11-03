@@ -21,6 +21,7 @@ fn run_hook(dir: &Path, event: &str, stdin_json: &str) {
         .args(["hook", event])
         .current_dir(dir)
         .env("MDKB_NO_DAEMON", "1")
+        .env("MDKB_HOOK_TELEMETRY", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

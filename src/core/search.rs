@@ -134,6 +134,8 @@ pub fn hybrid_search_fts_scored(
                     snippets: vec![],
                     status: doc.status.clone(),
                     superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
+                    source: crate::store::external::source(&doc.collection).map(str::to_owned),
+                    read_only: crate::store::external::source(&doc.collection).is_some(),
                     repo_root: None,
                 },
                 cosine,

@@ -2,11 +2,14 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$ROOT/target/release/mdkb"
+BIN="$HOME/.local/bin/mdkb"
 
 cd "$ROOT"
 
 cargo build --release "$@"
+mkdir -p "$(dirname "$BIN")"
+install -m 755 "$ROOT/target/release/mdkb" "$BIN.new"
+mv -f "$BIN.new" "$BIN"
 
 find_runtime_pids() {
   ps -axo pid=,command= | awk '

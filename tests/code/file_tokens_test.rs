@@ -76,6 +76,11 @@ pub struct UniqueGreeterStruct {
     let server = McpServer::new(root.clone());
     let result = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: "unique_greeter_symbol".to_string(),
             root: None,
             limit: 10,

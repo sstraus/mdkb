@@ -89,6 +89,45 @@ fn assert_usage_error(args: &[&str], values: &[String], bad: &str) {
     }
 }
 
+/// Catches help that leaves an agent without a generic route to settings,
+/// flags, and online topic guides, or initializes a store while browsing.
+#[test]
+fn root_help_guides_configuration_without_creating_a_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["--help"], dir.path());
+    assert!(out.status.success(), "{}", combined(&out));
+    let text = combined(&out);
+    for required in [
+        ".mdkb/config.toml",
+        "mdkb <command> --help",
+        "mdkb schema",
+        "https://github.com/sstraus/mdkb/blob/main/README.md#configuration",
+        "https://github.com/sstraus/mdkb/blob/main/docs/hooks.md",
+        "https://github.com/sstraus/mdkb/blob/main/src/config.rs",
+    ] {
+        assert!(text.contains(required), "missing {required}:\n{text}");
+    }
+    assert!(
+        !dir.path().join(".mdkb").exists(),
+        "help must not initialize a store"
+    );
+}
+
+/// Catches a setup guide attached to the wrong clap command: the integration
+/// documentation must be visible at the setup entry point itself.
+#[test]
+fn setup_help_links_integration_documentation() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["setup", "--help"], dir.path());
+    assert!(out.status.success(), "{}", combined(&out));
+    let text = combined(&out);
+    assert!(text.contains("mdkb setup hooks --help"), "{text}");
+    assert!(
+        text.contains("https://github.com/sstraus/mdkb/blob/main/docs/hooks.md"),
+        "{text}"
+    );
+}
+
 #[test]
 fn memory_add_help_lists_the_entry_types() {
     assert_help_lists(&["memory", "add", "--help"], &entry_types(), "--entry-type");

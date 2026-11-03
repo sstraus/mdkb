@@ -68,7 +68,7 @@ fn a_pruned_collection_is_not_reported_as_vanished() {
     std::fs::remove_dir_all(root.join("archive")).unwrap();
     let result = handle_update(&ctx, &root).expect("second update");
 
-    assert!(result.collections_vanished.is_empty());
+    assert_eq!(result.collections_vanished, [] as [String; 0]);
     assert!(
         !result.errors.iter().any(|e| e.contains("archive")),
         "no error may name the pruned collection: {:?}",
@@ -95,7 +95,7 @@ fn a_manual_collection_with_a_missing_directory_keeps_its_documents() {
         1,
         "a manual registration is the user's, not pruned"
     );
-    assert!(result.collections_pruned.is_empty());
+    assert_eq!(result.collections_pruned, [] as [String; 0]);
 }
 
 /// Catches: an unmounted volume under the root makes every convention directory
@@ -112,7 +112,7 @@ fn losing_every_convention_directory_at_once_prunes_none() {
     std::fs::remove_dir_all(root.join("docs")).unwrap();
     let result = handle_update(&ctx, &root).expect("second update");
 
-    assert!(result.collections_pruned.is_empty());
+    assert_eq!(result.collections_pruned, [] as [String; 0]);
     assert!(
         result.errors.iter().any(|e| e.contains("none pruned")),
         "the skipped prune must be reported: {:?}",
@@ -135,6 +135,6 @@ fn losing_every_convention_directory_prunes_none_when_a_root_readme_exists() {
     std::fs::remove_dir_all(root.join("docs")).unwrap();
     let result = handle_update(&ctx, &root).expect("second update");
 
-    assert!(result.collections_pruned.is_empty());
+    assert_eq!(result.collections_pruned, [] as [String; 0]);
     assert_eq!(hits(&ctx), 2, "both directories' documents must survive");
 }

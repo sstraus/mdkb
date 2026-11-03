@@ -242,7 +242,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(candidates(&conn, 1).unwrap().is_empty());
+        assert_eq!(
+            candidates(&conn, 1).unwrap(),
+            [] as [crate::code::duplication::candidates::DupCandidate; 0]
+        );
     }
 
     #[test]

@@ -2208,6 +2208,11 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
     // shared words are not one.
     let search_result = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: "identical ranking signal".to_string(),
             root: None,
             limit: 10,

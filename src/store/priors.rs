@@ -3414,7 +3414,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.unrefuted, vec!["clu-a".to_string()]);
-        assert!(report.refuted.is_empty());
+        assert_eq!(report.refuted, [] as [String; 0]);
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.confirmed_count, 0, "no session moves this counter");
         assert_eq!(c.refuted_count, 0);
@@ -3444,7 +3444,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.refuted, vec!["clu-a".to_string()]);
-        assert!(report.unrefuted.is_empty());
+        assert_eq!(report.unrefuted, [] as [String; 0]);
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.refuted_count, 1);
         assert_eq!(c.confirmed_count, 0);
@@ -3471,7 +3471,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.unrefuted, vec!["clu-a".to_string()]);
-        assert!(report.refuted.is_empty());
+        assert_eq!(report.refuted, [] as [String; 0]);
     }
 
     /// An error the transcript did not timestamp cannot be placed before the
@@ -3510,7 +3510,7 @@ mod tests {
         let report = settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
 
         assert_eq!(report.unobservable, vec!["clu-a".to_string()]);
-        assert!(report.refuted.is_empty());
+        assert_eq!(report.refuted, [] as [String; 0]);
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.confirmed_count, 0, "neither counter moves");
         assert_eq!(c.refuted_count, 0);
@@ -3667,7 +3667,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(report.unobservable, vec!["clu-a".to_string()]);
-        assert!(report.refuted.is_empty());
+        assert_eq!(report.refuted, [] as [String; 0]);
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!((c.confirmed_count, c.refuted_count), (0, 0));
 
@@ -3930,6 +3930,69 @@ mod tests {
         assert_eq!(after.refuted_count, 0);
     }
 
+    /// Catches: a `refuted` model verdict applied with the confirmation sign,
+    /// raising confirmations, reinstating a refuted prior and renewing its TTL.
+    #[test]
+    fn a_refuted_model_verdict_lowers_belief_and_does_not_reinstate_or_renew() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, expires_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100, 1000)",
+            [],
+        )
+        .unwrap();
+        let mut c = sample_cluster();
+        c.state = "refuted".into();
+        c.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &c).unwrap();
+        record_injection(&conn, &c.id, "session-a", 200).unwrap();
+        // The injection itself renews the TTL; pin a past expiry afterwards so
+        // only the verdict can move it.
+        conn.execute(
+            "UPDATE memory_entries SET expires_at = 1000 WHERE id = 'prior-a'",
+            [],
+        )
+        .unwrap();
+
+        record_model_verdict(&conn, &c.id, "refuted", Some("session-a"), 201).unwrap();
+
+        let after = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert_eq!((after.confirmed_count, after.refuted_count), (0, 1));
+        assert_eq!(after.state, "refuted");
+        let (confirmations, corrections, expires_at): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT confirmations, corrections, expires_at FROM memory_entries WHERE id = 'prior-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((confirmations, corrections), (0, 1));
+        assert_eq!(expires_at, 1000, "a refutation must not renew the TTL");
+    }
+
+    /// Catches: the `[]` arm removed, so a verdict on a prior nobody injected
+    /// reports "multiple open sessions" instead of the true cause.
+    #[test]
+    fn model_verdict_without_an_open_injection_says_so() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        c.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &c).unwrap();
+
+        let err = record_model_verdict(&conn, &c.id, "confirmed", None, 202).unwrap_err();
+        assert!(
+            err.to_string().contains("no open injection to judge"),
+            "{err}"
+        );
+    }
+
     /// Vouching for a prior must not be what kills it.
     ///
     /// The renewal exists so a confirmed promotion stays injectable. Written
@@ -4149,7 +4212,7 @@ mod tests {
 
         let report = curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
 
-        assert!(report.newly_promotable.is_empty());
+        assert_eq!(report.newly_promotable, [] as [String; 0]);
     }
 
     // Catches: `&&` -> `||`, which reports a survivor that never cleared the gate.
@@ -4160,7 +4223,7 @@ mod tests {
 
         let report = curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
 
-        assert!(report.newly_promotable.is_empty());
+        assert_eq!(report.newly_promotable, [] as [String; 0]);
         assert_eq!(report.moved, 1);
     }
 

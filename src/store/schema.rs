@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 34;
+pub const SCHEMA_VERSION: i32 = 35;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -515,6 +515,7 @@ fn create_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(RELATION_CANDIDATES_SQL)?;
     conn.execute_batch(RECALL_LEDGER_SQL)?;
     conn.execute_batch(INDEX_HEAD_SQL)?;
+    conn.execute_batch(crate::store::external::SCHEMA_SQL)?;
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
     Ok(())
 }
@@ -1283,6 +1284,10 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         conn.execute_batch(INDEX_HEAD_SQL)?;
     }
 
+    if from_version < 35 {
+        conn.execute_batch(crate::store::external::SCHEMA_SQL)?;
+    }
+
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
 
@@ -1421,6 +1426,22 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+
+    #[test]
+    fn test_migrate_below_v31_without_prior_clusters_succeeds() {
+        // Catches: the v31 guard widened from `&&` to `||`, so a pre-prior
+        // store (no prior_clusters table) runs ALTER TABLE on a missing table
+        // and aborts the whole migration.
+        let conn = setup_db();
+        init_schema(&conn).unwrap();
+        conn.execute_batch("DROP TABLE prior_injections; DROP TABLE prior_clusters;")
+            .unwrap();
+        assert!(!table_exists(&conn, "prior_clusters"));
+
+        migrate_schema_inner(&conn, 30).expect("v30 migration without prior_clusters");
+
+        assert!(!table_exists(&conn, "prior_clusters"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod caching_parser;
 pub mod context;
 pub mod cpp;
 pub mod csharp;
+pub mod definitions;
 pub mod gdscript;
 pub mod go;
 pub mod import;
@@ -21,3 +22,5 @@ pub mod python;
 pub mod rust;
 pub mod swift;
 pub mod typescript;
+
+pub mod literals;

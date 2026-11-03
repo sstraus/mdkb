@@ -54,7 +54,7 @@ pub struct WalkOptions<'a> {
 ///
 /// Returns the patterns that should be force-included in the index despite
 /// being gitignored.
-fn parse_mdkb_index_annotations(root: &Path) -> Vec<String> {
+pub(crate) fn parse_mdkb_index_annotations(root: &Path) -> Vec<String> {
     let gitignore_path = root.join(".gitignore");
     let Ok(content) = std::fs::read_to_string(&gitignore_path) else {
         return Vec::new();
@@ -118,7 +118,7 @@ fn discover_forced_files(
 }
 
 /// The forced pass and watcher admission must use identical traversal rules.
-fn forced_walk_builder(root: &Path, force_patterns: &[String]) -> Option<WalkBuilder> {
+pub(crate) fn forced_walk_builder(root: &Path, force_patterns: &[String]) -> Option<WalkBuilder> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
@@ -178,7 +178,7 @@ fn is_nested_store(dir: &Path) -> bool {
     dir.join(".mdkb").join("index.sqlite").is_file()
 }
 
-fn walk_builder(opts: WalkOptions<'_>) -> WalkBuilder {
+pub(crate) fn walk_builder(opts: WalkOptions<'_>) -> WalkBuilder {
     let WalkOptions {
         root,
         ignore_patterns,
@@ -381,8 +381,8 @@ mod tests {
 
         let files = discover(root);
 
-        // md and json are not supported languages
-        assert_eq!(files.len(), 4);
+        // JSON contributes literal values, while Markdown is not source.
+        assert_eq!(files.len(), 5);
         let names: Vec<&str> = files
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
@@ -486,7 +486,7 @@ mod tests {
     fn test_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
         let files = discover(dir.path());
-        assert!(files.is_empty());
+        assert_eq!(files, [] as [std::path::PathBuf; 0]);
     }
 
     #[test]

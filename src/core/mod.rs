@@ -933,3 +933,7 @@ mod verify_after_release_tests {
         assert!(outcome.is_none());
     }
 }
+
+pub mod search_contract;
+pub mod source_search;
+pub mod text_search;

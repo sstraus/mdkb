@@ -234,6 +234,9 @@ pub struct ToolRow {
 
 #[derive(Debug, Serialize)]
 pub struct HooksSummary {
+    /// Whether hooks write `hook-events.jsonl` / `hook-slow.jsonl` at all. When
+    /// false the counts below are not zero activity, they are no data.
+    pub telemetry_enabled: bool,
     /// Slow hook events in the last 7 days (from hook-slow.jsonl).
     pub slow_events_7d: usize,
     /// Oldest retained `hook-events.jsonl` row when it is newer than the 7-day
@@ -626,6 +629,7 @@ fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mut mining: MiningStatus) ->
     let drift = crate::cli::setup::detect_hook_drift_for_repo(repo_root, None);
 
     HooksSummary {
+        telemetry_enabled: crate::daemon::config::hook_telemetry_enabled(),
         slow_events_7d,
         events_since: log.since,
         events,
@@ -1076,7 +1080,7 @@ mod tests {
     fn header_version_non_empty() {
         let env = Env::new();
         let report = collect_report(&env.ctx).expect("collect");
-        assert!(!report.header.version.is_empty());
+        assert_ne!(report.header.version, "");
     }
 
     /// A rotated log retains less than 7 days; stats must report the real
@@ -1277,6 +1281,7 @@ mod tests {
                 top_tools: vec![],
             },
             hooks: HooksSummary {
+                telemetry_enabled: true,
                 slow_events_7d: 0,
                 events_since: None,
                 events: vec![],

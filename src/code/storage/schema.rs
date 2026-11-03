@@ -63,6 +63,16 @@ CREATE TABLE IF NOT EXISTS code_imports (
     is_type_only INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS code_literals (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+    content TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    enclosing_symbol TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_literals_file ON code_literals(file_id);
+
 CREATE TABLE IF NOT EXISTS code_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -135,7 +145,10 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 15;
+// Version 16 adds Objective-C headers and embedded cgo definitions to files
+// whose content hash can be unchanged since the previous indexing run.
+// Version 17 adds bounded AST literals, JSX text and JSON values.
+pub const RESOLUTION_VERSION: i64 = 17;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

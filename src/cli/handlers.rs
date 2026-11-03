@@ -2645,7 +2645,7 @@ mod tests {
         let result = handle_memory_import(&ctx, &path, false, false).unwrap();
         assert_eq!(result.imported, 1);
         assert_eq!(result.skipped, 0);
-        assert!(result.errors.is_empty());
+        assert_eq!(result.errors, [] as [String; 0]);
 
         let entry = handle_memory_show(&ctx, "test-import").unwrap().unwrap();
         assert_eq!(entry.title, "Test Import");
@@ -2705,7 +2705,7 @@ mod tests {
         let result = handle_memory_import(&ctx, &path, false, true).unwrap();
         assert_eq!(result.imported, 1);
         assert_eq!(result.skipped, 1);
-        assert!(result.errors.is_empty());
+        assert_eq!(result.errors, [] as [String; 0]);
     }
 
     #[test]
@@ -2754,7 +2754,7 @@ mod tests {
 
         let result = handle_memory_import(&ctx, &path, false, false).unwrap();
         assert_eq!(result.imported, 0);
-        assert!(result.errors.is_empty());
+        assert_eq!(result.errors, [] as [String; 0]);
     }
 
     #[test]
@@ -2787,7 +2787,7 @@ mod tests {
         let entry = handle_memory_show(&ctx, "minimal").unwrap().unwrap();
         assert_eq!(entry.source_type, memory::SourceType::UserStatement);
         assert_eq!(entry.entry_type, EntryType::Topic);
-        assert!(entry.tags.is_empty());
+        assert_eq!(entry.tags, [] as [String; 0]);
     }
 
     #[test]

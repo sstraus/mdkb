@@ -341,7 +341,11 @@ impl RepoRegistry {
     /// knows its repos before any client knocks.
     pub fn new(config: DaemonConfig) -> Self {
         let max_active = config.max_active_repos;
-        let repo_map = RepoMap::open(config.repo_map_path(), &config.repos);
+        let repo_map = RepoMap::open_with_expiry(
+            config.repo_map_path(),
+            &config.repos,
+            config.repo_expiry_days,
+        );
         let ignored = config.ignored_paths();
         Self {
             handles: DashMap::new(),
@@ -374,6 +378,7 @@ impl RepoRegistry {
 
         // Fast path: already open
         if let Some(handle) = self.open_handle(&canonical)? {
+            self.repo_map.record(&canonical);
             return Ok(handle);
         }
 
@@ -387,6 +392,7 @@ impl RepoRegistry {
         // Re-check after acquiring the gate: another caller may have just inserted this key.
         if let Some(handle) = self.handles.get(&canonical) {
             handle.touch();
+            self.repo_map.record(&canonical);
             return Ok(Arc::clone(&handle));
         }
 
@@ -487,6 +493,16 @@ impl RepoRegistry {
         let mut roots: std::collections::BTreeSet<_> = self.known_roots().into_iter().collect();
         self.retain_unignored(&mut roots);
         roots.into_iter().collect()
+    }
+
+    pub(crate) fn last_opened(&self) -> std::collections::BTreeMap<PathBuf, i64> {
+        self.repo_map.last_opened()
+    }
+
+    /// Shared listing rows, including activity from this registry's own map.
+    pub fn listed_rows(&self) -> Vec<super::repo_listing::RepoRow> {
+        let roots = self.listed_roots();
+        super::repo_listing::list_repos_with_opened(&roots, &self.last_opened())
     }
 
     /// Known roots plus stores nested below them, found by a read-only
@@ -780,7 +796,7 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
 /// Canonicalize a root path, resolving symlinks and normalizing.
 /// If the path is inside a git worktree, resolves to the main worktree root
 /// so that all worktrees of the same repo share a single `.mdkb/` directory.
-fn canonicalize_root(root: &Path) -> Result<PathBuf> {
+pub(crate) fn canonicalize_root(root: &Path) -> Result<PathBuf> {
     if root.as_os_str().is_empty() {
         return Err(Error::other("Repo path must not be empty"));
     }
@@ -1493,6 +1509,34 @@ mod tests {
         }
     }
 
+    /// Catches recording only newly created handles: a repo already live in
+    /// the daemon must update its activity on the next day's successful access.
+    #[test]
+    fn repo_expiry_activity_refreshes_an_already_open_handle() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let canonical = canonicalize_root(&root).unwrap();
+        let registry = RepoRegistry::new(allow_temp_config_with_state(state.path()));
+        let handle = registry.get_or_open(&root).unwrap();
+        // The handle is real and live; make only its persisted activity old,
+        // then reload that map as another process would.
+        let path = state.path().join("repos.json");
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["repos"][0]["last_opened_at"] = (now_unix() - 2 * 86_400).into();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let mut registry = registry;
+        registry.repo_map = RepoMap::open(Some(path.clone()), &[]);
+        let again = registry.get_or_open(&root).unwrap();
+        assert!(Arc::ptr_eq(&handle, &again));
+        let at = super::super::repo_map::read_last_opened(&path).unwrap()[&canonical];
+        assert!(
+            at >= now_unix() - 60,
+            "a cached handle must count as activity"
+        );
+    }
+
     /// AC#1 — a repo opened by one process is known to the next. Two
     /// registries over one daemon home stand in for a restart: the first
     /// process is gone, only `repos.json` connects them.
@@ -1539,7 +1583,7 @@ mod tests {
         });
 
         assert!(registry.get_or_open(&root).is_err());
-        assert!(registry.known_roots().is_empty());
+        assert_eq!(registry.known_roots(), [] as [std::path::PathBuf; 0]);
         assert!(
             !state.path().join("repos.json").exists(),
             "a refused open writes nothing at all"

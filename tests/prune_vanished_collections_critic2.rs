@@ -148,7 +148,7 @@ fn the_run_after_a_prune_is_clean() {
 
     let result = handle_update(&ctx, &root).expect("follow-up update");
 
-    assert!(result.collections_pruned.is_empty());
-    assert!(result.collections_vanished.is_empty());
+    assert_eq!(result.collections_pruned, [] as [String; 0]);
+    assert_eq!(result.collections_vanished, [] as [String; 0]);
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 }

@@ -712,6 +712,89 @@ mod tests {
         assert!(resp.contains(env!("CARGO_PKG_VERSION")));
     }
 
+    /// Catches external documents accepted without reaching the shared search/get index.
+    #[tokio::test]
+    async fn external_ingest_search_get_delete() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mdkb")).unwrap();
+        let registry = make_registry();
+        let dctx = make_dctx();
+        let root = tmp.path().to_string_lossy().to_string();
+        let call = |method: &str, mut params: Value| {
+            params["root"] = json!(root);
+            json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string()
+        };
+        let request = call(
+            "external.upsert",
+            json!({
+                "source":"test-owner", "id":"story-1", "revision":1,
+                "title":"External quasar", "body":"quasar evidence without a source file",
+                "metadata":{"status":"complete", "type":"feature", "updated_at":"2026-10-25"}
+            }),
+        );
+        let response = dispatch_hook_message(request.as_bytes(), &registry, &dctx).await;
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["applied"], true, "{response}");
+        let id = response["result"]["document_id"].as_i64().unwrap();
+        {
+            let handle = registry.get_or_open(tmp.path()).unwrap();
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            let hits = crate::core::ops::handle_search(ctx, "quasar", 10, None).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].id, id);
+            match crate::core::ops::handle_get(ctx, &id.to_string(), None).unwrap() {
+                crate::core::ops::GetResult::Document(doc, body) => {
+                    assert_eq!(body, "quasar evidence without a source file");
+                    assert_eq!(
+                        doc.metadata.as_ref().unwrap()["external"]["source"],
+                        "test-owner"
+                    );
+                }
+                crate::core::ops::GetResult::Memory(_) => {
+                    panic!("external content must resolve as a document");
+                }
+            }
+        }
+        let request = call("get", json!({"id":id.to_string()}));
+        let response = dispatch_hook_message(request.as_bytes(), &registry, &dctx).await;
+        assert!(
+            response.contains("quasar evidence without a source file"),
+            "{response}"
+        );
+        let request = call(
+            "external.delete",
+            json!({"source":"test-owner", "id":"story-1", "revision":2}),
+        );
+        let response = dispatch_hook_message(request.as_bytes(), &registry, &dctx).await;
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["result"]["deleted"], true);
+        let handle = registry.get_or_open(tmp.path()).unwrap();
+        let guard = handle.ctx.lock().await;
+        let ctx = guard.as_ref().unwrap();
+        assert!(
+            crate::core::ops::handle_search(ctx, "quasar", 10, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(crate::core::ops::handle_get(ctx, &id.to_string(), None).is_err());
+    }
+
+    /// Catches malformed ingest writes opening/mutating stores before admission refusal.
+    #[tokio::test]
+    async fn external_ingest_invalid_params_refused_before_store_open() {
+        let tmp = TempDir::new().unwrap();
+        let registry = make_registry();
+        let request = json!({"jsonrpc":"2.0", "id":1, "method":"external.upsert",
+            "params":{"root":tmp.path(), "source":"owner", "id":"id", "revision":-1,
+                "title":"title", "body":"body"}})
+        .to_string();
+        let response = dispatch_hook_message(request.as_bytes(), &registry, &make_dctx()).await;
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(!tmp.path().join(".mdkb/index.sqlite").exists());
+    }
+
     async fn repos_reply(registry: &Arc<RepoRegistry>) -> Value {
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"{}","params":{{}}}}"#,
@@ -740,6 +823,28 @@ mod tests {
 
         let canonical = outer.canonicalize().unwrap();
         assert_eq!(reply["result"]["roots"], serde_json::json!([canonical]));
+    }
+
+    /// Catches RPC rows omitting activity or reading HOME instead of the
+    /// daemon registry's configured state directory.
+    #[tokio::test]
+    async fn repos_method_rows_carry_activity_from_the_registry_map() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let state = tmp.path().join("state");
+        let registry = Arc::new(RepoRegistry::new(DaemonConfig {
+            state_dir: Some(state.clone()),
+            whitelist_dirs: vec![tmp.path().to_string_lossy().into_owned()],
+            ..DaemonConfig::default()
+        }));
+        registry.get_or_open(&root).unwrap();
+        let root = crate::domain::canonicalize_plain(&root).unwrap();
+        let at =
+            crate::daemon::repo_map::read_last_opened(&state.join("repos.json")).unwrap()[&root];
+        let reply = repos_reply(&registry).await;
+        assert_eq!(reply["result"]["rows"][0]["path"], serde_json::json!(root));
+        assert_eq!(reply["result"]["rows"][0]["last_opened_at"], at);
     }
 
     /// Catches: a root `daemon.toml` ignores still showing up in status, while

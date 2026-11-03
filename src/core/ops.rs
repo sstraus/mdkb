@@ -851,6 +851,8 @@ pub fn handle_vsearch(
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: crate::store::external::source(&doc.collection).map(str::to_owned),
+                read_only: crate::store::external::source(&doc.collection).is_some(),
                 repo_root: None,
             });
 
@@ -989,6 +991,9 @@ pub fn get_document_content(
 /// Append a slow-embedding record to `.mdkb/hook-slow.jsonl` (best-effort,
 /// size-rotated via [`crate::mcp::dispatch::append_hook_log`]).
 pub(crate) fn log_slow_embed(mdkb_dir: &Path, doc_path: &str, elapsed_ms: u64) {
+    if !crate::daemon::config::hook_telemetry_enabled() {
+        return;
+    }
     let ts = chrono::Utc::now().timestamp();
     let mut line = serde_json::json!({
         "ts": ts,

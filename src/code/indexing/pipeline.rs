@@ -376,6 +376,11 @@ pub(crate) fn create_parser(language: Language) -> Option<Box<dyn LanguageParser
         Language::Python => build_parser(language, PythonParser::new()),
         Language::Java => build_parser(language, JavaParser::new()),
         Language::C => build_parser(language, CParser::new()),
+        Language::Objc => build_parser(language, CParser::new_objc()),
+        Language::Shell | Language::Ruby | Language::Sql | Language::Json => build_parser(
+            language,
+            crate::code::parsing::definitions::DefinitionParser::new(language),
+        ),
         Language::Cpp => build_parser(language, CppParser::new()),
         Language::CSharp => build_parser(language, CSharpParser::new()),
         Language::Php => build_parser(language, PhpParser::new()),
@@ -418,6 +423,14 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         let mut counter = SymbolCounter::new();
 
         let symbols = parser.parse(&fc.content, dummy_file_id, &mut counter);
+        let literals = if crate::code::parsing::literals::skip_literals(&fc.path, &fc.content) {
+            Vec::new()
+        } else {
+            parser
+                .tree(&fc.content)
+                .map(|tree| crate::code::parsing::literals::extract(&tree, &fc.content, &symbols))
+                .unwrap_or_default()
+        };
         // Tree-sitter produces a recoverable tree for many syntax errors. Its
         // extracted symbols remain useful, but the file must carry the error
         // bit so a sparse result is never mistaken for a clean parse.
@@ -564,6 +577,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
             raw_symbols,
             raw_relationships,
             raw_imports,
+            literals,
         };
 
         if tx.send(parsed).is_err() {
@@ -630,6 +644,10 @@ fn stage_collect(
             mtime,
             token_estimate: parsed.token_estimate,
         });
+
+        for literal in parsed.literals {
+            batch.literals.push((file_id, literal));
+        }
 
         for import in parsed.raw_imports {
             batch.imports.push(CollectedImport { file_id, import });
@@ -811,9 +829,24 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             Some(i64::from(reg.token_estimate)),
         )?;
         db.set_file_has_error(real_id, reg.has_error)?;
+        db.conn()
+            .execute("DELETE FROM code_literals WHERE file_id = ?1", [real_id])?;
         file_id_map.insert(reg.file_id.value(), real_id);
         stats.files_discovered += 1;
         stats.files_indexed += 1;
+    }
+
+    for (file_id, literal) in &batch.literals {
+        let real_file_id = *file_id_map.get(&file_id.value()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "literal references an unregistered file_id {}",
+                file_id.value()
+            )
+        })?;
+        db.conn().execute(
+            "INSERT INTO code_literals (file_id, content, line, col, enclosing_symbol) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![real_file_id, literal.content, literal.line, literal.column, literal.enclosing_symbol],
+        )?;
     }
 
     for collected in &batch.imports {
@@ -967,7 +1000,10 @@ mod tests {
             db.find_symbols_by_name("big_fn").unwrap().is_empty(),
             "symbol from the oversized file must not be indexed"
         );
-        assert!(!db.find_symbols_by_name("small_fn").unwrap().is_empty());
+        assert_ne!(
+            db.find_symbols_by_name("small_fn").unwrap(),
+            [] as [crate::code::symbol::Symbol; 0]
+        );
     }
 
     #[test]
@@ -1085,8 +1121,8 @@ fn callee() {}
         let (_db_dir, db) = temp_db();
         let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        // Only the .rs file should be indexed
-        assert_eq!(db.file_count().unwrap(), 1);
+        // JSON is indexed for literal values; Markdown is still excluded.
+        assert_eq!(db.file_count().unwrap(), 2);
         assert!(stats.symbols_indexed >= 1);
     }
 

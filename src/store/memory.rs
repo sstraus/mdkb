@@ -1635,6 +1635,8 @@ pub fn search_entries_hybrid_fts(
             snippets: vec![],
             status: None,
             superseded_by: None,
+            source: None,
+            read_only: false,
             repo_root: None,
         })
         .collect();
@@ -3706,7 +3708,7 @@ mod tests {
 
         // Prune with 30 days - should find nothing
         let pruned = prune(&conn, 30);
-        assert!(pruned.is_empty());
+        assert_eq!(pruned, [] as [String; 0]);
 
         // Entry should still be active
         let retrieved = get_entry_without_tracking(&conn, "recent")
@@ -3871,7 +3873,7 @@ mod tests {
 
         // Prune - should find nothing (already archived)
         let pruned = prune(&conn, 30);
-        assert!(pruned.is_empty());
+        assert_eq!(pruned, [] as [String; 0]);
     }
 
     #[test]
@@ -5579,7 +5581,7 @@ mod tests {
 
         let summary = get_revision_summary(&conn, "test").unwrap();
         assert_eq!(summary.count, 0);
-        assert!(summary.dates.is_empty());
+        assert_eq!(summary.dates, [] as [i64; 0]);
     }
 
     #[test]

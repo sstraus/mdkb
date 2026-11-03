@@ -110,6 +110,11 @@ fn params(scope: &str, query: &str, file: Option<&str>) -> SearchParams {
         file: file.map(str::to_string),
         min_confidence: None,
         since: None,
+        patterns: None,
+        path: None,
+        regex: false,
+        ignore_case: false,
+        contract: None,
     }
 }
 

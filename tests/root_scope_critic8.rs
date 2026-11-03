@@ -83,7 +83,7 @@ fn try_read_known_roots_errs_when_the_path_is_a_directory() {
     let map = tmp.path().join("repos.json");
     std::fs::create_dir(&map).unwrap();
     assert!(try_read_known_roots(&map).is_err());
-    assert!(read_known_roots(&map).is_empty());
+    assert_eq!(read_known_roots(&map), [] as [std::path::PathBuf; 0]);
 }
 
 /// Catches: bytes that are not UTF-8 collapsing into an empty list instead of
@@ -124,7 +124,7 @@ fn the_daemon_map_still_quarantines_a_corrupt_file_and_recovers() {
     std::fs::write(&map, "{ not json").unwrap();
 
     let opened = RepoMap::open(Some(map.clone()), &[]);
-    assert!(opened.roots().is_empty());
+    assert_eq!(opened.roots(), [] as [std::path::PathBuf; 0]);
     let side = sidecars(tmp.path());
     assert_eq!(side.len(), 1, "{side:?}");
     assert_eq!(
@@ -144,7 +144,7 @@ fn the_daemon_map_opens_when_the_path_is_a_directory() {
     let map = tmp.path().join("repos.json");
     std::fs::create_dir(&map).unwrap();
     let opened = RepoMap::open(Some(map.clone()), &[]);
-    assert!(opened.roots().is_empty());
+    assert_eq!(opened.roots(), [] as [std::path::PathBuf; 0]);
     assert!(map.is_dir());
 }
 

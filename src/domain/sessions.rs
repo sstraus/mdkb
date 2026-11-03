@@ -27,8 +27,10 @@ pub struct SessionRecord {
 /// Returns `None` for progress, system, file-history-snapshot, queue-operation,
 /// summary records, and for user/assistant records with no text content.
 pub fn parse_record(line: &str) -> Option<SessionRecord> {
-    let raw: RawRecord = serde_json::from_str(line).ok()?;
+    record_from_raw(serde_json::from_str(line).ok()?)
+}
 
+fn record_from_raw(raw: RawRecord) -> Option<SessionRecord> {
     match raw.record_type.as_str() {
         "user" | "assistant" => {}
         _ => return None,
@@ -153,25 +155,28 @@ pub fn parse_session_file(
             continue;
         }
 
-        // Try to extract session metadata from any record
-        if session_id.is_none() || git_branch.is_none() {
-            if let Ok(raw) = serde_json::from_str::<RawRecordMeta>(&line) {
-                if session_id.is_none() {
-                    if let Some(id) = raw.session_id {
-                        session_id = Some(id);
-                    }
+        let raw: RawRecord = match serde_json::from_str(&line) {
+            Ok(raw) => raw,
+            Err(err) => {
+                // A valid but unfamiliar record is not a conversation turn. A
+                // truncated JSONL line, however, makes this scan incomplete;
+                // treating it as an empty session would archive live content.
+                if serde_json::from_str::<serde_json::Value>(&line).is_err() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("invalid session JSONL: {err}"),
+                    ));
                 }
-                if git_branch.is_none() {
-                    if let Some(branch) = raw.git_branch {
-                        if !branch.is_empty() {
-                            git_branch = Some(branch);
-                        }
-                    }
-                }
+                continue;
             }
+        };
+        if session_id.is_none() {
+            session_id = raw.session_id.clone();
         }
-
-        if let Some(record) = parse_record(&line) {
+        if git_branch.is_none() {
+            git_branch = raw.git_branch.as_ref().filter(|s| !s.is_empty()).cloned();
+        }
+        if let Some(record) = record_from_raw(raw) {
             records.push(record);
         }
     }
@@ -254,17 +259,12 @@ fn format_records(records: &[SessionRecord]) -> String {
 // =============================================================================
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawRecord {
     #[serde(rename = "type")]
     record_type: String,
     message: Option<RawMessage>,
     timestamp: Option<String>,
-}
-
-/// Lightweight struct to extract metadata without full parsing.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawRecordMeta {
     session_id: Option<String>,
     git_branch: Option<String>,
 }

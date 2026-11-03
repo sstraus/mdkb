@@ -491,9 +491,14 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             file,
             entry_type,
             root,
+            ignore_case,
+            patterns,
+            regex,
+            path,
+            search_contract,
         } => {
             let req = SearchRequest {
-                query,
+                query: query.unwrap_or_default(),
                 limit,
                 collection,
                 include_superseded,
@@ -501,7 +506,22 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 kind,
                 file,
                 entry_type,
+                ignore_case,
+                patterns,
+                regex,
+                path,
+                search_contract,
             };
+            mdkb::core::search_contract::validate(mdkb::core::search_contract::Request {
+                scope: req.scope.as_deref(),
+                query: &req.query,
+                patterns: (!req.patterns.is_empty()).then_some(req.patterns.as_slice()),
+                path: req.path.as_deref(),
+                file: req.file.as_deref(),
+                regex: req.regex,
+                ignore_case: req.ignore_case,
+                contract: req.search_contract.as_deref(),
+            })?;
             if let Some(raw_root) = root {
                 run_search_roots(&raw_root, req, cli.format).await?;
             } else {
@@ -1406,13 +1426,16 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             print!(
                 "\
 # Search
-mdkb search <query>                                    # docs + memory (default)
+mdkb search <query>                                    # docs + memory + indexed literals (default)
 mdkb search <query> --scope memory                     # memory only
 mdkb search <query> --scope memory --entry-type TYPE    # filter by type
 mdkb search <query> --scope docs                        # documents only
 mdkb search <query> --scope symbols                     # symbol definitions (fuzzy)
 mdkb search <query> --scope symbols --file hook         # path substring, not a glob
 mdkb search <query> --scope code                        # semantic code search
+mdkb search 'Fork from here' --scope text               # exact AST literal/JSX/i18n value, not grep
+mdkb search 'fork from here' --scope text -i             # Unicode case-insensitive literal
+mdkb search <query> --scope text --file src/             # narrow by path substring; index age reported
 mdkb search <query> -c <collection>                     # a collection is -c, NOT --scope
 mdkb search <query> --root NAME                         # another repo: same selector as the MCP `root` below (--root '*' = all)
 mdkb get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
@@ -1497,9 +1520,11 @@ MDKB_NAMESPACE=<name> mdkb <cmd>                        # use .mdkb/namespaces/<
 mdkb surface                                            # each MCP tool next to its CLI equivalent
 mdkb schema [COMMAND]                                   # the CLI as JSON, for machine callers
 
-# Repo selector (the MCP `root` parameter; the CLI always works in the current repo)
+# Repo selector (the MCP `root` parameter and CLI `--root`)
 (omitted)                                               # the declared workspace, and every store nested under it
-root=\"/abs/path\"                                        # one repo by path; need not be a known repo
+root=\"/abs/path\"                                        # nearest existing store or known repo containing this path
+root=\".\"                                                # relative to the CLI cwd or the first declared MCP workspace
+root=\"./dir\"                                          # explicit path; bare dir stays a repo name even if ./dir exists
 root=\"name\"                                             # one repo by name, the last component of a known root
 root=\"parent/name\"                                     # the same, by trailing path components: how a name several repos share is told apart
 root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
@@ -1675,25 +1700,14 @@ root=\"scope:home\"                                       # the known repos whos
                     }
                 }
                 SetupHooksCommand::Ego { force, dry_run } => {
-                    use mdkb::cli::setup_ego::{EgoSetupOutcome, handle_setup_hooks_ego};
-                    let result = handle_setup_hooks_ego(force, dry_run)?;
+                    let result = mdkb::cli::setup_ego::handle_setup_hooks_ego(force, dry_run)?;
                     if result.dry_run {
                         println!("{}", result.merged_toml);
                     } else {
-                        match &result.outcome {
-                            EgoSetupOutcome::Written => println!(
-                                "Registered mdkb_prompt_command = {} in {}",
-                                result.binary_path,
-                                result.config_path.display()
-                            ),
-                            EgoSetupOutcome::Unchanged => {
-                                println!("Already registered in {}", result.config_path.display());
-                            }
-                            EgoSetupOutcome::KeptExisting(existing) => println!(
-                                "Kept existing mdkb_prompt_command = {existing} in {}; use --force to replace it",
-                                result.config_path.display()
-                            ),
-                        }
+                        println!(
+                            "Registered generic mdkb hooks in {}",
+                            result.config_path.display()
+                        );
                     }
                 }
                 SetupHooksCommand::Codex { disable, dry_run } => {
@@ -1735,6 +1749,10 @@ root=\"scope:home\"                                       # the known repos whos
                             profile_dir.as_deref(),
                         )?;
                         println!("{msg}");
+                    }
+                    RemoveHooksCommand::Ego => {
+                        let result = mdkb::cli::setup_ego::handle_remove_hooks_ego()?;
+                        println!("Removed mdkb hooks from {}", result.config_path.display());
                     }
                     RemoveHooksCommand::Codex => {
                         let msg = mdkb::cli::setup::handle_remove_hooks_codex()?;
@@ -2012,6 +2030,11 @@ struct SearchRequest {
     kind: Option<String>,
     file: Option<String>,
     entry_type: Option<String>,
+    ignore_case: bool,
+    patterns: Vec<String>,
+    regex: bool,
+    path: Option<String>,
+    search_contract: Option<String>,
 }
 
 fn run_search(
@@ -2029,24 +2052,223 @@ fn run_search(
         kind,
         file,
         entry_type,
+        ignore_case,
+        patterns,
+        regex,
+        path,
+        search_contract,
     } = req;
+    let new_scope = matches!(
+        scope.as_deref(),
+        Some("source" | "literals" | "semantic-code" | "knowledge")
+    );
+    if scope.as_deref() == Some("source") && file.is_some() {
+        return Err(mdkb::Error::other("source uses --path, not legacy --file"));
+    }
+    if path.is_some() && !matches!(scope.as_deref(), Some("source" | "literals" | "symbols")) {
+        return Err(mdkb::Error::other(
+            "--path is available only for source, literals, and symbols",
+        ));
+    }
+    if file.is_some() && path.is_some() {
+        return Err(mdkb::Error::other(
+            "choose --path or legacy --file, not both",
+        ));
+    }
+    if regex && scope.as_deref() != Some("source") {
+        return Err(mdkb::Error::other(
+            "--regex is available only for --scope source",
+        ));
+    }
+    if !patterns.is_empty()
+        && (!query.is_empty() || !matches!(scope.as_deref(), Some("source" | "literals")))
+    {
+        return Err(mdkb::Error::other(
+            "-e requires source/literals and cannot be combined with QUERY",
+        ));
+    }
+    if new_scope && query.is_empty() && patterns.is_empty() {
+        return Err(mdkb::Error::other(
+            "canonical search needs QUERY or repeated -e patterns",
+        ));
+    }
+    if search_contract.is_some() && !matches!(format, OutputFormat::Json) {
+        return Err(mdkb::Error::other(
+            "--search-contract v2 requires --format json",
+        ));
+    }
     match scope.as_deref() {
+        Some("source") => {
+            let alternatives = if patterns.is_empty() {
+                vec![query.clone()]
+            } else {
+                patterns
+            };
+            let result = mdkb::core::source_search::search(
+                cwd,
+                mdkb::core::source_search::SourceRequest {
+                    patterns: &alternatives,
+                    path: path.as_deref(),
+                    regex,
+                    ignore_case,
+                    limit,
+                },
+            )?;
+            if matches!(format, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                for hit in &result.hits {
+                    println!("{}:{}:{}: {}", hit.file, hit.line, hit.column, hit.content);
+                }
+                println!(
+                    "{} source-line hits; coverage: {} ({} files scanned, {} bytes); truncated: {}",
+                    result.hits.len(),
+                    result.status,
+                    result.coverage.files_scanned,
+                    result.coverage.bytes_scanned,
+                    result.truncated
+                );
+                for failure in &result.coverage.failed_files {
+                    eprintln!("source scan partial: {failure}");
+                }
+            }
+        }
+        Some("literals") => {
+            let alternatives = if patterns.is_empty() {
+                vec![query.clone()]
+            } else {
+                patterns
+            };
+            let result = mdkb::core::text_search::search_canonical(
+                cwd,
+                &alternatives,
+                ignore_case,
+                path.as_deref(),
+                limit,
+            )?;
+            if matches!(format, OutputFormat::Json) {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                for hit in &result.hits {
+                    println!(
+                        "{}:{}:{}: {}",
+                        hit.location.file,
+                        hit.location.line,
+                        hit.location.column,
+                        hit.location.content.replace(['\n', '\r'], " ")
+                    );
+                }
+                println!(
+                    "{} indexed literal hits; coverage: {}; freshness: {}; truncated: {}",
+                    result.hits.len(),
+                    result.status,
+                    result.freshness.state,
+                    result.truncated
+                );
+                for stale in &result.coverage.stale_files {
+                    eprintln!("literal index not current: {stale}");
+                }
+            }
+        }
+        Some("text" | "strings") => {
+            let result =
+                mdkb::core::text_search::search(cwd, &query, ignore_case, file.as_deref(), limit)?
+                    .ok_or_else(|| {
+                        mdkb::Error::other(
+                            "Literal index not available; run `mdkb code index` first",
+                        )
+                    })?;
+            format_text_results(&result, format);
+        }
         Some("docs") => {
             let results = handle_hybrid_search(
                 ctx,
                 &query,
-                limit,
+                if search_contract.is_some() {
+                    limit.saturating_add(1)
+                } else {
+                    limit
+                },
                 collection.as_deref(),
                 include_superseded,
             )?;
-            format_search_results(&results, format);
+            if search_contract.as_deref() == Some("v2") {
+                print_indexed_search_envelope("docs", "document", &results, limit, results.len())?;
+            } else {
+                format_search_results(&results, format);
+            }
         }
         Some("memory") => {
-            let entries = handle_memory_search(ctx, &query, limit, entry_type.as_deref())?;
-            format_memory_list(&entries, format);
+            let entries = handle_memory_search(
+                ctx,
+                &query,
+                if search_contract.is_some() {
+                    limit.saturating_add(1)
+                } else {
+                    limit
+                },
+                entry_type.as_deref(),
+            )?;
+            if search_contract.as_deref() == Some("v2") {
+                print_indexed_search_envelope(
+                    "memory",
+                    "memory_entry",
+                    &entries,
+                    limit,
+                    entries.len(),
+                )?;
+            } else {
+                format_memory_list(&entries, format);
+            }
+        }
+        Some("knowledge") => {
+            let documents = handle_hybrid_search(
+                ctx,
+                &query,
+                limit.saturating_add(1),
+                collection.as_deref(),
+                include_superseded,
+            )?;
+            let memories =
+                handle_memory_search(ctx, &query, limit.saturating_add(1), entry_type.as_deref())?;
+            let truncated = documents.len().saturating_add(memories.len()) > limit;
+            let doc_count = documents.len().min(limit);
+            let mem_count = memories.len().min(limit.saturating_sub(doc_count));
+            if matches!(format, OutputFormat::Json) {
+                let hits: Vec<_> = documents
+                    .iter()
+                    .take(doc_count)
+                    .map(|doc| serde_json::json!({"corpus": "docs", "value": doc}))
+                    .chain(
+                        memories
+                            .iter()
+                            .take(mem_count)
+                            .map(|entry| serde_json::json!({"corpus": "memory", "value": entry})),
+                    )
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "scope": "knowledge", "unit": "knowledge_result", "status": "partial",
+                        "coverage": {"reason": "indexed corpus freshness not verified"},
+                        "freshness": {"state": "unknown"}, "hits": hits, "truncated": truncated
+                    }))?
+                );
+            } else {
+                format_search_results(&documents[..doc_count], format);
+                format_memory_list(&memories[..mem_count], format);
+                println!(
+                    "Knowledge corpus: indexed docs + memory; freshness unknown; truncated: {truncated}"
+                );
+            }
         }
         None => {
-            // Default: search docs + memory
+            let literals = if collection.is_none() {
+                mdkb::core::text_search::search(cwd, &query, ignore_case, file.as_deref(), limit)?
+            } else {
+                None
+            };
+            // Default: search docs + memory + indexed literals
             let results = handle_hybrid_search(
                 ctx,
                 &query,
@@ -2064,6 +2286,7 @@ fn run_search(
                 let out = serde_json::json!({
                     "documents": results,
                     "memory": entries,
+                    "text": literals,
                 });
                 println!("{}", serde_json::to_string_pretty(&out)?);
                 return Ok(());
@@ -2087,14 +2310,27 @@ fn run_search(
                 }
                 format_memory_list(&entries, format);
             }
-            if results.is_empty() && entries.is_empty() {
+            if let Some(result) = &literals {
+                if !result.hits.is_empty() {
+                    if headings {
+                        println!("## Source literals\n");
+                    }
+                    format_text_results(result, format);
+                }
+            }
+            if results.is_empty()
+                && entries.is_empty()
+                && literals
+                    .as_ref()
+                    .is_none_or(|result| result.hits.is_empty())
+            {
                 println!("No results found.");
                 if mdkb::store::search::index_is_empty(&ctx.conn)? {
                     println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
                 }
             }
         }
-        Some("code") => {
+        Some("code" | "semantic-code") => {
             let scored = mdkb::cli::handlers::handle_semantic_code_search(
                 cwd,
                 &ctx.config_path,
@@ -2102,7 +2338,19 @@ fn run_search(
                 kind.as_deref(),
                 limit,
             )?;
-            format_scored_symbols(&scored, format);
+            if scope.as_deref() == Some("semantic-code") && matches!(format, OutputFormat::Json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "scope": "semantic-code", "unit": "symbol", "status": "partial",
+                        "coverage": {"reason": "semantic ranking is not exhaustive"},
+                        "freshness": {"state": "unknown"}, "truncated": scored.len() == limit,
+                        "hits": scored.iter().map(|(symbol, score)| serde_json::json!({"symbol": symbol, "score": score})).collect::<Vec<_>>()
+                    }))?
+                );
+            } else {
+                format_scored_symbols(&scored, format);
+            }
         }
         Some("symbols") => {
             let found = mdkb::cli::handlers::handle_symbol_search(
@@ -2112,8 +2360,18 @@ fn run_search(
                 file.as_deref(),
                 limit,
             )?;
-            format_code_symbols(&found.symbols, format);
-            report_find_truncation(&found);
+            if search_contract.as_deref() == Some("v2") {
+                print_indexed_search_envelope(
+                    "symbols",
+                    "symbol",
+                    &found.symbols,
+                    limit,
+                    found.total,
+                )?;
+            } else {
+                format_code_symbols(&found.symbols, format);
+                report_find_truncation(&found);
+            }
         }
         Some("duplicates") => {
             // The query is not a query here: duplication is a sweep,
@@ -2143,7 +2401,7 @@ fn run_search(
         }
         Some(invalid) => {
             eprintln!(
-                "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, duplicates, coupling. Omit for docs+memory.",
+                "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, text, duplicates, coupling. Omit for docs+memory.",
                 invalid
             );
             std::process::exit(1);
@@ -2180,9 +2438,121 @@ async fn run_search_roots(
         )));
     }
     let several = roots.len() > 1;
+    if several && req.scope.as_deref() == Some("literals") {
+        if matches!(format, OutputFormat::Csv) {
+            return Err(mdkb::Error::other(
+                "multi-root literals support --format json, text, or markdown, not csv",
+            ));
+        }
+        let alternatives = if req.patterns.is_empty() {
+            vec![req.query.clone()]
+        } else {
+            req.patterns.clone()
+        };
+        let outcomes = roots
+            .iter()
+            .map(|root| {
+                let result = open_reader(root)
+                    .and_then(|_| {
+                        mdkb::core::text_search::search_canonical(
+                            root,
+                            &alternatives,
+                            req.ignore_case,
+                            req.path.as_deref(),
+                            req.limit,
+                        )
+                    })
+                    .map_err(|error| error.to_string());
+                (root.clone(), result)
+            })
+            .collect();
+        let result =
+            mdkb::core::text_search::aggregate_canonical_roots(outcomes, excluded, req.limit);
+        if matches!(format, OutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            for hit in result["hits"].as_array().into_iter().flatten() {
+                println!(
+                    "{}:{}:{}:{}: {}",
+                    hit["repo"].as_str().unwrap_or("?"),
+                    hit["file"].as_str().unwrap_or("?"),
+                    hit["line"],
+                    hit["column"],
+                    hit["content"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .replace(['\n', '\r'], " ")
+                );
+            }
+            println!(
+                "Literal corpus: {} (freshness {}); truncated: {}",
+                result["status"].as_str().unwrap_or("unknown"),
+                result["freshness"]["state"].as_str().unwrap_or("unknown"),
+                result["truncated"].as_bool().unwrap_or(false)
+            );
+            for root in result["coverage"]["roots"].as_array().into_iter().flatten() {
+                println!(
+                    "{}: {}",
+                    root["root"].as_str().unwrap_or("?"),
+                    root["status"].as_str().unwrap_or("unavailable")
+                );
+            }
+        }
+        return Ok(());
+    }
+    if several
+        && (req.scope.as_deref() == Some("knowledge")
+            || (req.search_contract.as_deref() == Some("v2")
+                && matches!(req.scope.as_deref(), Some("docs" | "memory"))))
+    {
+        if matches!(format, OutputFormat::Csv) {
+            return Err(mdkb::Error::other(
+                "canonical multi-root indexed search does not support csv",
+            ));
+        }
+        if req.search_contract.is_some() && !matches!(format, OutputFormat::Json) {
+            return Err(mdkb::Error::other(
+                "--search-contract v2 requires --format json",
+            ));
+        }
+        let result = mdkb::core::search_contract::search_indexed_roots(
+            &roots,
+            excluded,
+            req.scope.as_deref().unwrap_or_default(),
+            &req.query,
+            req.limit,
+            req.collection.as_deref(),
+            req.include_superseded,
+            req.entry_type.as_deref(),
+            None,
+            |root| open_reader(root).map_err(|error| error.to_string()),
+        );
+        if matches!(format, OutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            for hit in result["hits"].as_array().into_iter().flatten() {
+                println!("{}: {}", hit["repo"].as_str().unwrap_or("?"), hit["value"]);
+            }
+            println!(
+                "{} corpus: {}; freshness: unknown; truncated: {}",
+                req.scope.as_deref().unwrap_or_default(),
+                result["status"].as_str().unwrap_or("unavailable"),
+                result["truncated"].as_bool().unwrap_or(false)
+            );
+            for root in result["coverage"]["roots"].as_array().into_iter().flatten() {
+                println!(
+                    "{}: {}",
+                    root["root"].as_str().unwrap_or("?"),
+                    root["status"].as_str().unwrap_or("unavailable")
+                );
+            }
+        }
+        return Ok(());
+    }
     if several {
         let single_store_scope = req.scope.as_deref().is_some_and(|s| {
-            s == "coupling" || SearchScope::try_from(s).is_ok_and(|scope| !scope.fans_out())
+            matches!(s, "coupling" | "source" | "semantic-code")
+                || SearchScope::try_from(s).is_ok_and(|scope| !scope.fans_out())
         });
         if single_store_scope {
             return Err(mdkb::Error::other(format!(
@@ -2222,7 +2592,59 @@ async fn run_search_roots(
     Ok(())
 }
 
+fn print_indexed_search_envelope<T: serde::Serialize>(
+    scope: &str,
+    unit: &str,
+    hits: &[T],
+    limit: usize,
+    matched_count: usize,
+) -> mdkb::error::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&mdkb::core::search_contract::indexed_envelope(
+            scope,
+            unit,
+            hits,
+            limit,
+            matched_count
+        ))?
+    );
+    Ok(())
+}
+
+fn format_text_results(result: &mdkb::core::text_search::TextSearchResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(result).unwrap()),
+        OutputFormat::Csv => {
+            println!("file,line,column,content,enclosing_symbol");
+            for hit in &result.hits {
+                println!(
+                    "\"{}\",{},{},\"{}\",\"{}\"",
+                    hit.file.replace('"', "\"\""),
+                    hit.line,
+                    hit.column,
+                    hit.content.replace('"', "\"\""),
+                    hit.enclosing_symbol
+                        .as_deref()
+                        .unwrap_or("")
+                        .replace('"', "\"\"")
+                );
+            }
+        }
+        _ => print!("{}", mdkb::core::text_search::render(result)),
+    }
+}
+
 fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputFormat) {
+    if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        for result in results.iter().filter(|result| result.read_only) {
+            println!(
+                "[{}] read-only, source: {}",
+                result.id,
+                result.source.as_deref().unwrap_or("external")
+            );
+        }
+    }
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(results).unwrap());
@@ -2230,14 +2652,17 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
         OutputFormat::Csv => {
             println!("id,collection,path,title,score");
             for r in results {
-                println!(
-                    "{},{},{},{},{}",
-                    r.id,
-                    r.collection,
-                    r.path,
-                    r.title.as_deref().unwrap_or(""),
-                    r.score
-                );
+                let title = r.title.as_deref().unwrap_or("");
+                let title = if r.read_only {
+                    format!(
+                        "\"{}{}\"",
+                        title.replace('"', "\"\""),
+                        mdkb::store::external::label(&r.collection).replace('"', "\"\"")
+                    )
+                } else {
+                    title.to_string()
+                };
+                println!("{},{},{},{},{}", r.id, r.collection, r.path, title, r.score);
             }
         }
         OutputFormat::Markdown => {
@@ -2271,17 +2696,18 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
 }
 
 fn format_document(doc: &mdkb::domain::Document, content: &str, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            let output = serde_json::json!({
-                "document": doc,
-                "content": content,
-            });
-            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    if let OutputFormat::Json = format {
+        let output = serde_json::json!({
+            "document": doc,
+            "content": content,
+        });
+        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    } else {
+        let label = mdkb::store::external::label(&doc.collection);
+        if !label.is_empty() {
+            println!("{}\n", label.trim());
         }
-        _ => {
-            println!("{}", content);
-        }
+        println!("{}", content);
     }
 }
 
@@ -2833,6 +3259,10 @@ fn format_mget_results(results: &[(mdkb::domain::Document, String)], format: Out
             for (doc, content) in results {
                 let title = doc.title.as_deref().unwrap_or(&doc.relative_path);
                 println!("## {} ({})\n", title, doc.relative_path);
+                let label = mdkb::store::external::label(&doc.collection);
+                if !label.is_empty() {
+                    println!("{}", label.trim());
+                }
                 println!("{}\n", content);
                 println!("---\n");
             }
@@ -2845,6 +3275,10 @@ fn format_mget_results(results: &[(mdkb::domain::Document, String)], format: Out
                 for (doc, content) in results {
                     let title = doc.title.as_deref().unwrap_or("(untitled)");
                     println!("=== [{}] {} - {} ===", doc.id, doc.relative_path, title);
+                    let label = mdkb::store::external::label(&doc.collection);
+                    if !label.is_empty() {
+                        println!("{}", label.trim());
+                    }
                     println!("{}\n", content);
                 }
             }

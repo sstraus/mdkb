@@ -26,6 +26,7 @@ fn run_session_start(root: &Path, home: &Path) -> Output {
         .env("HOME", home)
         .env("MDKB_NO_SPAWN", "1")
         .env("MDKB_NO_DAEMON", "1")
+        .env("MDKB_HOOK_TELEMETRY", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -839,10 +839,9 @@ func outer_func():
     #[test]
     fn extends_by_script_path_records_nothing() {
         let mut parser = GdscriptParser::new().unwrap();
-        assert!(
-            parser
-                .find_extends("extends \"res://base.gd\"\nclass_name Player\n")
-                .is_empty()
+        assert_eq!(
+            parser.find_extends("extends \"res://base.gd\"\nclass_name Player\n"),
+            [] as [(&str, &str, crate::code::types::Range); 0]
         );
     }
 }

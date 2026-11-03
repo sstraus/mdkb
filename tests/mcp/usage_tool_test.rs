@@ -53,6 +53,11 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
 
     let _ = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: "usage".to_string(),
             root: None,
             limit: 5,

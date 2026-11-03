@@ -1,5 +1,158 @@
 # Changelog
 
+## 3.14.0 (2026-11-04)
+
+First public release since 3.12.1. It publishes the changes of 3.13.0 and
+3.13.1 below, which were not released separately.
+
+## 3.13.1 (2026-11-02)
+
+### Added
+
+- **Search current source and name every corpus.** New search scopes:
+  `source` reads current eligible files (identifiers and comments included,
+  `-e` for several patterns), `literals` searches indexed AST values,
+  `knowledge` searches documents and memory, and `semantic-code` replaces the
+  old `code` scope name. CLI `--search-contract v2` (with `--format json`) and
+  MCP `contract="v2"` return one envelope with a global limit and a coverage
+  status per root, so a partial scan or an index of unknown freshness never
+  reads as a clean no-match. Requests that do not name a contract keep their
+  old output. Requested by the maintainer (story 037-7237).
+
+### Changed
+
+- **License mdkb under Apache 2.0.** `LICENSE`, `NOTICE`, `Cargo.toml` and the
+  README now name the Apache License 2.0 instead of MIT, as in TUICommander and
+  ego (story 037-7237).
+
+- **Register ego through generic lifecycle hooks.** `mdkb setup hooks ego`
+  merges six hooks and exact execution allowances, removes the obsolete
+  `mdkb_prompt_command` key, and preserves unrelated TOML and config symlinks.
+  `mdkb setup remove hooks ego` removes the generated entries. Version-1 hook
+  output uses supported context events or lifecycle feedback. Requested by the
+  maintainer after ego removed its vendor-specific bridge (story 034-3190).
+
+### Fixed
+
+- **Name the Codex hooks that mdkb writes.** `mdkb setup hooks codex` now sets
+  `statusMessage` on each handler, so Codex `/hooks` lists `mdkb session-start`
+  and the other five events instead of "Unnamed hook". A reinstall relabels an
+  older install without duplicate entries. Codex then marks the changed hooks as
+  modified: trust them once in `/hooks`. Found by the maintainer in the Codex
+  0.166 hook browser (story 036-3921).
+
+- **Stop retrying session paths as repository documents.** Exclude session-source
+  collections from document watches. Discard out-of-root watcher paths before
+  retrying a failed batch, while indexing valid siblings and retaining transient
+  failures. Found by the maintainer after periodic multi-core daemon bursts
+  (story 035-8400).
+
+- **Wait for setup recovery in the watcher artifact-burst test.** Observe the
+  document phase completing before sampling reindex counters, instead of
+  assuming watcher readiness and a fixed delay drain native setup events.
+  Use a fresh watcher for the artifact burst so setup recovery cannot mask
+  overflow, and pause its consumer while native callbacks deliver the burst.
+  Found by the native batch gate (story 023-5c63).
+
+- **Keep scoped CLI search usable when the daemon repo list times out.** Use
+  the persisted `repos.json` map when the daemon query fails, with one stderr
+  note that the list can be stale. A daemon reply still takes precedence, and
+  an unreadable persisted map remains an error. Found by the maintainer during
+  a loaded-machine search (story 033-e2da).
+
+## 3.13.0 (2026-10-28)
+
+### Added
+
+- **Find UI labels and literal values in source.** Index bounded AST strings,
+  JSX text, and JSON values with file:line and enclosing-symbol context. Include
+  them in default CLI search, or select `--scope text` for fixed-string matching
+  and `--ignore-case` for Unicode lowercase matching. Report index age and use
+  the code index's existing ignore rules and refresh lifecycle. Requested by
+  the maintainer after a JSX label was absent from symbol search (story 031-2b1d).
+
+- **Index external documents without a filesystem mirror.** Owners push content
+  through `external.upsert`, `external.delete`, and `external.list` on the daemon
+  JSON-RPC socket. Keep monotonic revisions and deletion tombstones per root,
+  source, and owner ID. Search and get expose owner content as read-only, and
+  filesystem updates preserve it. Requested by the maintainer (story 030-9ce2).
+
+- **Expire inactive repository map entries.** Healthy, unpinned roots leave
+  the map after 30 days without an open. Set `repo_expiry_days` in `daemon.toml`
+  to change the limit, or `0` to turn it off. Keep configured roots,
+  hand-written scopes, unreadable stores, and all files on disk. Record activity
+  once per UTC day and show its date in CLI and MCP repo listings. CLI JSON
+  and daemon RPC repo rows include `last_opened_at` (UTC Unix seconds).
+  Reconcile newer activity from other live processes before expiry or writes;
+  the critic found a stale daemon could otherwise forget a recently opened repo.
+  Requested by
+  the maintainer (story 027-7177).
+
+- **Index Objective-C, shell, Ruby, SQL, and cgo definitions.** Discover `.m`,
+  `.sh`, `.bash`, `.rb`, and `.sql` sources. Detect Objective-C declarations in
+  `.h` files and preserve full method selectors. Keep embedded cgo definitions
+  at their original Go source lines. Use a SQLite grammar for SQL schema objects;
+  accept interpreter flags in script shebangs. Found when the maintainer could not find
+  McpMacControl overlay definitions in code search (story 025-6f46).
+
+- **CLI help guides agents through configuration.** The root and setup help
+  explain how to find settings, command flags, and full online references.
+  Requested by the maintainer (story 024-0773).
+
+### Changed
+
+- **Local release installs the stable binary.** `scripts/local-release.sh` now
+  installs the built executable in `~/.local/bin` before restarting the daemon.
+  Requested by the maintainer (story 024-0773).
+
+- **`mdkb setup hooks ego` says ego needs an exec allow rule.** ego runs the
+  registered command under its permission policy; without a rule such as
+  `--allow "exec(<mdkb> hook *)"` recall is silently absent. Setup now prints
+  that hint and `docs/hooks.md` documents it. Found while verifying story
+  020-bd65 against ego 0.1.2.
+
+### Fixed
+
+- **Hook logs are opt-in.** `hook-events.jsonl` and `hook-slow.jsonl` were
+  written by every hook run in every repo with no way to disable them. Measured
+  over 77 stores: 210,099 rows, 79% a pre/post tool hook that did nothing at a
+  median of 0 ms. They now need `[telemetry] hook_events = true` in the global
+  `~/.mdkb/daemon.toml` (or `MDKB_HOOK_TELEMETRY=1`); a repo's `config.toml`
+  cannot turn them on. A tool hook that did nothing is never logged, so its
+  `skipped` rows no longer count in `mdkb stats` invocations. `mdkb stats`
+  says "telemetry off" instead of showing zero counts, and its JSON gains
+  `hooks.telemetry_enabled`. Found by the maintainer when an agent UI showed a
+  diff of the file on every tool call (story 032-2a2a).
+
+- **Restore the Rust 1.99 Clippy gate.** Mark parser debug output as partial,
+  remove a redundant loop continuation, and use value-reporting emptiness
+  assertions in tests. Found by the rb lint gate (story 029-3231).
+
+- **Resolve repository paths in `--root`.** Select the nearest existing store
+  or known repo containing `.`, an explicit relative path (`./`, `../`, or `~/`),
+  or an absolute path. Bare names stay names even when a local directory matches.
+  Linked worktree paths select the main repository's store. Apply the same
+  rule to MCP root selectors, relative to the declared workspace. Report paths
+  with neither a store nor a known repo. Keep initialized stores outside Git
+  usable without registration; the full crate gate caught that regression.
+  Found when the maintainer used `--root .` (story 028-4844).
+
+- **Do not retry an absent collection forever after watcher recovery.** Report
+  the missing path once for the consumed recovery and keep processing valid
+  collections. Preserve registration and stored rows; delivered document events
+  resume indexing when the path returns. Found in maintainer daemon logs
+  (story 021-e01c).
+
+- **Check installed ego compatibility before registering prompt context.** Refuse
+  missing, incompatible or indeterminate startup parsers before changing user
+  configuration, including with `--force`. Found during maintainer installation
+  of 3.12.0 (story 020-bd65).
+
+- **Prevent recursive recall in prior-distiller children.** Set
+  `MDKB_DISTILLER_ACTIVE=1` on distiller subprocesses. This keeps
+  automatic context out of the background distillation prompt. Found during
+  maintainer investigation of recursive context injection (story 014-70ca).
+
 ## 3.12.1 (2026-10-22)
 
 ### Fixed

@@ -260,10 +260,19 @@ pub fn handle_update_force(
 /// runs the probe itself once it has released the store (the daemon watcher:
 /// see [`crate::core::run_mutation_verify_after_release`]).
 pub fn handle_update_unverified(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
-    run_document_update(ctx, root.as_ref(), false)
+    run_document_update_mode(ctx, root.as_ref(), false, true)
 }
 
 fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<UpdateResult> {
+    run_document_update_mode(ctx, root, force, false)
+}
+
+fn run_document_update_mode(
+    ctx: &Context,
+    root: &Path,
+    force: bool,
+    watcher: bool,
+) -> Result<UpdateResult> {
     let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, "update")?;
     crate::store::heal::invalidate_marker(&ctx.db_path);
 
@@ -297,13 +306,22 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
     // than the commit recorded for it, which reads as stale, never as fresh.
     let head = crate::git::head_commit(root);
 
+    let mut skipped_missing = false;
     with_transaction(&ctx.conn, || {
         // Inside the transaction: the sidecar snapshot is written only after a
         // successful run, so a prune that outlived a failed update would be
         // reported as a vanished collection by the next one.
         prune_vanished_convention_collections(ctx, root, &mut result)?;
         let collections = collections::list_collections(&ctx.conn)?;
-        update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
+        skipped_missing = update_all_collections(
+            ctx,
+            root,
+            &config,
+            &collections,
+            force,
+            &mut result,
+            watcher,
+        )?;
         // Frontmatter edges are rebuilt here, after every collection, rather
         // than per document: the allowlist lives in config and can change with
         // no file changing, and the per-document path skips a file whose mtime
@@ -338,7 +356,7 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
     // Whole-tree runs only: a targeted `--files` run does not make the tree
     // match HEAD. A run that reported errors leaves the previous record, which
     // is older and so can only understate freshness.
-    if result.errors.is_empty() {
+    if result.errors.is_empty() && !skipped_missing {
         if let Err(e) = crate::store::index_head::record(
             &ctx.conn,
             head.as_deref(),
@@ -627,11 +645,26 @@ fn update_all_collections(
     collections: &[Collection],
     force: bool,
     result: &mut UpdateResult,
-) -> Result<()> {
+    watcher: bool,
+) -> Result<bool> {
+    let mut skipped_missing = false;
     for coll in collections {
+        let base = root.join(&coll.path);
+        if watcher
+            && matches!(std::fs::metadata(&base), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        {
+            // A missing mount is not proof that stored documents were deleted.
+            // Keep registration and rows; delivered files resume indexing if it
+            // returns. Only this consumed recovery reports the absence: it must
+            // not retain the entire repository for another cooldown retry.
+            tracing::warn!(collection = %coll.name, path = %base.display(),
+                "Watcher collection path missing; dropped from retry work; delivered documents resume indexing when it returns");
+            skipped_missing = true;
+            continue;
+        }
         update_collection(ctx, root, config, coll, collections, force, result)?;
     }
-    Ok(())
+    Ok(skipped_missing)
 }
 
 /// A collection registered on a directory strictly inside `outer`'s, paired
@@ -692,6 +725,9 @@ fn update_collection(
     force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
+    if crate::store::external::source(&collection.name).is_some() {
+        return Ok(());
+    }
     let base_path = root.join(&collection.path);
 
     if !base_path.exists() {
@@ -896,6 +932,7 @@ fn run_files_update_mode(
     let matchers: Vec<(&Collection, globset::GlobMatcher, PathBuf)> = collections
         .iter()
         .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
+        .filter(|c| crate::store::external::source(&c.name).is_none())
         .filter_map(|coll| match compile_collection_matcher(&coll.pattern) {
             Ok(matcher) => match root.join(&coll.path).canonicalize() {
                 Ok(canonical_base) => Some((coll, matcher, canonical_base)),
@@ -1700,7 +1737,7 @@ mod housekeeping_tests {
         let path = Path::new("/nonexistent/housekeeping_warns_once/config.toml");
         let keys = || vec!["a.b".to_string(), "c".to_string()];
         assert_eq!(unwarned_keys(path, keys()), keys());
-        assert!(unwarned_keys(path, keys()).is_empty());
+        assert_eq!(unwarned_keys(path, keys()), [] as [String; 0]);
         // A new key on the same config still warns; the same key on another repo does too.
         assert_eq!(unwarned_keys(path, vec!["d".into()]), vec!["d".to_string()]);
         let other = Path::new("/nonexistent/housekeeping_warns_once_other/config.toml");

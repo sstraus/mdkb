@@ -118,7 +118,7 @@ fn a_healthy_update_reports_no_loss() {
 
     handle_update(&ctx, &root).expect("first update");
     let result = handle_update(&ctx, &root).expect("second update");
-    assert!(result.collections_vanished.is_empty());
+    assert_eq!(result.collections_vanished, [] as [String; 0]);
     assert!(!result.no_collections_registered);
 }
 
