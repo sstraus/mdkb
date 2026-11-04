@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{Debouncer, new_debouncer};
+use notify_debouncer_full::notify::event::{AccessKind, AccessMode, EventKind, ModifyKind};
+use notify_debouncer_full::notify::{Event, RecommendedWatcher, RecursiveMode};
+use notify_debouncer_full::{Debouncer, NoCache, new_debouncer_opt};
 use tokio::sync::mpsc;
 
 use crate::error::{ErrorKind, Result};
@@ -32,10 +33,64 @@ pub struct FileChange {
 /// Kind of file change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeKind {
-    /// File created or modified.
-    CreateOrModify,
-    /// File removed.
+    /// Created, renamed, a rescan request, or a kind the platform did not name.
+    CreateOrRename,
+    /// Data, metadata or access of an existing path. On a directory, Windows
+    /// reports this for every write to a child, and the child arrives as its
+    /// own event: it never names new subtree content.
+    Contents,
+    /// Removed.
     Remove,
+}
+
+impl ChangeKind {
+    /// `None` for an access that changes nothing. inotify reports every open,
+    /// so a read (the indexer's own included) would otherwise schedule a
+    /// reindex of the file it just read.
+    fn of(event: &Event) -> Option<Self> {
+        if event.need_rescan() {
+            return Some(Self::CreateOrRename);
+        }
+        Some(match event.kind {
+            EventKind::Remove(_) => Self::Remove,
+            EventKind::Access(AccessKind::Close(AccessMode::Write))
+            | EventKind::Modify(ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_)) => {
+                Self::Contents
+            }
+            EventKind::Access(_) => return None,
+            _ => Self::CreateOrRename,
+        })
+    }
+}
+
+/// One change per path for a debouncer batch, in first-seen order. The
+/// debouncer keeps one event per kind for a path (inotify: Create and
+/// Close(Write) for a new file); delivering each would spend several channel
+/// slots per file and overflow it on bursts that fit. Any kind other than
+/// `Contents` wins, so a created directory is never mistaken for a child write.
+fn changes_of(events: impl IntoIterator<Item = Event>) -> Vec<FileChange> {
+    let mut changes: Vec<FileChange> = Vec::new();
+    let mut index = std::collections::HashMap::new();
+    for event in events {
+        let Some(kind) = ChangeKind::of(&event) else {
+            continue;
+        };
+        for path in event.paths {
+            match index.get(&path) {
+                Some(&i) => {
+                    let change: &mut FileChange = &mut changes[i];
+                    if kind != ChangeKind::Contents {
+                        change.kind = kind;
+                    }
+                }
+                None => {
+                    index.insert(path.clone(), changes.len());
+                    changes.push(FileChange { path, kind });
+                }
+            }
+        }
+    }
+    changes
 }
 
 /// Configuration for the file watcher.
@@ -53,8 +108,9 @@ impl Default for WatcherConfig {
 
 /// File watcher that monitors paths and emits change events.
 pub struct FileWatcher {
-    /// The underlying debounced watcher.
-    _debouncer: Debouncer<RecommendedWatcher>,
+    /// The underlying debounced watcher. No file-ID cache: it would walk the
+    /// whole watched tree at startup, and only renames across paths use it.
+    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
     /// Channel receiver for events.
     receiver: mpsc::Receiver<FileChange>,
     #[cfg(test)]
@@ -89,24 +145,24 @@ impl FileWatcher {
         let filter = Arc::new(OnceLock::new());
         let filter_for_closure: Arc<OnceLock<PathFilter>> = Arc::clone(&filter);
         let mut last_warn: Option<std::time::Instant> = None;
-        let debouncer = new_debouncer(
+        let debouncer = new_debouncer_opt(
             Duration::from_millis(config.debounce_ms),
-            move |result: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
+            None,
+            move |result: notify_debouncer_full::DebounceEventResult| {
                 if let Ok(events) = result {
-                    for event in events {
+                    for change in changes_of(events.into_iter().map(|e| e.event)) {
                         deliver_change(
                             &tx,
                             &missed_for_closure,
                             &filter_for_closure,
                             &mut last_warn,
-                            FileChange {
-                                path: event.path,
-                                kind: ChangeKind::CreateOrModify,
-                            },
+                            change,
                         );
                     }
                 }
             },
+            NoCache,
+            notify_debouncer_full::notify::Config::default(),
         )
         .map_err(|e| ErrorKind::Watcher(format!("Failed to create watcher: {e}")))?;
 
@@ -130,7 +186,7 @@ impl FileWatcher {
             &mut None,
             FileChange {
                 path,
-                kind: ChangeKind::CreateOrModify,
+                kind: ChangeKind::CreateOrRename,
             },
         );
     }
@@ -160,20 +216,16 @@ impl FileWatcher {
     /// Watch a path for changes.
     pub fn watch(&mut self, path: &PathBuf) -> Result<()> {
         self._debouncer
-            .watcher()
-            .watch(path.as_ref(), RecursiveMode::Recursive)
+            .watch(path, RecursiveMode::Recursive)
             .map_err(|e| ErrorKind::Watcher(format!("Failed to watch {}: {e}", path.display())))?;
         Ok(())
     }
 
     /// Stop watching a path.
     pub fn unwatch(&mut self, path: &PathBuf) -> Result<()> {
-        self._debouncer
-            .watcher()
-            .unwatch(path.as_ref())
-            .map_err(|e| {
-                ErrorKind::Watcher(format!("Failed to unwatch {}: {e}", path.display()))
-            })?;
+        self._debouncer.unwatch(path).map_err(|e| {
+            ErrorKind::Watcher(format!("Failed to unwatch {}: {e}", path.display()))
+        })?;
         Ok(())
     }
 
@@ -191,6 +243,12 @@ fn deliver_change(
     last_warn: &mut Option<std::time::Instant>,
     change: FileChange,
 ) {
+    // A contents notification on a directory reports a child write (Windows),
+    // and the child is delivered as its own event. Admitted, it would read as a
+    // new subtree and force a full rescan for every build into the directory.
+    if change.kind == ChangeKind::Contents && change.path.is_dir() {
+        return;
+    }
     if filter.get().is_some_and(|keep| !keep(&change.path)) {
         return;
     }
@@ -364,7 +422,7 @@ mod tests {
                 &mut last_warn,
                 FileChange {
                     path: PathBuf::from(format!("target/debug/f{i}.o")),
-                    kind: ChangeKind::CreateOrModify,
+                    kind: ChangeKind::CreateOrRename,
                 },
             );
         }
@@ -376,7 +434,7 @@ mod tests {
             &mut last_warn,
             FileChange {
                 path: src.clone(),
-                kind: ChangeKind::CreateOrModify,
+                kind: ChangeKind::CreateOrRename,
             },
         );
         let seen = timeout(Duration::from_secs(10), async {
@@ -468,5 +526,108 @@ mod tests {
             matches!(seen, Ok(true)),
             "old source path must be delivered"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_routed_burst_below_channel_capacity_does_not_force_a_rescan() {
+        // Catches (039-6a38): the debouncer keeps one event per kind for a path
+        // (inotify: Create and Close(Write) for each new file), and the
+        // callback delivers each of them, so every written file takes several
+        // of the 100 channel slots and 80 routed files force the full rescan
+        // that a drop schedules.
+        let temp = setup_temp_dir();
+        let mut watcher =
+            FileWatcher::new(WatcherConfig { debounce_ms: 50 }).expect("watcher creation");
+        watcher.set_filter(|p| p.extension().is_some_and(|e| e == "rs"));
+        watcher
+            .watch(&temp.path().to_path_buf())
+            .expect("watch should succeed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Consumer is "mid-flush": nothing is received while the burst lands.
+        for i in 0..80 {
+            fs::write(temp.path().join(format!("f{i}.rs")), "x").expect("write");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let missed = watcher.take_missed_events();
+        let mut delivered = Vec::new();
+        while let Ok(change) = watcher.receiver.try_recv() {
+            delivered.push(change);
+        }
+        let paths: std::collections::HashSet<_> = delivered.iter().map(|c| &c.path).collect();
+        assert!(
+            !missed,
+            "80 routed files fit a 100-slot channel when each path is delivered once; \
+             queued {} changes for {} paths: {:?}",
+            delivered.len(),
+            paths.len(),
+            delivered.iter().take(4).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_batch_keeps_a_directory_create_over_its_later_child_write() {
+        // Catches: merging a batch by "last kind wins". Windows reports a new
+        // directory as Create then Modify(Any) when children land in the same
+        // window; kept as Contents, the create would be dropped as a child
+        // write and the subtree never discovered (021-e01c).
+        let dir = PathBuf::from("new-dir");
+        let file = PathBuf::from("lib.rs");
+        let event = |kind, path: &PathBuf| Event::new(kind).add_path(path.clone());
+        let modify_any = EventKind::Modify(ModifyKind::Any);
+        let created = EventKind::Create(notify_debouncer_full::notify::event::CreateKind::Any);
+        let changes = changes_of([
+            event(created, &dir),
+            event(modify_any, &file),
+            event(modify_any, &dir),
+            event(modify_any, &file),
+        ]);
+        let kinds: Vec<_> = changes.iter().map(|c| (c.path.clone(), c.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                (dir, ChangeKind::CreateOrRename),
+                (file, ChangeKind::Contents)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_child_write_reported_on_its_directory_is_not_delivered() {
+        // Catches (039-6a38): Windows reports `Modify(Any)` on a directory for
+        // every child write; delivered, it reads as a new subtree and forces a
+        // full rescan per build. A create, rename or rescan request on the
+        // same directory, and a write to a file, must still be delivered. An
+        // open (inotify reports the indexer's own reads) is not a change.
+        use notify_debouncer_full::notify::event::{CreateKind, Flag, RenameMode};
+        let temp = setup_temp_dir();
+        let dir = temp.path().join("build-output");
+        fs::create_dir(&dir).expect("dir");
+        let file = temp.path().join("lib.rs");
+        fs::write(&file, "fn a() {}").expect("file");
+        let event = |kind, path: &PathBuf| Event::new(kind).add_path(path.clone());
+        let modify_any = EventKind::Modify(ModifyKind::Any);
+        let created = EventKind::Create(CreateKind::Any);
+        let renamed = EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        let written = EventKind::Access(AccessKind::Close(AccessMode::Write));
+        let opened = EventKind::Access(AccessKind::Open(AccessMode::Any));
+        let cases = [
+            (event(modify_any, &dir), false),
+            (event(created, &dir), true),
+            (event(renamed, &dir), true),
+            (event(modify_any, &dir).set_flag(Flag::Rescan), true),
+            (event(modify_any, &file), true),
+            (event(written, &file), true),
+            (event(opened, &file), false),
+        ];
+        let (tx, mut rx) = mpsc::channel(10);
+        let (missed, filter) = (AtomicBool::new(false), OnceLock::new());
+        for (event, delivered) in cases {
+            if let Some(kind) = ChangeKind::of(&event) {
+                let path = event.paths[0].clone();
+                deliver_change(&tx, &missed, &filter, &mut None, FileChange { path, kind });
+            }
+            assert_eq!(rx.try_recv().is_ok(), delivered, "{event:?}");
+        }
     }
 }
