@@ -35,6 +35,49 @@ use mdkb::store::memory::{self, EntryStatus};
 /// not make a global counter a statement about a particular store.
 static WATCHER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Thread-local capture of mdkb tracing output, so a failing watcher test can
+/// print the delivered paths and the flush that counted as a reindex.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLog {
+    /// Install for the current thread. A `current_thread` runtime polls the
+    /// spawned watcher on this thread, so its events are captured too.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("mdkb=debug"))
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    fn since(&self, offset: usize) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()[offset..]).into_owned()
+    }
+}
+
 /// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.
 fn canonical_tempdir() -> TempDir {
     let base = std::env::temp_dir()
@@ -901,6 +944,8 @@ async fn stats_reports_a_fresh_code_index_after_an_editing_session() {
 #[tokio::test(flavor = "current_thread")]
 async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     let _serial = WATCHER_TESTS.lock().await;
+    let log = CapturedLog::default();
+    let _log_guard = log.install();
     let tmp = canonical_tempdir();
     let root = tmp.path().to_path_buf();
 
@@ -984,6 +1029,7 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
         .expect("burst watcher ready");
     let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
     let docs_before = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
+    let log_before = log.len();
 
     // Six times the channel: unfiltered, the tail would be dropped (measured
     // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls).
@@ -1004,7 +1050,9 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
         CODE_REINDEX_COUNT.load(Ordering::Relaxed),
         code_before,
         "a burst of unrouted files scheduled a reindex: the delivery filter is \
-         not installed, so the channel overflowed and forced a full rescan"
+         not installed, so the channel overflowed and forced a full rescan.\n\
+         Watcher log after the burst baseline:\n{}",
+        log.since(log_before)
     );
 
     assert_eq!(
