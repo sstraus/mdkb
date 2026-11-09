@@ -62,7 +62,7 @@ fn fresh_settings_gets_three_managed_hook_entries() {
         .expect("setup hooks ok");
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());
-    assert!(result.events_skipped.is_empty());
+    assert_eq!(result.events_skipped, [] as [String; 0]);
     assert!(!result.dry_run);
 
     let path = local_settings_path(project.path());
@@ -192,8 +192,14 @@ fn disable_skips_named_events() {
     assert!(result.events_skipped.contains(&"PostToolUse".to_string()));
 
     let v = read_json(&local_settings_path(project.path()));
-    assert!(mdkb_entries(&v, "SessionStart").is_empty());
-    assert!(mdkb_entries(&v, "PostToolUse").is_empty());
+    assert_eq!(
+        mdkb_entries(&v, "SessionStart"),
+        [] as [&serde_json::Value; 0]
+    );
+    assert_eq!(
+        mdkb_entries(&v, "PostToolUse"),
+        [] as [&serde_json::Value; 0]
+    );
     assert_eq!(mdkb_entries(&v, "UserPromptSubmit").len(), 1);
     assert_eq!(mdkb_entries(&v, "PreToolUse").len(), 1);
     assert_eq!(mdkb_entries(&v, "PostToolUseFailure").len(), 1);
@@ -614,7 +620,7 @@ fn check_hooks_reports_the_missing_stop_entry() {
     assert_eq!(check.user_path, private.join("settings.json"));
     assert_eq!(check.local_path, local_settings_path(project.path()));
     assert_eq!(check.drift.missing, vec!["PostToolUseFailure", "Stop"]);
-    assert!(check.drift.duplicated.is_empty());
+    assert_eq!(check.drift.duplicated, [] as [String; 0]);
     assert!(!check.drift.is_clean());
 
     // Setup closes the gap, and the check then passes against the same file.

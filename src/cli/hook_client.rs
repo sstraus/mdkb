@@ -309,7 +309,7 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     .await
     {
         Ok(response) => {
-            emit_hook_response(&response);
+            emit_hook_response(&hook_response_for_request(&params, &response));
             Ok(())
         }
         // The request provably never ran in the daemon. Falling back here keeps
@@ -442,8 +442,38 @@ async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: imp
 /// In-process fallback for lifecycle hooks: the raw envelope goes to stdout
 /// through `emit_hook_response`.
 async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
-    dispatch_in_process(method, params, root, emit_hook_response).await;
+    let request = params.clone();
+    dispatch_in_process(method, params, root, |result| {
+        emit_hook_response(&hook_response_for_request(&request, result));
+    })
+    .await;
     Ok(())
+}
+
+/// Version-1 generic hosts use a closed output schema. Only three events admit
+/// model context; other lifecycle observations use non-authoritative feedback.
+/// Daemon bookkeeping (such as `queued`) is not part of that wire contract.
+fn hook_response_for_request(request: &Value, result: &Value) -> Value {
+    if request.get("version").and_then(Value::as_u64) != Some(1) {
+        return result.clone();
+    }
+    let Some(context) = result.get("hookSpecificOutput") else {
+        return json!({});
+    };
+    let event = request.get("hook_event_name").and_then(Value::as_str);
+    if context.get("hookEventName").and_then(Value::as_str) != event {
+        return json!({});
+    }
+    if matches!(
+        event,
+        Some("SessionStart" | "UserPromptSubmit" | "PostToolUse")
+    ) {
+        json!({ "hookSpecificOutput": context })
+    } else if let Some(text) = context.get("additionalContext").and_then(Value::as_str) {
+        json!({ "version": 1, "decision": "continue", "feedback": text })
+    } else {
+        json!({})
+    }
 }
 
 /// Write the hook result envelope to stdout when it contains output.
@@ -1169,6 +1199,43 @@ mod tests {
             path.display()
         );
         assert!(path.to_string_lossy().contains(".mdkb"));
+    }
+
+    // Catches: the daemon route leaks bookkeeping or mislabels tool failures,
+    // while fixing generic output accidentally changes Claude/Codex output.
+    #[test]
+    fn versioned_hook_response_keeps_context_and_feedback_contracts_separate() {
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PostToolUse",
+            "PreToolUse",
+            "PostToolUseFailure",
+        ] {
+            let result = json!({"queued": true, "hookSpecificOutput": {
+                "hookEventName": event, "additionalContext": "observed guidance"
+            }});
+            assert_eq!(hook_response_for_request(&json!({}), &result), result);
+            let output = hook_response_for_request(
+                &json!({"version": 1, "hook_event_name": event}),
+                &result,
+            );
+            if matches!(event, "SessionStart" | "UserPromptSubmit" | "PostToolUse") {
+                assert_eq!(
+                    output,
+                    json!({"hookSpecificOutput": result["hookSpecificOutput"]})
+                );
+            } else {
+                assert_eq!(
+                    output,
+                    json!({"version": 1, "decision": "continue", "feedback": "observed guidance"})
+                );
+            }
+        }
+        assert_eq!(
+            hook_response_for_request(&json!({"version": 1}), &json!({"queued": true})),
+            json!({})
+        );
     }
 
     // ── emit_hook_response ────────────────────────────────────────────────────

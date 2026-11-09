@@ -250,9 +250,7 @@ fn silencing_one_of_two_same_named_repos_makes_the_bare_name_resolve() {
     assert_eq!(resolved.roots, vec![real]);
 }
 
-/// Catches: the ignore list overriding an explicit absolute path. A path is
-/// "one repo by path; need not be a known repo" — silencing is about discovery,
-/// not about refusing a caller who names the store.
+/// Catches: discovery exclusions blocking an explicitly selected existing store.
 #[test]
 fn an_ignored_store_is_still_reachable_by_its_absolute_path() {
     let state = tempfile::tempdir().unwrap();
@@ -263,9 +261,8 @@ fn an_ignored_store_is_still_reachable_by_its_absolute_path() {
         vec![silenced.to_string_lossy().to_string()],
     ));
 
-    let resolved =
-        resolve_root_selector(&registry, Some(&silenced.to_string_lossy()), &[]).expect("path");
-
+    let resolved = resolve_root_selector(&registry, Some(&silenced.to_string_lossy()), &[])
+        .expect("an explicit path selects an existing store without discovery");
     assert_eq!(resolved.roots, vec![silenced]);
 }
 

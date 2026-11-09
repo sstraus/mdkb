@@ -270,7 +270,7 @@ mod tests {
         let fps = [fp(1, 0, None), fp(2, 0b1111, None)];
 
         assert_eq!(cluster(&fps, 4, &no_calls()), vec![vec![0, 1]]);
-        assert!(cluster(&fps, 3, &no_calls()).is_empty());
+        assert_eq!(cluster(&fps, 3, &no_calls()), [] as [Vec<usize>; 0]);
     }
 
     #[test]
@@ -436,12 +436,12 @@ mod tests {
     fn a_lone_candidate_is_not_a_finding() {
         let fps = [fp(1, 0, None)];
 
-        assert!(cluster(&fps, 12, &no_calls()).is_empty());
+        assert_eq!(cluster(&fps, 12, &no_calls()), [] as [Vec<usize>; 0]);
     }
 
     #[test]
     fn no_candidates_is_no_clusters_not_a_panic() {
-        assert!(cluster(&[], 12, &no_calls()).is_empty());
+        assert_eq!(cluster(&[], 12, &no_calls()), [] as [Vec<usize>; 0]);
     }
 
     #[test]
@@ -460,14 +460,14 @@ mod tests {
         let fps = [fp(9, 0b1010, None), fp(5, 0b1010, None)];
         let calls = HashSet::from([(5i64, 9i64)]);
 
-        assert!(cluster(&fps, 12, &calls).is_empty());
+        assert_eq!(cluster(&fps, 12, &calls), [] as [Vec<usize>; 0]);
     }
 
     #[test]
     fn two_methods_of_the_same_type_are_suppressed() {
         let fps = [fp(1, 0b1010, Some("Store")), fp(2, 0b1010, Some("Store"))];
 
-        assert!(cluster(&fps, 12, &no_calls()).is_empty());
+        assert_eq!(cluster(&fps, 12, &no_calls()), [] as [Vec<usize>; 0]);
     }
 
     #[test]

@@ -1462,7 +1462,16 @@ impl LanguageParser for GoParser {
     }
 
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
-        self.parse_symbols(code, file_id, counter)
+        let mut symbols = self.parse_symbols(code, file_id, counter);
+        if let Some(tree) = self.parser.parse_cached(code) {
+            symbols.extend(super::cgo::symbols(
+                tree.root_node(),
+                code,
+                file_id,
+                counter,
+            ));
+        }
+        symbols
     }
 
     fn tree(&mut self, code: &str) -> Option<tree_sitter::Tree> {
@@ -1841,8 +1850,8 @@ type privateStruct struct {
             .filter(|s| s.visibility == Visibility::Package)
             .collect();
 
-        assert!(!exported.is_empty());
-        assert!(!unexported.is_empty());
+        assert_ne!(exported, [] as [&crate::code::symbol::Symbol; 0]);
+        assert_ne!(unexported, [] as [&crate::code::symbol::Symbol; 0]);
 
         assert!(
             symbols

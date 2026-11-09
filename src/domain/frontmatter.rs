@@ -388,8 +388,11 @@ mod tests {
     #[test]
     fn test_extract_relation_refs_missing_key() {
         let parsed = parse_frontmatter("---\nowner: alice\n---\nbody");
-        assert!(extract_relation_refs(parsed.frontmatter.as_ref(), "themes").is_empty());
-        assert!(extract_relation_refs(None, "owner").is_empty());
+        assert_eq!(
+            extract_relation_refs(parsed.frontmatter.as_ref(), "themes"),
+            [] as [String; 0]
+        );
+        assert_eq!(extract_relation_refs(None, "owner"), [] as [String; 0]);
     }
 
     #[test]
@@ -515,13 +518,13 @@ This has --- dashes in the body.
     fn test_extract_tags_missing() {
         let fm: Value = serde_json::json!({"title": "No tags"});
         let tags = extract_tags(Some(&fm));
-        assert!(tags.is_empty());
+        assert_eq!(tags, [] as [String; 0]);
     }
 
     #[test]
     fn test_extract_tags_none() {
         let tags = extract_tags(None);
-        assert!(tags.is_empty());
+        assert_eq!(tags, [] as [String; 0]);
     }
 
     #[test]

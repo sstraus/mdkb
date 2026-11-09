@@ -24,19 +24,57 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use super::config::RepoEntry;
+use super::config::{DaemonConfig, RepoEntry};
 
 /// On-disk format of `repos.json`. Bumped when the shape changes; an unknown
 /// version is read anyway (the payload is a list of paths) but reported, so an
 /// older binary reading a newer file says so instead of failing silently.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// The serialized map. `repos` reuses [`RepoEntry`] so the state file and the
-/// `[[repos]]` blocks of `daemon.toml` describe a root the same way.
+const DAY_SECS: i64 = 86_400;
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// The serialized map extends [`RepoEntry`] with daemon-owned activity metadata.
 #[derive(Debug, Serialize, Deserialize)]
 struct RepoMapFile {
     version: u32,
-    repos: Vec<RepoEntry>,
+    repos: Vec<MapEntry>,
+}
+
+/// Additive v2 metadata: v1 binaries can still deserialize every root and scope.
+#[derive(Debug, Serialize, Deserialize)]
+struct MapEntry {
+    #[serde(flatten)]
+    repo: RepoEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_opened_at: Option<i64>,
+}
+
+/// Remove only healthy, unpinned roots whose inactivity exceeds the limit.
+fn expire(
+    roots: &mut BTreeMap<PathBuf, i64>,
+    pinned: &BTreeSet<PathBuf>,
+    expiry_days: u64,
+    at: i64,
+) -> bool {
+    let before = roots.len();
+    if expiry_days > 0 {
+        roots.retain(|root, last| {
+            let expired = at.saturating_sub(*last) >
+                i64::try_from(expiry_days).unwrap_or(i64::MAX).saturating_mul(DAY_SECS);
+            if expired && !pinned.contains(root) && classify(root) == RootHealth::Healthy {
+                tracing::info!(root = %root.display(), reason = "inactivity exceeded repo_expiry_days",
+                    last_opened_at = *last, expiry_days, "Dropped repo from the map");
+                false
+            } else {
+                true
+            }
+        });
+    }
+    before != roots.len()
 }
 
 /// What a known root looks like on disk right now.
@@ -229,10 +267,31 @@ pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
 /// the map's own load it never moves a file aside — only the writer may.
 pub fn try_read_known_roots(path: &Path) -> Result<Vec<PathBuf>, String> {
     let read = parse_file(path).map_err(|e| e.to_string())?;
-    Ok(triage(canonical_set(&read.roots))
+    let config_path = path.with_file_name("daemon.toml");
+    let config = DaemonConfig::load_or_default(&config_path).map_err(|e| e.to_string())?;
+    let mut pinned: BTreeSet<_> = config
+        .repos
+        .iter()
+        .map(|r| canonical_key(Path::new(&r.root)))
+        .collect();
+    pinned.extend(try_read_scope_overrides(path)?.into_keys());
+    let mut roots: BTreeMap<_, _> = triage(canonical_set(&read.roots))
         .kept
         .into_iter()
-        .collect())
+        .map(|root| {
+            let at = read.last_opened.get(&root).copied().unwrap_or_else(now);
+            (root, at)
+        })
+        .collect();
+    expire(&mut roots, &pinned, config.repo_expiry_days, now());
+    Ok(roots.into_keys().collect())
+}
+
+/// Persisted activity for text listings; missing legacy dates remain unknown.
+pub fn read_last_opened(path: &Path) -> Result<BTreeMap<PathBuf, i64>, String> {
+    parse_file(path)
+        .map(|read| read.last_opened)
+        .map_err(|e| e.to_string())
 }
 
 /// The spelling every root is stored under (see [`canonical_key`]): one repo,
@@ -317,7 +376,12 @@ pub fn try_read_scope_overrides(path: &Path) -> Result<BTreeMap<PathBuf, String>
     Ok(file
         .repos
         .into_iter()
-        .filter_map(|r| Some((canonical_key(Path::new(&r.root)), clean_scope(&r.scope?)?)))
+        .filter_map(|r| {
+            Some((
+                canonical_key(Path::new(&r.repo.root)),
+                clean_scope(&r.repo.scope?)?,
+            ))
+        })
         .collect())
 }
 
@@ -334,7 +398,9 @@ pub struct RepoMap {
     path: Option<PathBuf>,
     /// Held across the file write so two recorders cannot interleave a set with
     /// a rename and persist a map that never existed in memory.
-    roots: Mutex<BTreeSet<PathBuf>>,
+    roots: Mutex<BTreeMap<PathBuf, i64>>,
+    pinned: BTreeSet<PathBuf>,
+    expiry_days: u64,
     /// May this process overwrite what is on disk?
     ///
     /// False when the file exists and could not be understood. Re-discovery is
@@ -364,10 +430,20 @@ impl RepoMap {
     /// A seed that no longer exists is dropped from the map but stays in
     /// `daemon.toml`, which this never rewrites: the operator's list is theirs.
     pub fn open(path: Option<PathBuf>, seeds: &[RepoEntry]) -> Self {
+        Self::open_with_expiry(path, seeds, DaemonConfig::default().repo_expiry_days)
+    }
+
+    /// Load with the configured inactivity limit; zero disables age-based expiry.
+    pub fn open_with_expiry(path: Option<PathBuf>, seeds: &[RepoEntry], expiry_days: u64) -> Self {
+        Self::open_at(path, seeds, expiry_days, now())
+    }
+
+    fn open_at(path: Option<PathBuf>, seeds: &[RepoEntry], expiry_days: u64, at: i64) -> Self {
         let read = match &path {
             Some(p) => read_file(p),
             None => MapRead {
                 roots: BTreeSet::new(),
+                last_opened: BTreeMap::new(),
                 replaceable: true,
             },
         };
@@ -410,35 +486,65 @@ impl RepoMap {
             .iter()
             .any(|(root, _)| !declared.contains_key(root));
 
+        let pinned: BTreeSet<_> = seeds
+            .iter()
+            .map(|seed| canonical_key(Path::new(&seed.root)))
+            .collect();
+        let mut protected = pinned.clone();
+        protected.extend(declared.into_keys());
+        let migrated = triaged
+            .kept
+            .iter()
+            .any(|r| !read.last_opened.contains_key(r));
+        let mut roots: BTreeMap<_, _> = triaged
+            .kept
+            .into_iter()
+            .map(|root| {
+                let last = read.last_opened.get(&root).copied().unwrap_or(at);
+                (root, last)
+            })
+            .collect();
+        let expired = expire(&mut roots, &protected, expiry_days, at);
         let map = Self {
             path,
-            roots: Mutex::new(triaged.kept),
+            roots: Mutex::new(roots),
+            pinned,
+            expiry_days,
             replaceable: read.replaceable,
             dirty: std::sync::atomic::AtomicBool::new(false),
         };
         // Persist only when the set on disk is not the set in hand: every CLI
         // hook builds a registry, and rewriting an unchanged map on each one
         // would rename a file per hook for nothing.
-        let changed = normalized || seeded != before || dropped_for_good;
+        let changed = normalized || seeded != before || dropped_for_good || migrated || expired;
         if changed {
-            let roots = map.roots.lock().unwrap_or_else(|e| e.into_inner());
-            map.persist(&roots);
+            let mut roots = map.roots.lock().unwrap_or_else(|e| e.into_inner());
+            map.persist(&mut roots);
         }
         map
     }
 
-    /// Record a root the registry has just opened. Idempotent: a root already
-    /// on the map costs no write, unless an earlier write was skipped or failed
-    /// and the file still lags the set.
+    /// Record a successful access, including an already-live registry handle.
+    /// Persist at most once per UTC day per root, unless a failed write needs
+    /// retrying. Same-day access can therefore lag by less than 24 hours.
     pub fn record(&self, root: &Path) {
+        self.record_at(root, now());
+    }
+
+    fn record_at(&self, root: &Path, at: i64) {
         let key = canonical_key(root);
         let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
-        if roots.insert(key.clone()) {
-            tracing::info!(root = %key.display(), "Recorded repo on the map");
+        let last = roots.get(&key).copied();
+        let changed = last.is_none_or(|last| at.div_euclid(DAY_SECS) > last.div_euclid(DAY_SECS));
+        if changed {
+            roots.insert(key.clone(), at);
+            if last.is_none() {
+                tracing::info!(root = %key.display(), "Recorded repo on the map");
+            }
         } else if !self.dirty.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
-        self.persist(&roots);
+        self.persist(&mut roots);
     }
 
     /// Is this root known?
@@ -446,23 +552,60 @@ impl RepoMap {
         self.roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(&canonical_key(root))
+            .contains_key(&canonical_key(root))
     }
 
     /// Every known root, sorted.
     pub fn roots(&self) -> Vec<PathBuf> {
-        self.roots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .cloned()
-            .collect()
+        self.roots_at(now())
+    }
+
+    fn roots_at(&self, at: i64) -> Vec<PathBuf> {
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        // A hook can refresh activity after this daemon loaded its snapshot.
+        if self.merge_persisted_activity(&mut roots).is_err() {
+            return roots.keys().cloned().collect();
+        }
+        let mut pinned = self.pinned.clone();
+        if let Some(path) = &self.path {
+            match try_read_scope_overrides(path) {
+                Ok(scopes) => pinned.extend(scopes.into_keys()),
+                // A hand edit in progress is not permission to expire its entries.
+                Err(_) => return roots.keys().cloned().collect(),
+            }
+        }
+        if expire(&mut roots, &pinned, self.expiry_days, at) {
+            self.persist(&mut roots);
+        }
+        roots.keys().cloned().collect()
+    }
+
+    /// Snapshot activity after reconciling successful opens from other processes.
+    pub(super) fn last_opened(&self) -> BTreeMap<PathBuf, i64> {
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(why) = self.merge_persisted_activity(&mut roots) {
+            tracing::warn!("Reading repo activity failed: {why}");
+        }
+        roots.clone()
+    }
+
+    /// Merge activity for retained roots without restoring an expired root.
+    fn merge_persisted_activity(&self, roots: &mut BTreeMap<PathBuf, i64>) -> Result<(), String> {
+        if let Some(path) = &self.path {
+            let opened = read_last_opened(path)?;
+            for (root, last) in roots {
+                if let Some(persisted) = opened.get(root) {
+                    *last = (*last).max(*persisted);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Write the whole set, atomically. A failure is reported and swallowed:
     /// losing the map costs a re-discovery, failing the open that triggered it
     /// costs the caller their tool call.
-    fn persist(&self, roots: &BTreeSet<PathBuf>) {
+    fn persist(&self, roots: &mut BTreeMap<PathBuf, i64>) {
         let Some(path) = &self.path else {
             return;
         };
@@ -489,6 +632,12 @@ impl RepoMap {
                 return;
             }
         };
+        // Never roll back another live map's activity in a whole-map write.
+        if let Err(why) = self.merge_persisted_activity(roots) {
+            tracing::warn!(path = %path.display(), "Not persisting repo activity: {why}");
+            self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let failed = write_atomic(path, roots, &scopes).map_err(|e| {
             tracing::warn!(
                 path = %path.display(),
@@ -509,6 +658,7 @@ impl RepoMap {
 /// which for a daemon that just started is nothing at all.
 struct MapRead {
     roots: BTreeSet<PathBuf>,
+    last_opened: BTreeMap<PathBuf, i64>,
     /// False when the file exists but could not be read, parsed, or is newer
     /// than this binary understands.
     replaceable: bool,
@@ -537,6 +687,7 @@ fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(MapRead {
                 roots: BTreeSet::new(),
+                last_opened: BTreeMap::new(),
                 replaceable: true,
             });
         }
@@ -544,10 +695,20 @@ fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
     };
     let file = serde_json::from_str::<RepoMapFile>(&content)
         .map_err(|e| Unreadable::Parse(e.to_string()))?;
+    let mut last_opened: BTreeMap<PathBuf, i64> = BTreeMap::new();
+    for entry in &file.repos {
+        if let Some(at) = entry.last_opened_at {
+            let key = canonical_key(Path::new(&entry.repo.root));
+            last_opened
+                .entry(key)
+                .and_modify(|last| *last = (*last).max(at))
+                .or_insert(at);
+        }
+    }
     let roots = file
         .repos
         .into_iter()
-        .map(|r| PathBuf::from(r.root))
+        .map(|r| PathBuf::from(r.repo.root))
         .collect();
     if file.version > FORMAT_VERSION {
         // Writing our own FORMAT_VERSION over this would silently downgrade a
@@ -561,6 +722,7 @@ fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
         );
         return Ok(MapRead {
             roots,
+            last_opened,
             replaceable: false,
         });
     }
@@ -574,6 +736,7 @@ fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
     }
     Ok(MapRead {
         roots,
+        last_opened,
         replaceable: true,
     })
 }
@@ -584,6 +747,7 @@ fn parse_file(path: &Path) -> Result<MapRead, Unreadable> {
 fn read_file(path: &Path) -> MapRead {
     let empty = |replaceable| MapRead {
         roots: BTreeSet::new(),
+        last_opened: BTreeMap::new(),
         replaceable,
     };
     match parse_file(path) {
@@ -636,7 +800,7 @@ fn read_file(path: &Path) -> MapRead {
 /// contents are still in the page cache.
 fn write_atomic(
     path: &Path,
-    roots: &BTreeSet<PathBuf>,
+    roots: &BTreeMap<PathBuf, i64>,
     scopes: &BTreeMap<PathBuf, String>,
 ) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -645,14 +809,17 @@ fn write_atomic(
     // An entry with a hand-written scope stays even when its root is not in
     // the set: a store that is missing (an unmounted volume, a directory that
     // holds no `.mdkb`) is not a reason to erase what the operator declared.
-    let kept: BTreeSet<&PathBuf> = roots.iter().chain(scopes.keys()).collect();
+    let kept: BTreeSet<&PathBuf> = roots.keys().chain(scopes.keys()).collect();
     let file = RepoMapFile {
         version: FORMAT_VERSION,
         repos: kept
             .into_iter()
-            .map(|r| RepoEntry {
-                root: r.to_string_lossy().to_string(),
-                scope: scopes.get(r).cloned(),
+            .map(|r| MapEntry {
+                repo: RepoEntry {
+                    root: r.to_string_lossy().to_string(),
+                    scope: scopes.get(r).cloned(),
+                },
+                last_opened_at: roots.get(r).copied(),
             })
             .collect(),
     };
@@ -710,6 +877,203 @@ mod tests {
                 scope: None,
             })
             .collect()
+    }
+
+    /// Catches expiry measured from first record rather than the last open.
+    #[test]
+    fn expiry_uses_last_open_keeps_29_days_and_drops_31_days() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let old = make_repo(tmp.path(), "old");
+        let recent = make_repo(tmp.path(), "recent");
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        map.record_at(&old, start);
+        map.record_at(&recent, start);
+        map.record_at(&recent, start + 2 * 86_400);
+        drop(map);
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start + 31 * 86_400);
+        assert_eq!(map.roots_at(start + 31 * 86_400), vec![recent]);
+        assert!(old.join(".mdkb").is_dir(), "expiry never deletes the store");
+        map.record_at(&old, start + 31 * 86_400);
+        let restarted = RepoMap::open_at(Some(path), &[], 30, start + 31 * 86_400);
+        assert!(
+            restarted.contains(&old),
+            "opening an expired root restores it"
+        );
+    }
+
+    /// Catches a >= boundary, ignored configuration, or expiring a live daemon
+    /// only at startup. The file is populated by real record calls.
+    #[test]
+    fn expiry_obeys_boundary_custom_limit_and_off_without_restart() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(tmp.path(), "repo");
+        let start = 1_767_225_600;
+        for (days, age, kept) in [
+            (30, 30 * 86_400, true),
+            (30, 30 * 86_400 + 1, false),
+            (7, 8 * 86_400, false),
+            (0, 365 * 86_400, true),
+        ] {
+            let map = RepoMap::open_at(None, &[], days, start);
+            map.record_at(&root, start);
+            assert_eq!(
+                map.roots_at(start + age).contains(&root),
+                kept,
+                "{days} days, age {age}"
+            );
+        }
+    }
+
+    /// Catches writes on every hook and activity frozen on first registration.
+    #[cfg(unix)]
+    #[test]
+    fn activity_is_persisted_once_per_utc_day_across_processes() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(tmp.path(), "repo");
+        let path = tmp.path().join("repos.json");
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        map.record_at(&root, start);
+        let inode = std::fs::metadata(&path).unwrap().ino();
+        map.record_at(&root, start + 100);
+        let restarted = RepoMap::open_at(Some(path.clone()), &[], 30, start + 200);
+        restarted.record_at(&root, start + 200);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        restarted.record_at(&root, start + 86_400);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(read_last_opened(&path).unwrap()[&root], start + 86_400);
+    }
+
+    /// Catches a long-lived daemon expiring a repo that a separate hook has
+    /// successfully opened since the daemon took its activity snapshot.
+    #[test]
+    fn expiry_keeps_activity_recorded_by_another_live_map() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(tmp.path(), "repo");
+        let path = tmp.path().join("repos.json");
+        let start = 1_767_225_600;
+        let seed = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        seed.record_at(&root, start);
+        let daemon = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        let hook = RepoMap::open_at(Some(path.clone()), &[], 30, start + 29 * 86_400);
+        hook.record_at(&root, start + 29 * 86_400);
+        assert_eq!(read_last_opened(&path).unwrap()[&root], start + 29 * 86_400);
+        assert_eq!(
+            daemon.roots_at(start + 31 * 86_400),
+            vec![root],
+            "a separate hook's successful open must prevent expiry"
+        );
+    }
+
+    /// Catches a stale whole-map write rolling back another hook's timestamp,
+    /// or replacing newer local activity with an older persisted timestamp.
+    #[test]
+    fn activity_merge_preserves_newest_timestamp_on_unrelated_writes() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let root = make_repo(tmp.path(), "repo");
+        let other = make_repo(tmp.path(), "other");
+        let start = 1_767_225_600;
+        let stale = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        stale.record_at(&root, start);
+        let hook = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        hook.record_at(&root, start + 29 * 86_400);
+        stale.record_at(&other, start + 86_400);
+        assert_eq!(read_last_opened(&path).unwrap()[&root], start + 29 * 86_400);
+        stale.record_at(&root, start + 32 * 86_400);
+        assert_eq!(read_last_opened(&path).unwrap()[&root], start + 32 * 86_400);
+        hook.record_at(&other, start + 33 * 86_400);
+        assert_eq!(read_last_opened(&path).unwrap()[&root], start + 32 * 86_400);
+    }
+
+    /// Catches deletion of user declarations by age and resetting their clocks
+    /// on every startup. Neither daemon.toml nor store bytes may change.
+    #[test]
+    fn expiry_preserves_configured_and_hand_scoped_roots() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let config_path = tmp.path().join("daemon.toml");
+        let seeded = make_repo(tmp.path(), "seeded");
+        let scoped = make_repo(tmp.path(), "scoped");
+        let old = make_repo(tmp.path(), "old");
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        for root in [&seeded, &scoped, &old] {
+            map.record_at(root, start);
+        }
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for entry in file["repos"].as_array_mut().unwrap() {
+            if entry["root"] == scoped.to_string_lossy().as_ref() {
+                entry["scope"] = "home".into();
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let config = format!(
+            "repo_expiry_days = 30\n[[repos]]\nroot = {:?}\n",
+            seeded.to_string_lossy()
+        );
+        std::fs::write(&config_path, &config).unwrap();
+        let at = start + 31 * 86_400;
+        let map = RepoMap::open_at(Some(path.clone()), &entries(&[&seeded]), 30, at);
+        assert_eq!(map.roots_at(at), vec![scoped.clone(), seeded.clone()]);
+        assert_eq!(read_scope_overrides(&path)[&scoped], "home");
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), config);
+        assert!(old.join(".mdkb").is_dir());
+    }
+
+    /// Catches an old unreadable root being treated like an unused healthy root.
+    #[cfg(unix)]
+    #[test]
+    fn expiry_never_removes_an_unreadable_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let root = make_repo(tmp.path(), "locked");
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        map.record_at(&root, start);
+        std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let map = RepoMap::open_at(Some(path), &[], 30, start + 31 * 86_400);
+        let roots = map.roots_at(start + 31 * 86_400);
+        std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        assert_eq!(roots, vec![root]);
+    }
+
+    /// Catches legacy entries being lost or their migration grace being renewed
+    /// at each restart, and breaking the shape understood by v1 binaries.
+    #[test]
+    fn expiry_migrates_legacy_entries_once_and_keeps_v1_read_compatibility() {
+        #[derive(Deserialize)]
+        struct V1 {
+            version: u32,
+            repos: Vec<RepoEntry>,
+        }
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let root = make_repo(tmp.path(), "legacy");
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": 1, "repos": [{"root": root}]}).to_string(),
+        )
+        .unwrap();
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        assert!(map.contains(&root));
+        let bytes = std::fs::read(&path).unwrap();
+        let old_reader: V1 = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(old_reader.version, 2);
+        assert_eq!(old_reader.repos[0].root, root.to_string_lossy());
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start + 29 * 86_400);
+        assert!(map.contains(&root));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let map = RepoMap::open_at(Some(path), &[], 30, start + 31 * 86_400);
+        assert!(!map.contains(&root));
     }
 
     /// AC#1 — a recorded root is still there when the next process loads the
@@ -878,7 +1242,7 @@ mod tests {
             Some(tmp.path().join("repos.json")),
             &entries(&[gone.as_path()]),
         );
-        assert!(map.roots().is_empty());
+        assert_eq!(map.roots(), [] as [std::path::PathBuf; 0]);
     }
 
     /// Two spellings of one repo are one entry. An operator writing a symlinked
@@ -930,7 +1294,7 @@ mod tests {
         std::fs::write(&path, "{ this is not json").unwrap();
 
         let map = RepoMap::open(Some(path.clone()), &[]);
-        assert!(map.roots().is_empty());
+        assert_eq!(map.roots(), [] as [std::path::PathBuf; 0]);
 
         // And the next record repairs the file.
         let root = make_repo(tmp.path(), "alpha");

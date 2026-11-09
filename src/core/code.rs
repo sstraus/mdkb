@@ -489,12 +489,12 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
     use crate::code::parsing::parser::LanguageParser;
     use crate::code::types::{FileId, SymbolCounter};
 
-    let language = Language::from_path(file).ok_or_else(|| {
-        Error::other(format!("Unsupported language for file: {}", file.display()))
-    })?;
-
     let code = std::fs::read_to_string(file)
         .map_err(|e| Error::other(format!("Failed to read '{}': {}", file.display(), e)))?;
+
+    let language = Language::from_path_and_content(file, &code).ok_or_else(|| {
+        Error::other(format!("Unsupported language for file: {}", file.display()))
+    })?;
 
     let file_id = FileId::new(1).expect("1 is valid");
     let mut counter = SymbolCounter::new();
@@ -523,6 +523,13 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
         Language::C => Box::new(
             crate::code::parsing::c_lang::CParser::new()
                 .map_err(|e| Error::other(format!("Failed to create C parser: {}", e)))?,
+        ),
+        Language::Objc => {
+            Box::new(crate::code::parsing::c_lang::CParser::new_objc().map_err(Error::other)?)
+        }
+        Language::Shell | Language::Ruby | Language::Sql | Language::Json => Box::new(
+            crate::code::parsing::definitions::DefinitionParser::new(language)
+                .map_err(Error::other)?,
         ),
         Language::Cpp => Box::new(
             crate::code::parsing::cpp::CppParser::new()

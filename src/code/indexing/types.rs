@@ -90,6 +90,7 @@ pub struct ParsedFile {
     pub raw_symbols: Vec<RawSymbol>,
     pub raw_relationships: Vec<RawRelationship>,
     pub raw_imports: Vec<RawImport>,
+    pub literals: Vec<crate::code::parsing::literals::Literal>,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +144,7 @@ pub struct IndexBatch {
     pub unresolved_relationships: Vec<CollectedRelationship>,
     pub file_registrations: Vec<FileRegistration>,
     pub imports: Vec<CollectedImport>,
+    pub literals: Vec<(FileId, crate::code::parsing::literals::Literal)>,
 }
 
 impl IndexBatch {
@@ -158,6 +160,7 @@ impl Default for IndexBatch {
             unresolved_relationships: Vec::new(),
             file_registrations: Vec::new(),
             imports: Vec::new(),
+            literals: Vec::new(),
         }
     }
 }

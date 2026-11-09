@@ -235,6 +235,8 @@ pub fn search_fts(
             snippets: vec![],
             status: row.get(5)?,
             superseded_by: None,
+            source: super::external::source(&row.get::<_, String>(1)?).map(str::to_owned),
+            read_only: super::external::source(&row.get::<_, String>(1)?).is_some(),
             repo_root: None,
         })
     };

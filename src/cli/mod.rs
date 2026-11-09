@@ -62,6 +62,29 @@ fn memory_relation_values() -> PossibleValuesParser {
 #[derive(Parser, Debug)]
 #[command(name = "mdkb")]
 #[command(author, version, about, long_about = None)]
+#[command(after_help = "LLM-FIRST GUIDE
+  1. Discover commands: mdkb --help; mdkb <command> --help; mdkb <group> <command> --help.
+     For a machine-readable command tree: mdkb schema (or mdkb schema <top-level-command>).
+     For short usage examples: mdkb cheatsheet; for MCP/CLI names: mdkb surface.
+  2. Initialize inside the intended project: mdkb init. Read .mdkb/config.toml.
+     Every shipped setting and default is present there as a commented TOML line.
+     Leave defaults commented to follow future releases; uncomment only the keys to override.
+     For integration setup and safe previews: mdkb setup --help; mdkb setup <group> --help.
+  3. Find a setting: search .mdkb/config.toml for the relevant section or key.
+     Check the linked topic guide for effects and dependencies before changing it.
+     The complete key definitions, types, and validation are linked below.
+     Change only that setting in .mdkb/config.toml; mdkb doctor checks the result.
+  4. Find a flag: mdkb <command> --help lists its flags, accepted values, and defaults.
+     CLI flags apply to one invocation; persistent repository options go in .mdkb/config.toml.
+     Run mdkb setup check to verify host integrations.
+
+ONLINE REFERENCE (full URLs; this help needs no network)
+  CLI commands: https://github.com/sstraus/mdkb/blob/main/README.md#cli-reference
+  Project configuration and ignore rules: https://github.com/sstraus/mdkb/blob/main/README.md#configuration
+  All config keys, types, and validation (source of truth): https://github.com/sstraus/mdkb/blob/main/src/config.rs
+  Integration setup and hook settings: https://github.com/sstraus/mdkb/blob/main/docs/hooks.md
+  Graph settings: https://github.com/sstraus/mdkb/blob/main/docs/graph.md
+  Memory conventions: https://github.com/sstraus/mdkb/blob/main/docs/memory-guidelines.md")]
 pub struct Cli {
     /// Verbose output (-v, -vv, -vvv)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -133,10 +156,26 @@ pub enum Command {
         git_ref: Option<String>,
     },
 
-    /// Search documents, memory, or code symbols
+    /// Search one corpus: source, literals, symbols, semantic-code, docs, memory, or knowledge
     Search {
-        /// Search query
-        query: String,
+        /// Search query; omit only when -e supplies source or literal alternatives
+        query: Option<String>,
+
+        /// OR alternatives for source or literals (repeat -e)
+        #[arg(short = 'e', long = "pattern")]
+        patterns: Vec<String>,
+
+        /// Treat source patterns as regular expressions
+        #[arg(long)]
+        regex: bool,
+
+        /// Exact file or directory prefix for source, literals, or symbols
+        #[arg(long)]
+        path: Option<String>,
+
+        /// Opt in to a coverage envelope for existing JSON scopes
+        #[arg(long = "search-contract")]
+        search_contract: Option<String>,
 
         /// Maximum number of results
         #[arg(short, long, default_value = "10")]
@@ -150,15 +189,19 @@ pub enum Command {
         #[arg(long)]
         include_superseded: bool,
 
-        /// Search scope: docs, memory, code, or symbols. Omit to search docs+memory
+        /// Choose source (live lines), literals (indexed values), symbols, semantic-code, docs, memory, or knowledge; omitting scope keeps the legacy mixed search
         #[arg(long)]
         scope: Option<String>,
+
+        /// Case-insensitive literal search (Unicode lowercase matching)
+        #[arg(short = 'i', long)]
+        ignore_case: bool,
 
         /// Filter by symbol kind (function, struct, method, etc.) - used with code/symbols scopes
         #[arg(short, long)]
         kind: Option<String>,
 
-        /// Filter by file path (substring match) - used with symbols scope
+        /// Filter by file path (substring match) - used with symbols/text scopes
         #[arg(short, long)]
         file: Option<String>,
 
@@ -166,7 +209,7 @@ pub enum Command {
         #[arg(long = "entry-type", alias = "type", value_parser = entry_type_values())]
         entry_type: Option<String>,
 
-        /// Repo to search: a name, an absolute path, a comma list of either, or "*" for every known repo. Omit for this directory's repo
+        /// Repo to search: a name, a path, a comma list of either, or "*" for every known repo. Omit for this directory's repo
         #[arg(long)]
         root: Option<String>,
     },
@@ -1189,6 +1232,13 @@ pub enum GraphCommand {
 
 /// Setup and configuration subcommands.
 #[derive(Subcommand, Debug)]
+#[command(after_help = "CONFIGURATION GUIDE
+  Repository settings: mdkb init creates .mdkb/config.toml with every default commented out.
+  Edit only the settings you need; see mdkb --help for topic guides and key definitions.
+  Integration commands: mdkb setup mcp --help; mdkb setup hooks --help.
+  Preview changes where supported with --dry-run; verify with mdkb setup check.
+  Online setup guide: https://github.com/sstraus/mdkb/blob/main/README.md#installation
+  Hook options and troubleshooting: https://github.com/sstraus/mdkb/blob/main/docs/hooks.md")]
 pub enum SetupCommand {
     /// Enable privacy-minimized local telemetry for mdkb development
     Developer {
@@ -1268,9 +1318,9 @@ pub enum SetupHooksCommand {
         http_url: Option<String>,
     },
 
-    /// Register mdkb as ego's prompt-context source (writes ~/.ego/config.toml)
+    /// Register generic lifecycle hooks with ego (writes $EGO_HOME/config.toml)
     Ego {
-        /// Replace an existing, different `mdkb_prompt_command` value
+        /// Retained for compatibility; generic hook setup merges without replacing user hooks
         #[arg(long)]
         force: bool,
 
@@ -1327,6 +1377,9 @@ pub enum RemoveMcpCommand {
 /// Hooks removal subcommands.
 #[derive(Subcommand, Debug)]
 pub enum RemoveHooksCommand {
+    /// Remove generic mdkb hooks and their execution allowances from ego
+    Ego,
+
     /// Remove mdkb hooks from Claude Code
     Claude {
         /// Scope: local or user

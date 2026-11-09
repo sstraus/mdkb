@@ -743,7 +743,10 @@ mod tests {
 
     #[test]
     fn a_cluster_holding_everything_leaves_nothing_to_score() {
-        assert!(unclustered_pairs(3, &[vec![0, 1, 2]]).is_empty());
+        assert_eq!(
+            unclustered_pairs(3, &[vec![0, 1, 2]]),
+            [] as [(usize, usize); 0]
+        );
     }
 
     #[test]
@@ -773,7 +776,10 @@ mod tests {
         // the model judged code it never saw.
         let vectors = vec![Some(vec![1.0f32, 0.0]), None];
 
-        assert!(score_pairs(&vectors, &[(0, 1)], -1.0).is_empty());
+        assert_eq!(
+            score_pairs(&vectors, &[(0, 1)], -1.0),
+            [] as [(usize, usize, f32); 0]
+        );
     }
 
     #[test]
@@ -839,7 +845,7 @@ mod tests {
 
         let scored = score_semantic_tail(&db, &bodies, &[vec![0, 1]], &embedder, 0.0).unwrap();
 
-        assert!(scored.is_empty());
+        assert_eq!(scored, [] as [(usize, usize, f32); 0]);
         assert_eq!(
             embedder.calls.load(Ordering::SeqCst),
             0,

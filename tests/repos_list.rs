@@ -310,3 +310,101 @@ fn threaded_listing_handles_no_roots_one_root_and_one_more_than_the_width() {
         }
     }
 }
+
+/// Catches JSON omitting activity while text and MCP show it.
+#[test]
+fn cli_json_carries_the_persisted_last_open_timestamp() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let root = store(tmp.path(), "repo", 1, 1);
+    let path = home.join(".mdkb/repos.json");
+    let map = mdkb::daemon::repo_map::RepoMap::open(Some(path.clone()), &[]);
+    map.record(&root);
+    let at = mdkb::daemon::repo_map::read_last_opened(&path).unwrap()[&root];
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = Command::new(BIN)
+        .args(["--format", "json", "repos", "list"])
+        .env("HOME", &home)
+        .env_remove("MDKB_NAMESPACE")
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows[0]["last_opened_at"], at);
+}
+
+/// Catches the CLI omitting activity metadata or printing the index date as
+/// the last-open date. The timestamp is produced by an actual map record.
+#[test]
+fn cli_text_shows_the_persisted_last_open_date() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let root = store(tmp.path(), "repo", 1, 1);
+    let path = home.join(".mdkb/repos.json");
+    let map = mdkb::daemon::repo_map::RepoMap::open(Some(path.clone()), &[]);
+    map.record(&root);
+    let at = mdkb::daemon::repo_map::read_last_opened(&path).unwrap()[&root];
+    let date = chrono::DateTime::from_timestamp(at, 0)
+        .unwrap()
+        .format("%Y-%m-%d");
+    let before = std::fs::read(&path).unwrap();
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = Command::new(BIN)
+        .args(["repos", "list"])
+        .env("HOME", &home)
+        .env_remove("MDKB_NAMESPACE")
+        .current_dir(cwd)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("opened@{date}")), "{text}");
+    assert!(text.contains("docs@1970-01-01"), "{text}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "listing is read-only"
+    );
+}
+
+/// Catches offline CLI listing ignoring daemon.toml's inactivity policy,
+/// or deleting entries while merely inspecting them.
+#[test]
+fn cli_text_filters_expired_roots_and_respects_off() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let root = store(tmp.path(), "old-repo", 1, 1);
+    let path = home.join(".mdkb/repos.json");
+    let map = mdkb::daemon::repo_map::RepoMap::open(Some(path.clone()), &[]);
+    map.record(&root);
+    let mut file: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    file["repos"][0]["last_opened_at"] = (chrono::Utc::now().timestamp() - 31 * 86_400).into();
+    std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let cwd = tmp.path().join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    for (days, visible) in [(30, false), (0, true)] {
+        std::fs::write(
+            home.join(".mdkb/daemon.toml"),
+            format!("repo_expiry_days = {days}\n"),
+        )
+        .unwrap();
+        let out = Command::new(BIN)
+            .args(["repos", "list"])
+            .env("HOME", &home)
+            .env_remove("MDKB_NAMESPACE")
+            .current_dir(&cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().contains("old-repo"),
+            visible
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}

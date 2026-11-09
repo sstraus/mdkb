@@ -21,6 +21,9 @@ use mdkb::mcp::tools::SearchParams;
 use mdkb::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
 use serde_json::json;
 
+#[path = "common/cli.rs"]
+mod cli;
+
 /// A real store under `parent/name`, with one memory entry whose title carries
 /// `needle` — a nonsense token, so a match cannot come from anywhere else.
 ///
@@ -594,6 +597,541 @@ async fn an_omitted_scope_searches_documents_and_memory() {
         output.contains("zonk_harvest"),
         "the memory entry is the half the document leg cannot supply: {output}"
     );
+}
+
+/// Catches: canonical literals taking the legacy docs/memory fan-out, dropping
+/// a closed repo, or using a per-repo rather than global result limit.
+#[tokio::test]
+async fn canonical_literal_fan_out_reports_both_roots_and_global_limit() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let first = repo_with_entry(repos.path(), "first", "unrelated");
+    let second = repo_with_entry(repos.path(), "second", "unrelated");
+    for root in [&first, &second] {
+        std::fs::write(root.join("labels.js"), "const label = 'orbitLantern';\n").unwrap();
+        let output = cli::run(&["code", "index", "labels.js"], root);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&first).expect("open first");
+    registry.get_or_open(&second).expect("open second");
+    assert!(
+        registry.get(&first).is_none(),
+        "the first root must be closed"
+    );
+
+    for (limit, expected_truncated) in [(1, true), (2, false)] {
+        let params: SearchParams = serde_json::from_value(json!({
+            "scope": "literals", "query": "orbitLantern", "root": "*", "limit": limit,
+        }))
+        .unwrap();
+        let (output, count) = cross_repo_search_impl(&registry, &params, &[])
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&output).expect("canonical JSON");
+        assert_eq!(value["scope"], "literals", "{value}");
+        assert_eq!(value["unit"], "ast_literal", "{value}");
+        assert_eq!(count, limit, "{value}");
+        assert_eq!(value["hits"].as_array().unwrap().len(), limit, "{value}");
+        assert_eq!(value["truncated"], expected_truncated, "{value}");
+        assert_eq!(
+            value["coverage"]["roots"].as_array().unwrap().len(),
+            2,
+            "{value}"
+        );
+        assert_eq!(value["status"], "complete", "{value}");
+        for hit in value["hits"].as_array().unwrap() {
+            assert_eq!(hit["content"], "orbitLantern", "{value}");
+        }
+        if limit == 2 {
+            let repos: std::collections::HashSet<_> = value["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["repo"].as_str().unwrap())
+                .collect();
+            assert_eq!(repos.len(), 2, "{value}");
+        }
+    }
+}
+
+/// Catches: CLI and MCP disagreeing about global truncation or silently
+/// calling an initialized root with no code index a complete no-match.
+#[tokio::test]
+async fn cli_and_mcp_multi_root_literals_agree_with_unavailable_index() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let home = repos.path().join("home");
+    std::fs::create_dir_all(home.join(".mdkb")).unwrap();
+    let first = repo_with_entry(repos.path(), "first", "unrelated");
+    let second = repo_with_entry(repos.path(), "second", "unrelated");
+    std::fs::write(
+        first.join("labels.js"),
+        "const a = 'orbitLantern'; const b = 'orbitLantern';\n",
+    )
+    .unwrap();
+    let indexed = cli::run(&["code", "index", "labels.js"], &first);
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(first.join(".mdkb/code.sqlite").exists());
+    // Init creates an empty code database. Remove only this fixture's database
+    // to exercise an unavailable index rather than an empty indexed corpus.
+    assert!(second.join(".mdkb/code.sqlite").exists());
+    std::fs::remove_file(second.join(".mdkb/code.sqlite")).unwrap();
+    let map_roots = [first.as_path(), second.as_path()]
+        .iter()
+        .map(|root| json!({"root": root}))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        home.join(".mdkb/repos.json"),
+        json!({"version": 1, "repos": map_roots}).to_string(),
+    )
+    .unwrap();
+    let selected = format!("{},{}", first.display(), second.display());
+    let cli_output = cli::command()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&first)
+        .args([
+            "--format",
+            "json",
+            "search",
+            "orbitLantern",
+            "--scope",
+            "literals",
+            "--root",
+            &selected,
+            "--limit",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_output.stderr)
+    );
+    let cli_value: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&first).unwrap();
+    registry.get_or_open(&second).unwrap();
+    let params: SearchParams = serde_json::from_value(json!({
+        "scope": "literals", "query": "orbitLantern", "root": "*", "limit": 1,
+    }))
+    .unwrap();
+    let (mcp_output, count) = cross_repo_search_impl(&registry, &params, &[])
+        .await
+        .unwrap();
+    let mcp_value: serde_json::Value = serde_json::from_str(&mcp_output).unwrap();
+    assert_eq!(cli_value, mcp_value, "CLI/MCP multi-root literals diverged");
+    assert_eq!(count, 1);
+    assert_eq!(cli_value["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(cli_value["truncated"], true);
+    assert_eq!(cli_value["status"], "partial");
+    assert_eq!(cli_value["freshness"]["state"], "unknown");
+    let roots = cli_value["coverage"]["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 2);
+    assert_eq!(roots[0]["status"], "complete");
+    assert_eq!(roots[1]["status"], "unavailable");
+}
+
+/// Catches: legacy fan-out collapsing two matching memory entries into one
+/// pseudo-hit, applying per-root limits, or hiding a selected root in JSON.
+#[tokio::test]
+async fn canonical_indexed_multi_root_results_are_per_entry_and_match_cli_mcp() {
+    let state = tempfile::tempdir().unwrap();
+    let repos = tempfile::tempdir().unwrap();
+    let home = repos.path().join("home");
+    std::fs::create_dir_all(home.join(".mdkb")).unwrap();
+    let mut roots = Vec::new();
+    for (name, memory_count) in [("first", 2), ("second", 1)] {
+        let root = repos.path().join(name);
+        std::fs::create_dir(&root).unwrap();
+        let root = mdkb::domain::canonicalize_plain(&root).unwrap();
+        mdkb::cli::handlers::handle_init(&root).unwrap();
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/guide.md"),
+            "# Orbit Lantern\n\nOrbit Lantern is a project decision.\n",
+        )
+        .unwrap();
+        let update = cli::run(&["update"], &root);
+        assert!(update.status.success(), "{update:?}");
+        for n in 0..memory_count {
+            let id = format!("orbit-lantern-{name}-{n}");
+            let title = format!("Orbit Lantern {name} decision {n}");
+            let content = format!("Orbit Lantern {name} records decision {n} for this repository.");
+            let entry_type = if n == 0 { "decision" } else { "topic" };
+            let source_type = "user_statement";
+            let added = cli::run(
+                &[
+                    "memory",
+                    "add",
+                    &id,
+                    "-t",
+                    &title,
+                    "-c",
+                    &content,
+                    "--entry-type",
+                    entry_type,
+                    "--source-type",
+                    source_type,
+                ],
+                &root,
+            );
+            assert!(added.status.success(), "{added:?}");
+        }
+        roots.push(root);
+    }
+    let map_roots = roots
+        .iter()
+        .map(|root| json!({"root": root}))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        home.join(".mdkb/repos.json"),
+        json!({"version": 1, "repos": map_roots}).to_string(),
+    )
+    .unwrap();
+    let selected = format!("{},{}", roots[0].display(), roots[1].display());
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    for root in &roots {
+        registry.get_or_open(root).unwrap();
+    }
+    assert!(
+        registry.get(&roots[0]).is_none(),
+        "first root must be closed"
+    );
+
+    for (scope, limit, unit) in [
+        ("docs", 1, "document"),
+        ("memory", 2, "memory_entry"),
+        ("knowledge", 2, "knowledge_result"),
+    ] {
+        let limit_arg = limit.to_string();
+        let mut args = vec![
+            "--format",
+            "json",
+            "search",
+            "Orbit Lantern",
+            "--scope",
+            scope,
+            "--root",
+            selected.as_str(),
+            "--limit",
+            limit_arg.as_str(),
+        ];
+        if scope != "knowledge" {
+            args.extend(["--search-contract", "v2"]);
+        }
+        let cli_output = cli::command()
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .current_dir(&roots[0])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(cli_output.status.success(), "{scope}: {cli_output:?}");
+        let cli_value: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+        let mut params: SearchParams = serde_json::from_value(json!({
+            "scope": scope, "query": "Orbit Lantern", "root": "*", "limit": limit,
+        }))
+        .unwrap();
+        if scope != "knowledge" {
+            params.contract = Some("v2".into());
+        }
+        let (mcp_output, count) = cross_repo_search_impl(&registry, &params, &[])
+            .await
+            .unwrap();
+        let mcp_value: serde_json::Value = serde_json::from_str(&mcp_output).unwrap();
+        assert_eq!(cli_value, mcp_value, "{scope}: transport mismatch");
+        assert_eq!(cli_value["scope"], scope);
+        assert_eq!(cli_value["unit"], unit);
+        assert_eq!(cli_value["status"], "partial");
+        assert_eq!(cli_value["freshness"]["state"], "unknown");
+        assert_eq!(cli_value["truncated"], true);
+        assert_eq!(cli_value["hits"].as_array().unwrap().len(), limit);
+        assert_eq!(count, limit);
+        assert_eq!(cli_value["coverage"]["roots"].as_array().unwrap().len(), 2);
+        if scope == "memory" {
+            let ids: Vec<_> = cli_value["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["value"]["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["orbit-lantern-first-0", "orbit-lantern-first-1"]);
+        }
+        for hit in cli_value["hits"].as_array().unwrap() {
+            assert_eq!(hit["repo"], roots[0].display().to_string());
+            if scope == "knowledge" {
+                assert!(hit["corpus"] == "docs" || hit["corpus"] == "memory");
+            }
+        }
+    }
+    // Catches: the MCP canonical branch dropping its existing memory kind filter.
+    let typed_cli = cli::command()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&roots[0])
+        .args([
+            "--format",
+            "json",
+            "search",
+            "Orbit Lantern",
+            "--scope",
+            "memory",
+            "--root",
+            &selected,
+            "--limit",
+            "3",
+            "--search-contract",
+            "v2",
+            "--entry-type",
+            "decision",
+        ])
+        .output()
+        .unwrap();
+    assert!(typed_cli.status.success(), "{typed_cli:?}");
+    let typed_cli: serde_json::Value = serde_json::from_slice(&typed_cli.stdout).unwrap();
+    let typed_params: SearchParams = serde_json::from_value(json!({
+        "scope": "memory", "contract": "v2", "query": "Orbit Lantern",
+        "root": "*", "limit": 3, "kind": "decision",
+    }))
+    .unwrap();
+    let (typed_mcp, _) = cross_repo_search_impl(&registry, &typed_params, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        typed_cli,
+        serde_json::from_str::<serde_json::Value>(&typed_mcp).unwrap()
+    );
+    let typed_ids: Vec<_> = typed_cli["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hit| hit["value"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        typed_ids,
+        ["orbit-lantern-first-0", "orbit-lantern-second-0"]
+    );
+    assert_eq!(typed_cli["truncated"], false);
+
+    let legacy_cli = cli::command()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&roots[0])
+        .args([
+            "--format",
+            "json",
+            "search",
+            "Orbit Lantern",
+            "--scope",
+            "memory",
+            "--root",
+            &selected,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !legacy_cli.status.success(),
+        "legacy multi-root JSON must refuse"
+    );
+    let (legacy_mcp, _) = cross_repo_search_impl(&registry, &memory_search("Orbit Lantern"), &[])
+        .await
+        .unwrap();
+    assert!(
+        !legacy_mcp.starts_with('{'),
+        "legacy MCP must stay human text"
+    );
+
+    // Catches: an unavailable indexed store being counted as an empty search.
+    std::fs::remove_file(roots[1].join(".mdkb/index.sqlite")).unwrap();
+    let unavailable_cli = cli::command()
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .current_dir(&roots[0])
+        .args([
+            "--format",
+            "json",
+            "search",
+            "Orbit Lantern",
+            "--scope",
+            "memory",
+            "--root",
+            &selected,
+            "--limit",
+            "3",
+            "--search-contract",
+            "v2",
+        ])
+        .output()
+        .unwrap();
+    assert!(unavailable_cli.status.success(), "{unavailable_cli:?}");
+    let unavailable_cli: serde_json::Value =
+        serde_json::from_slice(&unavailable_cli.stdout).unwrap();
+    let unavailable_params: SearchParams = serde_json::from_value(json!({
+        "scope": "memory", "contract": "v2", "query": "Orbit Lantern",
+        "root": "*", "limit": 3,
+    }))
+    .unwrap();
+    let (unavailable_mcp, _) = cross_repo_search_impl(&registry, &unavailable_params, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        unavailable_cli,
+        serde_json::from_str::<serde_json::Value>(&unavailable_mcp).unwrap()
+    );
+    assert_eq!(unavailable_cli["status"], "partial");
+    assert_eq!(
+        unavailable_cli["coverage"]["roots"][1]["status"],
+        "unavailable"
+    );
+    assert_eq!(unavailable_cli["hits"].as_array().unwrap().len(), 2);
+}
+
+/// Catches: a confidence filter applied after a bounded candidate window
+/// hiding an eligible indexed memory entry that ranked just outside it.
+#[tokio::test]
+async fn canonical_memory_confidence_filter_reaches_past_unqualified_prefix() {
+    let state = tempfile::tempdir().unwrap();
+    let repos = tempfile::tempdir().unwrap();
+    let root = repo_with_entry(repos.path(), "confidence", "unrelated");
+    let ctx = Context::open(&root).unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let seed = mdkb::store::memory::get_entry_without_tracking(&ctx.conn, "unrelated-entry")
+        .unwrap()
+        .unwrap();
+    let query = "verifier_lock";
+    for (n, detail) in ["spruce", "basalt", "harbor"].into_iter().enumerate() {
+        let mut entry = seed.clone();
+        entry.id = format!("confidence-candidate-{n}");
+        entry.title = format!("{query} {detail} decision");
+        entry.content = format!("{query} {detail} records a separate maintenance decision.");
+        entry.created_at = now;
+        entry.updated_at = now;
+        entry.source_type = SourceType::Inference;
+        add_entry(&ctx.conn, &entry).unwrap();
+    }
+    let unfiltered = mdkb::core::memory::handle_memory_search(&ctx, query, 3, None).unwrap();
+    assert_eq!(unfiltered.len(), 3, "all three entries must be indexed");
+    let eligible_id = unfiltered[2].id.clone();
+    let mut eligible = unfiltered[2].clone();
+    eligible.source_type = SourceType::OfficialDocs;
+    mdkb::store::memory::update_entry(&ctx.conn, &eligible).unwrap();
+    let unfiltered = mdkb::core::memory::handle_memory_search(&ctx, query, 3, None).unwrap();
+    assert_eq!(unfiltered.len(), 3);
+    assert_eq!(
+        unfiltered[2].id, eligible_id,
+        "confidence changed retrieval order: {unfiltered:?}"
+    );
+    assert!(unfiltered[..2].iter().all(|entry| entry.confidence() < 0.4));
+    assert!(unfiltered[2].confidence() >= 0.4);
+    drop(ctx);
+
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&root).unwrap();
+    let params: SearchParams = serde_json::from_value(json!({
+        "scope": "memory", "contract": "v2", "query": query,
+        "root": "*", "limit": 1, "min_confidence": 0.4,
+    }))
+    .unwrap();
+    let (output, count) = cross_repo_search_impl(&registry, &params, &[])
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(count, 1, "qualifying indexed entry was hidden: {value}");
+    assert_eq!(value["hits"][0]["value"]["id"], eligible_id);
+    assert_eq!(value["truncated"], false);
+}
+
+/// Catches: treating a relevance-gated short page as corpus exhaustion while
+/// a high-confidence lexical hit remains beyond the bounded BM25 prefix.
+#[tokio::test]
+async fn canonical_memory_confidence_filter_widens_after_relevance_gate_short_page() {
+    let state = tempfile::tempdir().unwrap();
+    let repos = tempfile::tempdir().unwrap();
+    let root = repo_with_entry(repos.path(), "gated", "unrelated");
+    let ctx = Context::open(&root).unwrap();
+    let query = "verifier_lock";
+    let now = chrono::Utc::now().timestamp();
+    let seed = mdkb::store::memory::get_entry_without_tracking(&ctx.conn, "unrelated-entry")
+        .unwrap()
+        .unwrap();
+    for n in 0..8 {
+        let mut entry = seed.clone();
+        entry.id = format!("gate-decoy-{n}");
+        entry.title = format!("Verifier lock maintenance note {n}");
+        entry.content = format!(
+            "Verifier lock maintenance note {n} records verifier lock maintenance details."
+        );
+        entry.created_at = now;
+        entry.updated_at = now;
+        entry.source_type = SourceType::Inference;
+        add_entry(&ctx.conn, &entry).unwrap();
+    }
+    let mut eligible = seed;
+    eligible.id = "gate-eligible".into();
+    eligible.title = "verifier_lock independent decision".into();
+    eligible.content = "This entry records a separate decision about verifier_lock.".into();
+    eligible.created_at = now;
+    eligible.updated_at = now;
+    eligible.source_type = SourceType::OfficialDocs;
+    add_entry(&ctx.conn, &eligible).unwrap();
+    let short = mdkb::core::memory::handle_memory_search(&ctx, query, 2, None).unwrap();
+    assert!(
+        short.len() < 2,
+        "fixture must create a short gated page: {short:?}"
+    );
+    assert!(short.iter().all(|entry| entry.id != eligible.id));
+    let wide = mdkb::core::memory::handle_memory_search(&ctx, query, 10, None).unwrap();
+    assert!(wide.iter().any(|entry| entry.id == eligible.id), "{wide:?}");
+    drop(ctx);
+
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&root).unwrap();
+    let params: SearchParams = serde_json::from_value(json!({
+        "scope": "memory", "contract": "v2", "query": query,
+        "root": "*", "limit": 1, "min_confidence": 0.4,
+    }))
+    .unwrap();
+    let (output, count) = cross_repo_search_impl(&registry, &params, &[])
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(count, 1, "qualifying entry was hidden: {value}");
+    assert_eq!(value["hits"][0]["value"]["id"], eligible.id);
+}
+
+/// Catches: explicit source/semantic-code wildcard searches falling into
+/// the legacy docs+memory fan-out and returning a false no-match.
+#[tokio::test]
+async fn unsupported_canonical_scopes_never_fall_through_to_legacy_cross_repo_corpus() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let first = repo_with_entry(repos.path(), "first", "zonk_harvest");
+    let second = repo_with_entry(repos.path(), "second", "zonk_harvest");
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&first).expect("open first");
+    registry.get_or_open(&second).expect("open second");
+    for scope in ["source", "semantic-code"] {
+        let mut params = memory_search("zonk_harvest");
+        params.scope = Some(scope.to_string());
+        params.root = Some("*".to_string());
+        let result = cross_repo_search_impl(&registry, &params, &[]).await;
+        assert!(
+            result.is_err(),
+            "{scope} must not return the docs/memory corpus: {result:?}"
+        );
+    }
 }
 
 /// Roll a store's recorded schema back without opening it through `Context`,

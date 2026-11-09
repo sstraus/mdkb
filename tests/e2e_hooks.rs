@@ -538,3 +538,74 @@ fn one_shot_prompt_persists_its_hook_call() {
         );
     }
 }
+
+// Catches: generic version-1 hosts reject Claude-only PreToolUse context and
+// daemon bookkeeping fields instead of settling a successful hook.
+#[test]
+fn versioned_hook_outputs_match_the_host_lifecycle_contract() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("repo");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    handle_init(&root).unwrap();
+    let config = root.join(".mdkb/config.toml");
+    let mut raw = std::fs::read_to_string(&config).unwrap();
+    raw.push_str("\n[hooks]\nuser_prompt_submit_require_sigil = true\n");
+    std::fs::write(config, raw).unwrap();
+    for (arg, event) in [
+        ("session-start", "SessionStart"),
+        ("user-prompt-submit", "UserPromptSubmit"),
+        ("pre-tool-use", "PreToolUse"),
+        ("post-tool-use", "PostToolUse"),
+        ("post-tool-use", "PostToolUseFailure"),
+        ("stop", "Stop"),
+    ] {
+        let payload = serde_json::json!({
+            "version": 1, "hook_event_name": event, "session_id": "generic-hooks",
+            "cwd": root, "prompt": "ordinary prompt", "tool_name": "Grep",
+            "tool_input": {"pattern": "authentication", "path": "docs/"}, "transcript": ""
+        });
+        let (stdout, stderr, code) =
+            run_hook_with_home(arg, &root, &payload.to_string(), Some(&home));
+        assert_eq!(code, 0, "{event}: {stderr}");
+        assert!(
+            stderr
+                .lines()
+                .all(|line| line.contains("slot held") && line.contains("held_ms")),
+            "{event}: {stderr}"
+        );
+        if event == "PreToolUse" {
+            let output: Value =
+                serde_json::from_str(&stdout).expect("search guidance must reach host feedback");
+            assert!(
+                output["feedback"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("authentication"),
+                "{output}"
+            );
+        }
+        if stdout.trim().is_empty() {
+            continue;
+        }
+        let output: Value = serde_json::from_str(&stdout).unwrap();
+        for key in output.as_object().unwrap().keys() {
+            assert!(
+                ["version", "decision", "feedback", "hookSpecificOutput"].contains(&key.as_str()),
+                "{event}: {output}"
+            );
+        }
+        if let Some(context) = output.get("hookSpecificOutput") {
+            assert!(
+                ["SessionStart", "UserPromptSubmit", "PostToolUse"].contains(&event),
+                "{event}: {output}"
+            );
+            assert_eq!(context["hookEventName"], event);
+        }
+        if output.get("feedback").is_some() {
+            assert_eq!(output["version"], 1);
+            assert_eq!(output["decision"], "continue");
+        }
+    }
+}

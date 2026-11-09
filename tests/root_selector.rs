@@ -13,8 +13,7 @@
 //!   that resolve to nothing. An input that cannot mean one thing must not be
 //!   answered as if it did.
 //! * **An absolute path always beats a repo name.** The choice is syntactic —
-//!   `Path::is_absolute` decides, before anything touches the disk — so a path
-//!   to a repo that is not on the map still behaves exactly as it did.
+//!   absolute syntax selects a path, which resolves to its containing known repo.
 
 use std::path::{Path, PathBuf};
 
@@ -27,30 +26,52 @@ mod cli;
 fn dir(parent: &Path, name: &str) -> PathBuf {
     let root = parent.join(name);
     std::fs::create_dir_all(&root).expect("create dir");
-    root.canonicalize().expect("canonicalize")
+    mdkb::domain::canonicalize_plain(&root).expect("canonicalize")
 }
 
 fn parse(raw: &str) -> Result<RootSelector, String> {
     RootSelector::parse(Some(raw))
 }
 
-/// Criterion 4: a bare absolute path behaves exactly as today, and that must
-/// hold for a root the map has never heard of — the path IS the answer, so
-/// resolution may not depend on membership.
+/// Catches: an uninitialized path silently opening a store outside the known map.
 #[test]
-fn an_absolute_path_resolves_to_itself_even_when_it_is_not_on_the_map() {
+fn an_outside_path_names_the_path_and_refuses_an_unknown_repo() {
     let tmp = tempfile::tempdir().expect("tmp");
+    let alpha = dir(tmp.path(), "alpha");
     let stranger = dir(tmp.path(), "stranger");
+    std::fs::create_dir(stranger.join(".mdkb")).unwrap();
+    let raw = stranger.display().to_string();
+    let err = parse(&raw).unwrap().resolve(&[alpha], &[]).unwrap_err();
+    assert!(
+        err.contains(&raw) && err.contains("not inside a known repo"),
+        "{err}"
+    );
+}
 
-    let selector = parse(&stranger.display().to_string()).expect("an absolute path parses");
-    let resolved = selector
-        .resolve(&[], &[])
-        .expect("an absolute path needs no map");
-
-    assert_eq!(
-        resolved,
-        vec![stranger],
-        "the path is the answer; the map is not consulted"
+/// Catches: returning the descendant itself or the first matching parent instead
+/// of the nearest registered ancestor, including after normalizing dot components.
+#[test]
+fn descendant_paths_select_the_nearest_registered_ancestor() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let outer = dir(tmp.path(), "outer");
+    let nested = dir(&outer, "nested");
+    let leaf = dir(&nested, "src");
+    let known = vec![outer.clone(), nested.clone()];
+    for path in [&leaf, &leaf.join(".."), &nested] {
+        let raw = path.display().to_string();
+        assert_eq!(
+            parse(&raw).unwrap().resolve(&known, &[]).unwrap(),
+            vec![nested.clone()],
+            "{raw}"
+        );
+    }
+    // Prefix matching must compare components, not text.
+    let sibling = dir(tmp.path(), "outer-sibling");
+    assert!(
+        parse(sibling.to_str().unwrap())
+            .unwrap()
+            .resolve(&known, &[])
+            .is_err()
     );
 }
 
@@ -76,7 +97,7 @@ fn a_comma_list_mixes_names_and_paths_in_the_order_written() {
     let tmp = tempfile::tempdir().expect("tmp");
     let alpha = dir(tmp.path(), "alpha");
     let stranger = dir(tmp.path(), "stranger");
-    let known = vec![alpha.clone()];
+    let known = vec![alpha.clone(), stranger.clone()];
 
     let raw = format!("alpha, {}", stranger.display());
     let resolved = parse(&raw)
@@ -202,7 +223,9 @@ fn an_absolute_path_always_beats_a_name_spelled_the_same_way() {
         "an absolute string is a path term, never a name term"
     );
 
-    let resolved = selector.resolve(&[], &[]).expect("resolves with no map");
+    let resolved = selector
+        .resolve(std::slice::from_ref(&decoy), &[])
+        .expect("known path resolves");
     assert_eq!(resolved, vec![decoy]);
 }
 
@@ -260,5 +283,176 @@ fn the_cheatsheet_carries_the_root_grammar() {
             !line.contains(&exe),
             "story 119: no machine-specific build path on a grammar line: {line}"
         );
+    }
+}
+
+/// Catches: MCP relative paths using the daemon cwd rather than its declared
+/// workspace, and descendants resolving to an outer store instead of a nested one.
+#[test]
+fn mcp_relative_paths_use_the_declared_workspace_and_nearest_registered_repo() {
+    use mdkb::daemon::config::DaemonConfig;
+    use mdkb::daemon::registry::RepoRegistry;
+    use mdkb::mcp::dispatch::resolve_root_selector;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = dir(tmp.path(), "outer");
+    let nested = dir(&outer, "nested");
+    let leaf = dir(&nested, "src");
+    let registry = RepoRegistry::new(DaemonConfig {
+        state_dir: Some(tmp.path().join("state")),
+        whitelist_dirs: vec![tmp.path().display().to_string()],
+        ..DaemonConfig::default()
+    });
+    registry.get_or_open(&outer).unwrap();
+    registry.get_or_open(&nested).unwrap();
+    let scope = vec![outer.clone()];
+    for (raw, expected) in [
+        (".", &outer),
+        ("./nested/src", &nested),
+        (leaf.to_str().unwrap(), &nested),
+    ] {
+        let resolved = resolve_root_selector(&registry, Some(raw), &scope).unwrap();
+        assert_eq!(resolved.roots, vec![expected.clone()], "{raw}");
+    }
+}
+
+/// Catches: comparing a symlink spelling against canonical registry keys.
+#[cfg(unix)]
+#[test]
+fn symlink_paths_select_the_registered_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = dir(tmp.path(), "repo");
+    let leaf = dir(&repo, "src");
+    let link = tmp.path().join("alias");
+    std::os::unix::fs::symlink(&leaf, &link).unwrap();
+    assert_eq!(
+        parse(link.to_str().unwrap())
+            .unwrap()
+            .resolve(std::slice::from_ref(&repo), &[])
+            .unwrap(),
+        vec![repo]
+    );
+}
+
+/// Catches: a local directory shadowing a registered bare repository name.
+#[test]
+fn root_revision_bare_names_ignore_local_directory_collisions() {
+    use mdkb::daemon::{config::DaemonConfig, registry::RepoRegistry};
+    use mdkb::mcp::dispatch::resolve_root_selector;
+    let tmp = tempfile::tempdir().unwrap();
+    let local = dir(tmp.path(), "local");
+    let docs = dir(tmp.path(), "docs");
+    dir(&local, "docs");
+    let registry = RepoRegistry::new(DaemonConfig {
+        state_dir: Some(tmp.path().join("state")),
+        whitelist_dirs: vec![tmp.path().display().to_string()],
+        ..DaemonConfig::default()
+    });
+    registry.get_or_open(&local).unwrap();
+    registry.get_or_open(&docs).unwrap();
+    for (raw, expected) in [("docs", &docs), ("./docs", &local), ("docs,./docs", &docs)] {
+        let resolved =
+            resolve_root_selector(&registry, Some(raw), std::slice::from_ref(&local)).unwrap();
+        let expected = if raw.contains(',') {
+            vec![docs.clone(), local.clone()]
+        } else {
+            vec![expected.clone()]
+        };
+        assert_eq!(resolved.roots, expected, "{raw}");
+    }
+}
+
+/// Catches: linked-worktree roots and descendants failing to select the main store.
+#[test]
+fn root_revision_linked_worktree_paths_share_the_registered_main_identity() {
+    use mdkb::daemon::{config::DaemonConfig, registry::RepoRegistry};
+    use mdkb::mcp::dispatch::resolve_root_selector;
+    let tmp = tempfile::tempdir().unwrap();
+    let main = dir(tmp.path(), "main");
+    let worktree = tmp.path().join("linked");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "fixture",
+    ]);
+    git(&["worktree", "add", "--detach", worktree.to_str().unwrap()]);
+    let worktree = mdkb::domain::canonicalize_plain(&worktree).unwrap();
+    let leaf = dir(&worktree, "src");
+    let registry = RepoRegistry::new(DaemonConfig {
+        state_dir: Some(tmp.path().join("state")),
+        whitelist_dirs: vec![tmp.path().display().to_string()],
+        ..DaemonConfig::default()
+    });
+    registry.get_or_open(&main).unwrap();
+    let nested = dir(&main, "src");
+    registry.get_or_open(&nested).unwrap();
+    for (raw, expected) in [
+        (".", &main),
+        ("./src", &nested),
+        ("../linked/src", &nested),
+        (worktree.to_str().unwrap(), &main),
+        (leaf.to_str().unwrap(), &nested),
+    ] {
+        let resolved =
+            resolve_root_selector(&registry, Some(raw), std::slice::from_ref(&worktree)).unwrap();
+        assert_eq!(resolved.roots, vec![expected.clone()], "{raw}");
+    }
+}
+
+/// Catches: home-relative syntax becoming a literal repo name or cwd-relative path.
+#[test]
+fn home_relative_root_uses_the_real_home_directory() {
+    let home =
+        mdkb::domain::canonicalize_plain(&mdkb::daemon::config::home_dir().unwrap()).unwrap();
+    assert_eq!(
+        parse("~/")
+            .unwrap()
+            .resolve(std::slice::from_ref(&home), &[])
+            .unwrap(),
+        vec![home]
+    );
+}
+
+/// Catches: registered-only resolution rejecting a non-Git store or selecting
+/// an outer registered store instead of the nearest unregistered store.
+#[test]
+fn initialized_paths_select_the_nearest_store_without_registration_or_git() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = dir(tmp.path(), "outer");
+    let nested = dir(&outer, "nested");
+    let leaf = dir(&nested, "src");
+    for root in [&outer, &nested] {
+        mdkb::cli::handlers::handle_init(root).expect("init store");
+    }
+    // An uninitialized .mdkb below a store must not hide the store above it.
+    std::fs::create_dir(leaf.join(".mdkb")).unwrap();
+    for known in [vec![], vec![outer.clone()]] {
+        for path in [&nested, &leaf, &leaf.join("..")] {
+            assert_eq!(
+                parse(path.to_str().unwrap())
+                    .unwrap()
+                    .resolve(&known, &[])
+                    .unwrap(),
+                vec![nested.clone()],
+                "{} with known={known:?}",
+                path.display()
+            );
+        }
     }
 }

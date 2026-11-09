@@ -121,8 +121,8 @@ fn a_pruned_directory_that_returns_is_registered_and_indexed_again() {
         0,
         "the old generation stays gone"
     );
-    assert!(result.collections_pruned.is_empty());
-    assert!(result.collections_vanished.is_empty());
+    assert_eq!(result.collections_pruned, [] as [String; 0]);
+    assert_eq!(result.collections_vanished, [] as [String; 0]);
 }
 
 /// Catches: pruning by path prefix or by "anything covering that directory":

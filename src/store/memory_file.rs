@@ -515,7 +515,7 @@ mod tests {
         let text = to_markdown(&entry);
         assert!(text.contains("tags: []"));
         let back = from_markdown(&text).unwrap().into_entry();
-        assert!(back.tags.is_empty());
+        assert_eq!(back.tags, [] as [String; 0]);
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(parsed.meta.entry_type, EntryType::Topic);
         assert_eq!(parsed.meta.source_type, SourceType::UserStatement);
         assert_eq!(parsed.meta.status, EntryStatus::Active);
-        assert!(parsed.meta.tags.is_empty());
+        assert_eq!(parsed.meta.tags, [] as [String; 0]);
         assert_eq!(parsed.meta.created_at, None);
         assert_eq!(parsed.meta.access_count, None);
     }

@@ -37,8 +37,8 @@ fn test_instructions_content() {
     let instructions = response["result"]["instructions"].as_str().unwrap_or("");
 
     assert!(
-        instructions.contains("search(query)"),
-        "Instructions must mention search(query). Got: {}",
+        instructions.contains("search(query, scope=\"source\")"),
+        "Instructions must route occurrences to source. Got: {}",
         &instructions[..instructions.len().min(200)]
     );
     assert!(
@@ -292,7 +292,7 @@ fn test_instructions_variant_default() {
         "Default variant should produce non-empty instructions"
     );
     assert!(
-        instructions.contains("search(query)"),
+        instructions.contains("search(query, scope=\"source\")"),
         "Default variant must contain search(query)"
     );
 }
@@ -307,7 +307,7 @@ fn test_instructions_variant_unknown_falls_back() {
 
     // Should still get valid instructions (fallback to default)
     assert!(
-        instructions.contains("search(query)"),
+        instructions.contains("search(query, scope=\"source\")"),
         "Unknown variant should fall back to default. Got: {}",
         &instructions[..instructions.len().min(200)]
     );

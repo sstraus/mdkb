@@ -3627,7 +3627,7 @@ mod tests {
 
         // FTS5 should no longer find it
         let results = db.search_symbols("Archive", 10).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]
@@ -3674,7 +3674,7 @@ mod tests {
 
         // "g%" would match both if unescaped; should match neither as literal "g%"
         let results = db.search_symbols("g%", 10).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]
@@ -3795,7 +3795,7 @@ mod tests {
     fn test_search_symbols_empty_db() {
         let (_dir, db) = temp_db();
         let results = db.search_symbols("anything", 10).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]
@@ -3810,7 +3810,7 @@ mod tests {
             .unwrap();
 
         let impact = db.get_impact_radius(orphan_id, 5).unwrap();
-        assert!(impact.is_empty());
+        assert_eq!(impact, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]
@@ -3859,7 +3859,7 @@ mod tests {
     fn test_find_symbols_by_name_not_found() {
         let (_dir, db) = temp_db();
         let results = db.find_symbols_by_name("nonexistent").unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]
@@ -3997,7 +3997,7 @@ mod tests {
     fn test_symbols_in_file_ordered_empty() {
         let (_dir, db) = temp_db();
         let syms = db.symbols_in_file_ordered("nonexistent.rs").unwrap();
-        assert!(syms.is_empty());
+        assert_eq!(syms, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[test]

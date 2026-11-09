@@ -595,7 +595,7 @@ impl McpServer {
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
     #[tool(
-        description = "Semantic search (fuzzy, not literal). Searches docs+memory (default), docs, memory, code symbols (scope=\"symbols\"), semantic code (scope=\"code\"), or duplication clusters (scope=\"duplicates\"). For exact string/regex matching, use Grep instead.",
+        description = "Search source lines, indexed literals, symbols, semantic-code, docs, memory, knowledge, or the duplicates audit; legacy code remains accepted.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -607,6 +607,24 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        if params
+            .scope
+            .as_deref()
+            .is_some_and(|scope| SearchScope::try_from(scope).is_err())
+        {
+            return Err(mcp_error("Invalid search scope"));
+        }
+        crate::core::search_contract::validate(crate::core::search_contract::Request {
+            scope: params.scope.as_deref(),
+            query: &params.query,
+            patterns: params.patterns.as_deref(),
+            path: params.path.as_deref(),
+            file: params.file.as_deref(),
+            regex: params.regex,
+            ignore_case: params.ignore_case,
+            contract: params.contract.as_deref(),
+        })
+        .map_err(|error| mcp_error(error.to_string()))?;
         // `search` is the one tool that fans out, so it resolves the selector
         // itself. `*` always goes to the fan-out — even over one repo, so the
         // answer still states its coverage, and even in standalone mode, where
@@ -1411,6 +1429,25 @@ impl WatchedCollection {
     }
 }
 
+fn watched_document_collections(
+    root: &Path,
+    collections: &[crate::domain::Collection],
+    respect_gitignore: bool,
+) -> Vec<WatchedCollection> {
+    collections
+        .iter()
+        // Session transcripts have a dedicated parser and live outside root;
+        // filesystem document updates deliberately cannot ingest them.
+        .filter(|coll| coll.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
+        .filter(|coll| crate::store::external::source(&coll.name).is_none())
+        .filter_map(|coll| {
+            let mut watched = WatchedCollection::new(root.join(&coll.path), &coll.pattern)?;
+            watched.respect_gitignore = respect_gitignore;
+            Some(watched)
+        })
+        .collect()
+}
+
 fn classify_change(
     path: &Path,
     collections: &[WatchedCollection],
@@ -1726,14 +1763,8 @@ pub async fn run_file_watcher_inner(
         }
     };
 
-    let collection_paths: Vec<WatchedCollection> = collection_list
-        .iter()
-        .filter_map(|coll| {
-            let mut watched = WatchedCollection::new(root.join(&coll.path), &coll.pattern)?;
-            watched.respect_gitignore = doc_respect_gitignore;
-            Some(watched)
-        })
-        .collect();
+    let collection_paths =
+        watched_document_collections(&root, &collection_list, doc_respect_gitignore);
     // Documents and code must both reject build/dependency churn. The document
     // defaults apply even when code indexing has no configured exclusions.
     // DEFERRED (2026-10-21) — ARCH-1: split route policies and preserve force-
@@ -1790,15 +1821,14 @@ pub async fn run_file_watcher_inner(
     }
 
     // Only watch collection paths that are OUTSIDE the root (rare edge case)
-    for coll in &collection_list {
-        let abs_path = root.join(&coll.path);
+    for coll in &collection_paths {
+        let abs_path = &coll.path;
         if !abs_path.starts_with(&root) {
-            if let Err(e) = watcher.watch(&abs_path) {
+            if let Err(e) = watcher.watch(abs_path) {
                 tracing::warn!("Failed to watch {}: {}", abs_path.display(), e);
             } else {
                 tracing::info!(
-                    "Watching external collection '{}' at {}",
-                    coll.name,
+                    "Watching external document collection at {}",
                     abs_path.display()
                 );
             }
@@ -2228,6 +2258,34 @@ async fn flush_doc_update(
     needs_update: &mut FileUpdateRequest,
     needs_memory_sync: &mut FileUpdateRequest,
 ) {
+    // Prune permanent per-path rejections before retaining a request on a
+    // transient failure. Otherwise one escaped path poisons every later retry,
+    // repeatedly reprocessing valid siblings (and scanning graph relations).
+    if let FileUpdateRequest::Changed(paths) = needs_update {
+        if let Ok(canonical_root) = crate::domain::canonicalize_plain(root) {
+            paths.retain(|path| {
+                let absolute = if path.is_absolute() {
+                    path.clone()
+                } else {
+                    canonical_root.join(path)
+                };
+                let resolved = match crate::domain::canonicalize_plain(&absolute) {
+                    Ok(resolved) => resolved,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => absolute.clone(),
+                    Err(_) => return true, // I/O failures may recover on retry.
+                };
+                let keep = resolved.starts_with(&canonical_root)
+                    && !absolute.components().any(|c| matches!(c, std::path::Component::ParentDir));
+                if !keep {
+                    tracing::debug!(path = %path.display(), "Discarding out-of-root watcher document path");
+                }
+                keep
+            });
+            if paths.is_empty() {
+                *needs_update = FileUpdateRequest::Idle;
+            }
+        }
+    }
     let request = std::mem::take(needs_update);
     let full = matches!(request, FileUpdateRequest::Full);
     let files = match &request {
@@ -2300,14 +2358,14 @@ async fn flush_doc_update(
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb — Project Knowledge Base
 
-mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match literal strings or regex — for those use Grep, not mdkb.
+Choose a search scope by task; a zero-hit indexed result is not proof that current source lacks the text.
 
 ## Code
 
-- `code_graph(name)` — callers, callees, or impact radius in one call (`direction=\"callers\"|\"callees\"|\"impact\"`). Replaces multi-file Grep for \"who calls X\".
-- `search(query, scope=\"symbols\")` — find a symbol by name. `scope=\"code\"` — semantic code query.
-- Architecture/decisions: `search(query)` → `get(id)`.
-- Literal string or regex → Grep.
+- Current source occurrences, including comments: `search(query, scope=\"source\")`; repeat `patterns` for OR, or set `regex=true`.
+- Parsed UI values: `search(query, scope=\"literals\")`; uncertain definition names: `search(query, scope=\"symbols\")`.
+- Code concepts: `search(query, scope=\"semantic-code\")`; call relationships: `code_graph(name, direction=\"calls\"|\"callers\"|\"impact\")` (not exhaustive source uses).
+- Architecture/decisions: `search(query, scope=\"knowledge\")` → `get(id)`.
 
 ## Memory
 
@@ -2562,6 +2620,8 @@ mod tests {
             snippets: vec!["...matching text...".to_string()],
             status: None,
             superseded_by: None,
+            source: None,
+            read_only: false,
             repo_root: None,
         }];
         let output = format_search_results(&results, 10);
@@ -2588,6 +2648,8 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
             SearchResult {
@@ -2599,6 +2661,8 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
         ];
@@ -2624,6 +2688,8 @@ mod tests {
             snippets: vec![],
             status: None,
             superseded_by: None,
+            source: None,
+            read_only: false,
             repo_root: Some("/repos/example".to_string()),
         }];
 
@@ -2649,6 +2715,8 @@ mod tests {
             snippets: vec![],
             status: None,
             superseded_by: None,
+            source: None,
+            read_only: false,
             repo_root: Some("/repos/example".to_string()),
         }];
 
@@ -2676,6 +2744,8 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
             SearchResult {
@@ -2687,6 +2757,8 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
         ];
@@ -2724,7 +2796,7 @@ mod tests {
         // Check base instructions present
         assert!(result.contains("# mdkb"));
         assert!(result.contains("memory_write"));
-        assert!(result.contains("search(query)"));
+        assert!(result.contains("search(query, scope=\"source\")"));
 
         // Check entries included
         assert!(result.contains("Available Memories"));
@@ -3073,7 +3145,7 @@ mod tests {
         assert!(result.contains("mdkb"), "Should mention mdkb");
         assert!(result.contains("# mdkb"), "Should explain what mdkb is");
         assert!(
-            result.contains("search(query)"),
+            result.contains("search(query, scope=\"source\")"),
             "Should mention search tool"
         );
         assert!(
@@ -3358,6 +3430,11 @@ mod tests {
 
         let result = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "zzzznonexistentquery99999".to_string(),
                 limit: 10,
                 collection: None,
@@ -3415,6 +3492,11 @@ mod tests {
 
         let result = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "zzzznonexistentquery99999".to_string(),
                 limit: 10,
                 collection: None,
@@ -3745,6 +3827,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "main".to_string(),
                     limit: 10,
                     collection: None,
@@ -3775,6 +3862,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "nonexistent_symbol_xyz".to_string(),
                     limit: 10,
                     collection: None,
@@ -3804,6 +3896,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "DataHelper".to_string(),
                     limit: 10,
                     collection: None,
@@ -3838,6 +3935,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "utility".to_string(),
                     limit: 10,
                     collection: None,
@@ -3868,6 +3970,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "main".to_string(),
                     limit: 10,
                     collection: None,
@@ -3895,6 +4002,11 @@ if (require.main === module) {
             let result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "process".to_string(),
                     limit: 10,
                     collection: None,
@@ -4067,6 +4179,11 @@ if (require.main === module) {
             tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "main".to_string(),
                     limit: 10,
                     collection: None,
@@ -4118,6 +4235,11 @@ if (require.main === module) {
             tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "main".to_string(),
                     limit: 10,
                     collection: None,
@@ -4138,6 +4260,11 @@ if (require.main === module) {
             tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "data".to_string(),
                     limit: 5,
                     collection: None,
@@ -4192,6 +4319,11 @@ if (require.main === module) {
             let find_result = tokio::time::timeout(
                 timeout,
                 server.search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: "main".to_string(),
                     limit: 10,
                     collection: None,
@@ -4477,9 +4609,18 @@ if (require.main === module) {
         assert_eq!(code_doc(path, &collections, &excludes), (true, true));
     }
 
+    /// Catches: edits to i18n JSON bypass the code watcher and leave literal hits stale.
+    #[test]
+    fn test_classify_change_json_refreshes_literals() {
+        let path = Path::new("/project/en.json");
+        let collections = vec![PathBuf::from("/project/docs")];
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+        assert_eq!(code_doc(path, &collections, &excludes), (true, false));
+    }
+
     #[test]
     fn test_classify_change_irrelevant_file() {
-        let path = Path::new("/project/data.json");
+        let path = Path::new("/project/data.txt");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
         assert_eq!(code_doc(path, &collections, &excludes), (false, false));
@@ -4761,9 +4902,14 @@ if (require.main === module) {
             if failure != "file" {
                 std::fs::write(&path, "# Retry\n").unwrap();
             }
-            let mut docs = FileUpdateRequest::Changed(vec![path.clone()]);
+            let outside = root.parent().unwrap().join("outside-session.jsonl");
+            let mut docs = FileUpdateRequest::Changed(vec![outside, path.clone()]);
             let mut memory = FileUpdateRequest::Idle;
             flush_doc_update(&delivery.ctx, &root, &mut docs, &mut memory).await;
+            assert!(
+                matches!(&docs, FileUpdateRequest::Changed(paths) if paths == std::slice::from_ref(&path)),
+                "{failure}: retain transient work, not permanent out-of-root paths"
+            );
             match failure {
                 "closed" => *delivery.ctx.lock().await = saved,
                 "config" => std::fs::write(&config_path, config).unwrap(),
@@ -4830,7 +4976,7 @@ if (require.main === module) {
             }
         }
 
-        async fn apply(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        async fn apply(&mut self, paths: impl IntoIterator<Item = PathBuf>) -> FileUpdateRequest {
             let mut docs = FileUpdateRequest::Idle;
             let mut memory = FileUpdateRequest::Idle;
             let mut code = Vec::new();
@@ -4860,6 +5006,7 @@ if (require.main === module) {
                 docs = FileUpdateRequest::Full;
             }
             flush_doc_update(&self.ctx, &self.root, &mut docs, &mut memory).await;
+            docs
         }
 
         async fn contains(&self, path: &str) -> bool {
@@ -4870,6 +5017,209 @@ if (require.main === module) {
             )
             .unwrap()
             .is_some()
+        }
+
+        /// Collections that index `path`, whatever their name.
+        async fn owners(&self, path: &str) -> Vec<String> {
+            let guard = self.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            collections::list_collections(conn)
+                .unwrap()
+                .into_iter()
+                .filter(|c| {
+                    crate::store::documents::get_document_by_path(conn, &c.name, path)
+                        .unwrap()
+                        .is_some()
+                })
+                .map(|c| c.name)
+                .collect()
+        }
+    }
+
+    /// Catches: session-source notifications entering document batches and
+    /// retrying permanently rejected paths while valid siblings are reprocessed.
+    #[tokio::test]
+    async fn session_source_batch_does_not_retry_or_walk_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let root = base.join("repo");
+        let sessions = base.join(".claude/projects/repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(sessions.join("session/subagents")).unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        let discovered = {
+            let guard = delivery.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            collections::add_collection(
+                conn,
+                &crate::domain::Collection {
+                    name: crate::domain::COLLECTION_CLAUDE_SESSIONS.into(),
+                    path: sessions.to_string_lossy().into_owned(),
+                    pattern: "*.jsonl".into(),
+                    source: crate::domain::COLLECTION_SOURCE_SESSIONS.into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+            collections::list_collections(conn).unwrap()
+        };
+        delivery.collections = watched_document_collections(&root, &discovered, false);
+        delivery.watcher = FileWatcher::new(WatcherConfig { debounce_ms: 20 }).unwrap();
+        delivery.watcher.set_filter(routed_path_filter(
+            delivery.collections.clone(),
+            delivery.excludes.clone(),
+            root.join(".mdkb/memory/entries"),
+            false,
+            None,
+        ));
+        let transcript = sessions.join("session.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        std::fs::write(root.join("sibling.md"), "# Sibling\n").unwrap();
+        std::fs::write(root.join("unrelated.md"), "# Not delivered\n").unwrap();
+        let pending = delivery.apply([transcript, root.join("sibling.md")]).await;
+        assert!(
+            !pending.is_pending(),
+            "session path retained the mixed batch"
+        );
+        assert!(delivery.contains("sibling.md").await);
+        assert!(!delivery.contains("unrelated.md").await);
+        // A bare session directory must not schedule full document recovery.
+        assert!(
+            !delivery
+                .apply([sessions.join("session")])
+                .await
+                .is_pending()
+        );
+        assert!(!delivery.contains("unrelated.md").await);
+    }
+
+    /// Catches: stale/injected out-of-root paths surviving retries even after
+    /// session admission is fixed. Valid siblings still commit, without a walk.
+    #[tokio::test]
+    async fn rejected_watcher_paths_do_not_poison_retry_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let root = base.join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        let outside = base.join("session.jsonl");
+        std::fs::write(&outside, "{}\n").unwrap();
+        std::fs::write(root.join("sibling.md"), "# Sibling\n").unwrap();
+        std::fs::write(root.join("unrelated.md"), "# Not delivered\n").unwrap();
+        let mut docs = FileUpdateRequest::Changed(vec![
+            outside,
+            base.join("vanished"),
+            root.join("sibling.md"),
+        ]);
+        let mut memory = FileUpdateRequest::Idle;
+        flush_doc_update(&delivery.ctx, &root, &mut docs, &mut memory).await;
+        assert!(!docs.is_pending(), "permanent rejection retained the batch");
+        assert!(delivery.contains("sibling.md").await);
+        assert!(!delivery.contains("unrelated.md").await);
+        flush_doc_update(&delivery.ctx, &root, &mut docs, &mut memory).await;
+        assert!(!delivery.contains("unrelated.md").await);
+    }
+
+    /// Catches: one permanently absent collection retains Full forever, blocks
+    /// sibling work, or needs an unrelated discovery pass when documents return.
+    #[tokio::test]
+    async fn missing_collection_is_not_retried_forever() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        {
+            let guard = delivery.ctx.lock().await;
+            collections::add_collection(
+                &guard.as_ref().unwrap().conn,
+                &crate::domain::Collection {
+                    name: "missing".into(),
+                    path: "gone".into(),
+                    pattern: "**/*.md".into(),
+                    source: "manual".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+        }
+        std::fs::write(root.join("ready.md"), "# Ready\n").unwrap();
+        // A delivered directory takes the same full-recovery path as the loop.
+        let pending = delivery.apply([root.clone()]).await;
+        assert!(
+            !pending.is_pending(),
+            "permanently missing collection retained a cooldown retry"
+        );
+        assert!(delivery.contains("ready.md").await);
+        std::fs::write(root.join("unrelated.md"), "# Not delivered\n").unwrap();
+        std::fs::write(root.join("sibling.md"), "# Sibling\n").unwrap();
+        assert!(!delivery.apply([root.join("sibling.md")]).await.is_pending());
+        // Full recovery also creates the convention collection `_root` over the
+        // same base as `docs`; a Changed delivery lands in whichever owns it.
+        assert_eq!(
+            delivery.owners("sibling.md").await.len(),
+            1,
+            "sibling.md must be indexed in exactly one collection"
+        );
+        std::fs::create_dir(root.join("gone")).unwrap();
+        std::fs::write(root.join("gone/returned.md"), "# Returned\n").unwrap();
+        assert!(
+            !delivery
+                .apply([root.join("gone/returned.md")])
+                .await
+                .is_pending()
+        );
+        let guard = delivery.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        assert!(
+            crate::store::documents::get_document_by_path(conn, "missing", "returned.md")
+                .unwrap()
+                .is_some()
+        );
+        drop(guard);
+        assert!(
+            delivery.owners("unrelated.md").await.is_empty(),
+            "restoration triggered unrelated discovery"
+        );
+    }
+
+    /// Catches: a quarantined collection whose directory returns with its files
+    /// already inside (mv, checkout, remount) and only the directory notification
+    /// delivered stays unindexed, because recovery relies on per-file events.
+    #[tokio::test]
+    async fn missing_collection_recovers_from_directory_only_notification() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = crate::domain::canonicalize_plain(temp.path()).unwrap();
+        let mut delivery = DocumentDelivery::new(&root, "**/*.md", false);
+        {
+            let guard = delivery.ctx.lock().await;
+            collections::add_collection(
+                &guard.as_ref().unwrap().conn,
+                &crate::domain::Collection {
+                    name: "gone".into(),
+                    path: "gone".into(),
+                    pattern: "**/*.md".into(),
+                    source: "manual".into(),
+                    created_at: 0,
+                    updated_at: 0,
+                },
+            )
+            .unwrap();
+        }
+        assert!(!delivery.apply([root.clone()]).await.is_pending());
+        std::fs::create_dir_all(root.join("gone/deep")).unwrap();
+        std::fs::write(root.join("gone/a.md"), "# A\n").unwrap();
+        std::fs::write(root.join("gone/deep/b.md"), "# B\n").unwrap();
+        assert!(!delivery.apply([root.join("gone")]).await.is_pending());
+        let guard = delivery.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        for rel in ["a.md", "deep/b.md"] {
+            assert!(
+                crate::store::documents::get_document_by_path(conn, "gone", rel)
+                    .unwrap()
+                    .is_some(),
+                "{rel} not indexed after the collection directory returned"
+            );
         }
     }
 
@@ -5536,7 +5886,7 @@ if (require.main === module) {
             "message: {message}"
         );
         assert!(
-            message.contains("root=\\\"/abs/path\\\""),
+            message.contains("provide MCP roots/list"),
             "message: {message}"
         );
     }
@@ -5608,6 +5958,11 @@ if (require.main === module) {
 
         let result = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "anything".to_string(),
                 limit: 10,
                 collection: None,
@@ -5650,6 +6005,11 @@ if (require.main === module) {
         let server = McpServer::global(registry);
         let err = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "anything".to_string(),
                 limit: 10,
                 collection: None,
@@ -5695,6 +6055,11 @@ if (require.main === module) {
         let server = McpServer::global(registry);
         let result = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: query.to_string(),
                 limit: 20,
                 collection: None,
@@ -5765,6 +6130,11 @@ if (require.main === module) {
         registry.get_or_open(repo.path()).unwrap();
         let err = McpServer::global(registry)
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "anything".to_string(),
                 limit: 10,
                 collection: None,
@@ -5831,6 +6201,11 @@ if (require.main === module) {
 
         let result = server
             .search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "test".to_string(),
                 root: Some("*".to_string()),
                 limit: 10,
@@ -5918,6 +6293,11 @@ if (require.main === module) {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "widgets".to_string(),
                 root: Some("*".to_string()),
                 limit: 10,
@@ -6003,6 +6383,11 @@ if (require.main === module) {
         for query in ["Jev wake judge", "jev wake", "wake judge"] {
             let result = server
                 .search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: query.to_string(),
                     root: Some("*".to_string()),
                     scope: Some("docs".to_string()),
@@ -6076,6 +6461,11 @@ if (require.main === module) {
         for query in ["Jev wake judge", "jev wake", "wake judge"] {
             let result = server
                 .search(Parameters(SearchParams {
+                    patterns: None,
+                    path: None,
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
                     query: query.to_string(),
                     root: Some("*".to_string()),
                     scope: Some("memory".to_string()),
@@ -6139,6 +6529,11 @@ if (require.main === module) {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "backward".to_string(),
                 root: None, // no root param — standalone
                 limit: 10,
@@ -6208,6 +6603,11 @@ if (require.main === module) {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.search(Parameters(SearchParams {
+                patterns: None,
+                path: None,
+                regex: false,
+                ignore_case: false,
+                contract: None,
                 query: "unique".to_string(),
                 root: Some(root2.to_string_lossy().to_string()),
                 limit: 10,

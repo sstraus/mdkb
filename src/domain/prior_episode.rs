@@ -353,8 +353,11 @@ mod tests {
     fn no_tools_yields_empty_episode() {
         let line = r#"{"type":"user","message":{"role":"user","content":"just chatting"}}"#;
         let ep = parse_episode(line);
-        assert!(ep.tools.is_empty());
-        assert!(ep.errors.is_empty());
+        assert_eq!(ep.tools, [] as [crate::domain::prior_episode::ToolUse; 0]);
+        assert_eq!(
+            ep.errors,
+            [] as [crate::domain::prior_episode::ToolError; 0]
+        );
         assert!(!ep.had_corrective_action);
         assert!(!ep.ended_clean);
         assert_eq!(ep.user_messages, vec!["just chatting".to_string()]);

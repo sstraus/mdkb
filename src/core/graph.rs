@@ -729,7 +729,7 @@ mod relation_apply_tests {
 
         let applied = apply_detected_relations(&path, &["org".to_string()]).unwrap();
 
-        assert!(applied.added.is_empty());
+        assert_eq!(applied.added, [] as [String; 0]);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             after_first,
@@ -744,7 +744,7 @@ mod relation_apply_tests {
 
         let applied = apply_detected_relations(&path, &[]).unwrap();
 
-        assert!(applied.added.is_empty());
+        assert_eq!(applied.added, [] as [String; 0]);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             SHIPPED,
@@ -955,7 +955,10 @@ mod relation_detection_tests {
         .unwrap();
 
         let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
-        assert!(found.candidates.is_empty());
+        assert_eq!(
+            found.candidates,
+            [] as [crate::core::graph::RelationCandidate; 0]
+        );
         assert!(
             found.has_no_identity_space(),
             "the caller must be able to say WHY nothing was found"
@@ -975,7 +978,10 @@ mod relation_detection_tests {
         );
 
         let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
-        assert!(found.candidates.is_empty());
+        assert_eq!(
+            found.candidates,
+            [] as [crate::core::graph::RelationCandidate; 0]
+        );
         assert!(!found.has_no_identity_space());
         assert_eq!(found.identities, 1);
     }

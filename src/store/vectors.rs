@@ -995,7 +995,7 @@ mod tests {
 
         let query = test_embedding(0.5);
         let results = vector_search(&conn, &query, 10).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(i64, f32); 0]);
     }
 
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
 
         // Search should return empty
         let results = memory_vector_search(&conn, &test_embedding(0.1), 10, None).unwrap();
-        assert!(results.is_empty());
+        assert_eq!(results, [] as [(i64, f32); 0]);
 
         // Deleting again should return false
         assert!(!delete_memory_embedding(&conn, rowid).unwrap());

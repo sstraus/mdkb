@@ -23,6 +23,11 @@ pub enum Language {
     Swift,
     Lua,
     Gdscript,
+    Objc,
+    Shell,
+    Ruby,
+    Sql,
+    Json,
 }
 
 impl Language {
@@ -43,6 +48,11 @@ impl Language {
             "swift" => Some(Self::Swift),
             "lua" => Some(Self::Lua),
             "gd" => Some(Self::Gdscript),
+            "m" => Some(Self::Objc),
+            "sh" | "bash" => Some(Self::Shell),
+            "rb" => Some(Self::Ruby),
+            "sql" => Some(Self::Sql),
+            "json" => Some(Self::Json),
             _ => None,
         }
     }
@@ -62,10 +72,16 @@ impl Language {
     pub fn from_path_and_content(path: &Path, content: &str) -> Option<Self> {
         let language = Self::from_path(path);
         if language == Some(Self::C)
-            && path.extension().is_some_and(|extension| extension == "h")
-            && is_cpp_header(content)
+            && path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("h"))
         {
-            return Some(Self::Cpp);
+            if is_objc_header(content) {
+                return Some(Self::Objc);
+            }
+            if is_cpp_header(content) {
+                return Some(Self::Cpp);
+            }
         }
         language
     }
@@ -83,17 +99,31 @@ impl Language {
             return None;
         }
         let shebang = line.trim_start_matches("#!");
-        // Match interpreter name from "#!/usr/bin/env X" or "#!/usr/bin/X"
-        let interpreter = shebang
-            .rsplit('/')
-            .next()
-            .unwrap_or(shebang)
-            .split_whitespace()
-            .last()?;
+        // Kernel shebangs name the interpreter first; later words are its
+        // arguments. env adds its own options before that interpreter.
+        let mut words = shebang.split_whitespace();
+        let program = words.next()?.rsplit('/').next()?;
+        let interpreter = if program == "env" {
+            loop {
+                let word = words.next()?;
+                match word {
+                    "-u" | "--unset" | "-C" | "--chdir" => {
+                        words.next()?;
+                    }
+                    "--" => break words.next()?.rsplit('/').next()?,
+                    _ if word.starts_with('-') || word.contains('=') => {}
+                    _ => break word.rsplit('/').next()?,
+                }
+            }
+        } else {
+            program
+        };
         match interpreter {
             "node" | "nodejs" | "bun" | "deno" => Some(Self::JavaScript),
             "ts-node" | "tsx" => Some(Self::TypeScript),
             "python" | "python3" | "python2" => Some(Self::Python),
+            "sh" | "bash" => Some(Self::Shell),
+            "ruby" => Some(Self::Ruby),
             // not supported yet
             _ => None,
         }
@@ -116,6 +146,11 @@ impl Language {
             Self::Swift => &["swift"],
             Self::Lua => &["lua"],
             Self::Gdscript => &["gd"],
+            Self::Objc => &["m", "h"],
+            Self::Shell => &["sh", "bash"],
+            Self::Ruby => &["rb"],
+            Self::Sql => &["sql"],
+            Self::Json => &["json"],
         }
     }
 
@@ -136,6 +171,11 @@ impl Language {
             Self::Swift => "swift",
             Self::Lua => "lua",
             Self::Gdscript => "gdscript",
+            Self::Objc => "objc",
+            Self::Shell => "shell",
+            Self::Ruby => "ruby",
+            Self::Sql => "sql",
+            Self::Json => "json",
         }
     }
 
@@ -156,8 +196,47 @@ impl Language {
             Self::Swift => "Swift",
             Self::Lua => "Lua",
             Self::Gdscript => "GDScript",
+            Self::Objc => "Objective-C",
+            Self::Shell => "Shell",
+            Self::Ruby => "Ruby",
+            Self::Sql => "SQL",
+            Self::Json => "JSON",
         }
     }
+}
+
+/// Objective-C declarations, not occurrences of `@interface` in comments/strings.
+fn is_objc_header(content: &str) -> bool {
+    // Every Objective-C declaration starts with @; plain C headers need no
+    // extra parse. The AST still decides when @ appears in a comment/string.
+    if !content.contains('@') {
+        return false;
+    }
+    let mut parser = tree_sitter::Parser::new();
+    if parser
+        .set_language(&tree_sitter_objc::LANGUAGE.into())
+        .is_err()
+    {
+        return false;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return false;
+    };
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_interface"
+                | "class_implementation"
+                | "protocol_declaration"
+                | "class_declaration"
+                | "protocol_forward_declaration"
+        ) {
+            return true;
+        }
+        stack.extend(node.named_children(&mut node.walk()));
+    }
+    false
 }
 
 /// Whether a `.h` file contains a valid C++ declaration that C cannot express.
@@ -284,11 +363,34 @@ mod tests {
     }
 
     #[test]
-    fn test_shebang_bash_not_supported() {
+    fn shell_shebang_selects_shell_grammar() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("deploy");
         std::fs::write(&script, "#!/bin/bash\necho hello\n").unwrap();
-        assert_eq!(Language::from_path(&script), None);
+        assert_eq!(Language::from_path(&script), Some(Language::Shell));
+    }
+
+    /// `#!/bin/sh -e` and `#!/bin/bash -eu` are the usual way to write a shell
+    /// script; the interpreter is the first word, not the last.
+    #[test]
+    fn shell_shebang_with_flags_selects_shell_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, line) in [
+            ("a", "#!/bin/sh -e"),
+            ("b", "#!/bin/bash -eu"),
+            ("c", "#!/usr/bin/env bash"),
+            ("d", "#!/usr/bin/env -S bash -eu"),
+            ("e", "#!/usr/bin/env -u IGNORED /bin/sh -e"),
+            ("f", "#!/usr/bin/env MODE=test bash -eu"),
+        ] {
+            let script = dir.path().join(name);
+            std::fs::write(&script, format!("{line}\necho hello\n")).unwrap();
+            assert_eq!(
+                Language::from_path(&script),
+                Some(Language::Shell),
+                "shebang {line:?}"
+            );
+        }
     }
 
     #[test]

@@ -937,6 +937,18 @@ pub fn check_hooks(cwd: &Path) -> Result<HookCheck> {
     })
 }
 
+/// The CLI whose settings file receives the hook entries. It decides the
+/// handler shape each host accepts.
+#[derive(Clone, Copy)]
+enum HookHost<'a> {
+    /// Claude Code: a command handler, or its native HTTP handler when a base
+    /// URL is given.
+    Claude { http_base_url: Option<&'a str> },
+    /// Codex CLI: a command handler with a `statusMessage`. Codex `/hooks`
+    /// shows that field as the hook title and "Unnamed hook" without it.
+    Codex,
+}
+
 /// Upsert mdkb hook entries into `settings` in-place, replacing any existing
 /// `_managedBy: "mdkb"` entries and skipping events in `disabled`.
 /// Returns `(registered_events, skipped_events)`.
@@ -945,8 +957,12 @@ fn upsert_hook_entries(
     binary_path: &str,
     disabled: &std::collections::HashSet<String>,
     daemon_required: bool,
-    http_base_url: Option<&str>,
+    host: HookHost<'_>,
 ) -> (Vec<String>, Vec<String>) {
+    let http_base_url = match host {
+        HookHost::Claude { http_base_url } => http_base_url,
+        HookHost::Codex => None,
+    };
     let hooks_root = settings
         .as_object_mut()
         .unwrap()
@@ -964,7 +980,7 @@ fn upsert_hook_entries(
             skipped.push((*event_name).to_string());
             continue;
         }
-        let handler =
+        let mut handler =
             if let Some(base_url) = http_base_url.filter(|_| *event_name != "SessionStart") {
                 serde_json::json!({
                     "type": "http",
@@ -982,6 +998,9 @@ fn upsert_hook_entries(
                     "command": hook_command_line(binary_path, cli_event, daemon_required)
                 })
             };
+        if matches!(host, HookHost::Codex) {
+            handler["statusMessage"] = serde_json::json!(format!("mdkb {cli_event}"));
+        }
         let mut mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
             "hooks": [handler]
@@ -1026,18 +1045,13 @@ fn write_hook_entries(
     cmd_name: &str,
     dry_run: bool,
     daemon_required: bool,
-    http_base_url: Option<&str>,
+    host: HookHost<'_>,
 ) -> Result<(Vec<String>, Vec<String>, serde_json::Value)> {
     if dry_run {
         // Dry-run: read without locking (no write will happen).
         let mut settings = read_json_file(settings_path, cmd_name)?;
-        let (registered, skipped) = upsert_hook_entries(
-            &mut settings,
-            binary_path,
-            disabled,
-            daemon_required,
-            http_base_url,
-        );
+        let (registered, skipped) =
+            upsert_hook_entries(&mut settings, binary_path, disabled, daemon_required, host);
         println!(
             "{}",
             serde_json::to_string_pretty(&settings).unwrap_or_default()
@@ -1053,13 +1067,8 @@ fn write_hook_entries(
     let skipped_ref = &mut skipped_out;
     locked_read_modify_write(settings_path, || {
         let mut settings = read_json_file(settings_path, cmd_name)?;
-        let (registered, skipped) = upsert_hook_entries(
-            &mut settings,
-            binary_path,
-            disabled,
-            daemon_required,
-            http_base_url,
-        );
+        let (registered, skipped) =
+            upsert_hook_entries(&mut settings, binary_path, disabled, daemon_required, host);
         *registered_ref = registered;
         *skipped_ref = skipped;
         Ok(settings)
@@ -1116,7 +1125,7 @@ pub fn handle_setup_hooks_claude_with_http(
         "setup hooks claude",
         dry_run,
         hooks_cfg.daemon_required,
-        http_base_url,
+        HookHost::Claude { http_base_url },
     )?;
 
     Ok(HooksSetupResult {
@@ -1208,7 +1217,7 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
         "setup hooks codex",
         dry_run,
         daemon_required,
-        None,
+        HookHost::Codex,
     )?;
 
     Ok(HooksSetupResult {
@@ -1658,7 +1667,15 @@ mod tests {
                 ]
             }
         });
-        upsert_hook_entries(&mut settings, "/usr/bin/mdkb", &HashSet::new(), false, None);
+        upsert_hook_entries(
+            &mut settings,
+            "/usr/bin/mdkb",
+            &HashSet::new(),
+            false,
+            HookHost::Claude {
+                http_base_url: None,
+            },
+        );
 
         let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
         let managed = pre
@@ -1709,7 +1726,9 @@ mod tests {
             "/usr/bin/mdkb",
             &std::collections::HashSet::new(),
             false,
-            None,
+            HookHost::Claude {
+                http_base_url: None,
+            },
         );
         for event in ["PreToolUse", "PostToolUse"] {
             let entries = settings["hooks"][event].as_array().unwrap();
@@ -1738,7 +1757,15 @@ mod tests {
     fn test_detect_drift_clean_canonical() {
         use std::collections::HashSet;
         let mut settings = serde_json::json!({});
-        upsert_hook_entries(&mut settings, "/usr/bin/mdkb", &HashSet::new(), false, None);
+        upsert_hook_entries(
+            &mut settings,
+            "/usr/bin/mdkb",
+            &HashSet::new(),
+            false,
+            HookHost::Claude {
+                http_base_url: None,
+            },
+        );
         let drift = detect_hook_drift(&[&settings]);
         assert!(
             drift.is_clean(),

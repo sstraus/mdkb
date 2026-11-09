@@ -316,7 +316,7 @@ For local development builds that back active MCP/hooks, prefer:
 scripts/local-release.sh
 ```
 
-It builds `target/release/mdkb`, stops stale `mdkb mcp` processes, restarts the daemon, and reports which process holds the rebuilt binary.
+It builds `target/release/mdkb`, installs a stable copy at `~/.local/bin/mdkb`, stops stale `mdkb mcp` processes, restarts the daemon, and reports which process holds the installed binary. Register MCP and hooks from the stable copy: a managed `target/` view can disappear after a build.
 
 ### Uninstalling
 
@@ -380,12 +380,16 @@ validation and write admission remain authoritative.
 
 | Scope | What it searches |
 |-------|-----------------|
-| _(omit)_ | Docs + memory combined (default) |
-| `docs` | Hybrid BM25 + semantic over markdown documents |
-| `memory` | Hybrid BM25 + semantic over memory entries, identical on every surface — the CLI, the MCP tool and the recall hook build the same OR-expanded query and apply the same absolute relevance floor. `--entry-type` narrows the corpus both legs draw from; it does not select a different engine |
-| `symbols` | Exact symbol lookup by name, filterable by `kind` and `file` |
-| `code` | Semantic code search across indexed symbols |
-| `duplicates` | Clusters of near-identical bodies. `since="<ref>"` narrows the report to clusters your change touched |
+| `source` | Current eligible source lines, including identifiers and comments; report partial scans rather than claiming absence |
+| `literals` | Indexed AST values, not identifiers or all source text |
+| `symbols` | Indexed symbol-name search for uncertain spellings; use `mdkb code find NAME` for an exact definition |
+| `semantic-code` | Semantic search across indexed symbols, not exhaustive textual matches |
+| `docs` | Hybrid BM25 + semantic search over indexed documents |
+| `memory` | Hybrid BM25 + semantic search over memory entries. CLI `--entry-type` and MCP `kind` narrow this corpus |
+| `knowledge` | Indexed documents and memory; does not include source or literals |
+| `duplicates` | Audit of near-identical bodies, not a retrieval query; `since="<ref>"` narrows it to clusters touched by a change |
+
+Name a scope explicitly for agent searches. Legacy defaults differ: CLI also searches indexed literals, while MCP searches docs and memory. Old `text`/`strings` (CLI) search AST literals, and old `code` searches semantic symbols. Existing `symbols`, `docs`, and `memory` JSON shapes remain unchanged unless CLI `--search-contract v2` or MCP `contract="v2"` requests a coverage envelope. An indexed no-match does not prove current working-tree absence when freshness is unknown.
 
 ### Memory
 
@@ -474,7 +478,9 @@ Source types control confidence weighting:
 
 ## Code Intelligence
 
-Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
+Tree-sitter parsing for **18 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, GDScript, Objective-C, shell, Ruby, and SQL.
+
+Objective-C `.m` files and Objective-C declarations in `.h` files include methods, C functions, and file-level static definitions. Go cgo preambles contribute C and Objective-C definitions at their original Go source locations. Shell and Ruby support named definitions; SQL uses a SQLite grammar to index table, view, index, and trigger definitions; other SQL dialects can produce partial results marked with parse errors. These new parsers do not infer dynamic calls or types.
 
 - **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
@@ -556,9 +562,12 @@ the same `buckets` summary alongside `evidence.hamming` per cluster. See
 ### Search
 
 ```bash
-mdkb search "authentication flow"
+mdkb search "handler" --scope source --root .
+mdkb search --scope source -e 'first phrase' -e 'second phrase' --root .
+mdkb code find handler
 mdkb search "handler" --scope symbols --kind function
-mdkb search "auth handler" --scope code
+mdkb search "auth handler" --scope semantic-code
+mdkb search "authentication flow" --scope knowledge
 ```
 
 ### Collections
@@ -732,6 +741,23 @@ by every store the daemon opens, and survives a restart. `mdkb daemon status`
 asks the running daemon for that list over its socket, so it answers at once
 and never walks the disk; with no daemon running it says so and lists nothing.
 
+Healthy roots not opened for more than 30 days leave this map, not the disk.
+Set `repo_expiry_days` in `daemon.toml` to another number of days, or `0` to
+turn expiry off. Explicit `[[repos]]` entries and hand-written repo scopes do
+not expire; unreadable stores stay on the map. Expiry runs at map load and
+when the daemon lists known roots. Opening a forgotten store records it again.
+Activity is persisted on the first successful access per UTC day, including
+access to an already-open handle; later accesses that day do not rewrite the
+file. Thus activity has less than one day of precision. Existing entries without
+activity dates receive a one-time 30-day grace period (or the configured limit).
+`mdkb repos list` and the MCP `repos` tool include `opened@YYYY-MM-DD`.
+CLI JSON and daemon RPC repo rows include `last_opened_at` (UTC Unix seconds,
+null when no activity is known). The RPC keeps its existing `roots` list and
+adds `rows` with the same metadata. Listings read activity outside the store-row
+cache so another process's successful open is visible without a cache delay.
+Map format v2 keeps the existing root/scope fields: old binaries read its entries
+but leave the newer file untouched.
+
 The MCP `root` parameter says which repositories a call means:
 
 | `root` | Means |
@@ -847,6 +873,14 @@ mdkb eval recall --mode hybrid --min-recall 0.9   # exit 1 below the floor
 ```
 
 Baseline numbers, the fixture authoring rule and what CI enforces: [docs/retrieval-eval.md](docs/retrieval-eval.md).
+
+For a full local acceptance run, use `bash scripts/local-e2e.sh` (Rust toolchain,
+Python 3, and network access for the first ONNX model download). The workflow
+runs the regular test suite, normally ignored model-backed tests, and retrieval
+quality checks. It fails if the model is unavailable instead of treating a
+skipped vector eval as a pass. `tests/e2e_local_workflow.rs` also verifies that
+CLI updates refresh document and code search and delete obsolete vectors.
+
 
 The [recall-options experiment](docs/recall-options-eval.md#mac-prompt-path-cost-2026-10-21)
 separates ungated retrieval from actual injected recall and records native Mac
@@ -1011,4 +1045,4 @@ The server is checked once a day. Report reproducible bugs through
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE) — Copyright 2026 Stefano Straus. See [NOTICE](NOTICE).

@@ -59,6 +59,7 @@ fn run_hook_with_mode(
         // background process behind.
         .env("HOME", daemon_dir)
         .env("MDKB_NO_SPAWN", "1")
+        .env("MDKB_HOOK_TELEMETRY", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

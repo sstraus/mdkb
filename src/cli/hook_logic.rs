@@ -1059,7 +1059,10 @@ mod tests {
     #[test]
     fn path_like_tokens_ignores_bare_words() {
         // Plain prose has no path/.md tokens — must not resolve nouns to docs.
-        assert!(path_like_tokens("how does the authentication system work").is_empty());
+        assert_eq!(
+            path_like_tokens("how does the authentication system work"),
+            [] as [String; 0]
+        );
     }
 
     #[test]

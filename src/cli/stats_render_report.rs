@@ -305,7 +305,11 @@ fn window_label(since: Option<i64>) -> String {
 }
 
 fn render_hooks(out: &mut String, h: &HooksSummary) {
-    let mut body = format!("  slow events (7d)  {:>4}", h.slow_events_7d);
+    let mut body = if h.telemetry_enabled {
+        format!("  slow events (7d)  {:>4}", h.slow_events_7d)
+    } else {
+        "  telemetry off      set [telemetry] hook_events = true in ~/.mdkb/daemon.toml".to_string()
+    };
 
     if !h.events.is_empty() {
         body.push_str("\n\n  Event              Calls  Fired   Conv  Hit%   Avg    P95");
@@ -543,6 +547,7 @@ mod tests {
                 ],
             },
             hooks: HooksSummary {
+                telemetry_enabled: true,
                 slow_events_7d: 3,
                 events_since: None,
                 events: vec![],
@@ -811,6 +816,16 @@ mod tests {
     fn render_hooks_shows_slow_count() {
         let out = render(&fixture_report(), false);
         assert!(out.contains('3')); // slow_events_7d
+    }
+
+    /// Catches: zero counts read as "no hook activity" when the logs are simply off.
+    #[test]
+    fn render_hooks_says_telemetry_is_off_instead_of_showing_zeros() {
+        let mut report = fixture_report();
+        report.hooks.telemetry_enabled = false;
+        let out = render(&report, false);
+        assert!(out.contains("telemetry off"), "{out}");
+        assert!(!out.contains("slow events"), "{out}");
     }
 
     #[test]

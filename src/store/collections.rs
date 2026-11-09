@@ -13,6 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// convention auto-registration (`apply_conventions`) — both target the same name
 /// and would otherwise collide under concurrency.
 pub fn add_collection(conn: &Connection, collection: &Collection) -> Result<()> {
+    super::external::refuse_collection(&collection.name)?;
     conn.execute(
         "INSERT INTO collections (name, path, pattern, source, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -80,6 +81,7 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
 
 /// Remove a collection by name.
 pub fn remove_collection(conn: &Connection, name: &str) -> Result<bool> {
+    super::external::refuse_collection(name)?;
     let rows_affected = conn.execute("DELETE FROM collections WHERE name = ?1", params![name])?;
     Ok(rows_affected > 0)
 }
@@ -96,6 +98,8 @@ pub fn get_collection_document_count(conn: &Connection, name: &str) -> Result<i6
 
 /// Rename a collection.
 pub fn rename_collection(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
+    super::external::refuse_collection(old_name)?;
+    super::external::refuse_collection(new_name)?;
     let rows_affected = conn.execute(
         "UPDATE collections SET name = ?1 WHERE name = ?2",
         params![new_name, old_name],

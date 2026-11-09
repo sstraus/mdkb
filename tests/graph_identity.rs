@@ -627,10 +627,9 @@ fn switching_to_manual_clears_what_was_measured() {
         root: env.root,
     };
     env.update();
-    assert!(
-        !mdkb::store::graph::undetected_relation_keys(&env.ctx.conn)
-            .unwrap()
-            .is_empty()
+    assert_ne!(
+        mdkb::store::graph::undetected_relation_keys(&env.ctx.conn).unwrap(),
+        [] as [mdkb::store::graph::RelationCandidateRow; 0]
     );
 
     set_graph_config(
@@ -683,7 +682,7 @@ fn a_broken_frontmatter_block_is_reported_by_update() {
 
     // The document is still indexed — losing it entirely would be worse than
     // losing its metadata — but it claims no identity it never parsed.
-    assert!(env.aliases("broken.md").is_empty());
+    assert_eq!(env.aliases("broken.md"), [] as [(String, String); 0]);
     assert_eq!(
         env.edges("good.md").len(),
         1,
@@ -798,7 +797,7 @@ fn a_manual_pattern_survives_an_update() {
         pattern, "*.md",
         "source=manual is a choice, not a stale default"
     );
-    assert!(result.pattern_upgrades.is_empty());
+    assert_eq!(result.pattern_upgrades, [] as [String; 0]);
 }
 
 /// A revert performed with the supported command has to survive the next update.

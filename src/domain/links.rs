@@ -175,7 +175,7 @@ mod tests {
         let content = "No wiki links here, just [regular](link.md).";
         let links = extract_wiki_links(content);
 
-        assert!(links.is_empty());
+        assert_eq!(links, [] as [crate::domain::links::WikiLink; 0]);
     }
 
     #[test]

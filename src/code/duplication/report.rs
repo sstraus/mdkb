@@ -1600,8 +1600,14 @@ mod tests {
 
         assert_eq!(value["clusters"], 0);
         assert_eq!(value["duplicated_lines"], 0);
-        assert!(value["findings"].as_array().unwrap().is_empty());
-        assert!(value["buckets"].as_array().unwrap().is_empty());
+        assert_eq!(
+            value["findings"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
+        assert_eq!(
+            value["buckets"].as_array().unwrap().as_slice(),
+            [] as [serde_json::Value; 0]
+        );
         assert_eq!(render_csv(&[]).lines().count(), 1, "the header alone");
     }
 

@@ -123,10 +123,21 @@ pub(crate) async fn dispatch_hook_message(
     }
 
     if method == REPOS_METHOD {
+        let owner = Arc::clone(registry);
+        let rows = match tokio::task::spawn_blocking(move || owner.listed_rows()).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return rpc_error(id, -32603, &format!("repos: listing task failed: {error}"));
+            }
+        };
+        let roots: Vec<_> = rows.iter().map(|row| &row.path).collect();
         return json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": { "roots": registry.listed_roots() },
+            "result": {
+                "roots": roots,
+                "rows": rows,
+            },
         })
         .to_string();
     }
@@ -151,6 +162,14 @@ pub(crate) async fn dispatch_hook_message(
             serde_json::from_value::<crate::core::cli_mutation::CliMutation>(params.clone())
     {
         return rpc_error(id, -32602, &format!("cli.mutate: invalid params: {error}"));
+    }
+
+    if matches!(
+        method,
+        "external.upsert" | "external.delete" | "external.list"
+    ) && let Err(error) = crate::store::external::Request::parse(method, params.clone())
+    {
+        return rpc_error(id, -32602, &format!("{method}: invalid params: {error}"));
     }
 
     let handle = match registry.get_or_open(root) {
@@ -282,7 +301,7 @@ mod tests {
                 "root={root:?}: {reply}"
             );
             assert_eq!(registry.active_count(), 0);
-            assert!(registry.listed_roots().is_empty());
+            assert_eq!(registry.listed_roots(), [] as [std::path::PathBuf; 0]);
         }
     }
 

@@ -35,6 +35,49 @@ use mdkb::store::memory::{self, EntryStatus};
 /// not make a global counter a statement about a particular store.
 static WATCHER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Thread-local capture of mdkb tracing output, so a failing watcher test can
+/// print the delivered paths and the flush that counted as a reindex.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = CapturedLog;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl CapturedLog {
+    /// Install for the current thread. A `current_thread` runtime polls the
+    /// spawned watcher on this thread, so its events are captured too.
+    fn install(&self) -> tracing::subscriber::DefaultGuard {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(self.clone())
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new("mdkb=debug"))
+            .finish();
+        tracing::subscriber::set_default(subscriber)
+    }
+
+    fn len(&self) -> usize {
+        self.0.lock().unwrap().len()
+    }
+
+    fn since(&self, offset: usize) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()[offset..]).into_owned()
+    }
+}
+
 /// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.
 fn canonical_tempdir() -> TempDir {
     let base = std::env::temp_dir()
@@ -898,9 +941,11 @@ async fn stats_reports_a_fresh_code_index_after_an_editing_session() {
 /// would overflow it, set the flag and force a full rescan. The final routed
 /// write is the control: it proves the watcher was live, so the silence before
 /// it is the filter and not a deaf watcher.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test(flavor = "current_thread")]
 async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     let _serial = WATCHER_TESTS.lock().await;
+    let log = CapturedLog::default();
+    let _log_guard = log.install();
     let tmp = canonical_tempdir();
     let root = tmp.path().to_path_buf();
 
@@ -917,7 +962,7 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
     let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
     let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(None));
     let ready = Arc::new(tokio::sync::Notify::new());
-    let watcher = {
+    let start_watcher = || {
         let (root, ctx, code, ready) = (
             root.clone(),
             Arc::clone(&ctx_arc),
@@ -940,15 +985,51 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
             .await;
         })
     };
+    let watcher = start_watcher();
     tokio::time::timeout(Duration::from_secs(20), ready.notified())
         .await
         .expect("watcher ready");
 
-    // Let the bootstrap reindex settle so the baseline counts only what the
-    // burst causes.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Catches a baseline splitting setup recovery: code finishes before the
+    // document task can acquire the context. A native directory notification
+    // is legitimate reconciliation, unlike the object-file burst below.
+    let setup_context = ctx_arc.lock().await;
+    let setup_code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+    std::fs::create_dir(root.join("setup-directory")).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while CODE_REINDEX_COUNT.load(Ordering::Relaxed) == setup_code_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "native setup directory never triggered recovery"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Ready only means watches are registered and code bootstrap completed.
+    // Release the delayed document phase and observe its completion before
+    // sampling either counter; elapsed time cannot establish that boundary.
+    let setup_docs_before = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
+    drop(setup_context);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while DOC_REINDEX_COUNT.load(Ordering::Relaxed) == setup_docs_before {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "setup recovery never completed its document phase"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Keep the split-baseline reproduction above out of the burst observation:
+    // its recovery arms a 30s cooldown. Restart with the populated code facade,
+    // so bootstrap writes no files and overflow recovery is immediately eligible.
+    watcher.abort();
+    let _ = watcher.await;
+    let watcher = start_watcher();
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
+        .await
+        .expect("burst watcher ready");
     let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
     let docs_before = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
+    let log_before = log.len();
 
     // Six times the channel: unfiltered, the tail would be dropped (measured
     // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls).
@@ -957,6 +1038,11 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
         std::fs::write(junk.join(format!("artifact{n}.o")), format!("{n}\n")).unwrap();
     }
 
+    // Hold this single-threaded consumer while the native callback delivers
+    // the burst. Without admission filtering, its 100-slot channel must overflow
+    // rather than depending on the consumer losing a scheduler race.
+    std::thread::sleep(Duration::from_secs(1));
+
     // Far longer than debounce (50ms) plus flush idle (200ms): a rescan caused
     // by the burst would have completed well inside this.
     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -964,7 +1050,9 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
         CODE_REINDEX_COUNT.load(Ordering::Relaxed),
         code_before,
         "a burst of unrouted files scheduled a reindex: the delivery filter is \
-         not installed, so the channel overflowed and forced a full rescan"
+         not installed, so the channel overflowed and forced a full rescan.\n\
+         Watcher log after the burst baseline:\n{}",
+        log.since(log_before)
     );
 
     assert_eq!(
@@ -988,7 +1076,15 @@ async fn an_unrouted_burst_neither_drops_events_nor_forces_a_rescan() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // A routed flush must not hide a full recovery queued by the burst.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        DOC_REINDEX_COUNT.load(Ordering::Relaxed),
+        docs_before,
+        "routed control must not conceal an artifact-triggered recovery"
+    );
     watcher.abort();
+    let _ = watcher.await;
 }
 
 /// Catches: resetting the idle sleep on every injected event, which starves

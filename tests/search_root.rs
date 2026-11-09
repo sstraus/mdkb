@@ -88,6 +88,129 @@ fn stderr(out: &Output) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+/// A controlled peer for the repository-owned `daemon.repos` protocol. The
+/// test process is the live PID; no detached daemon or developer state is used.
+fn delayed_repo_list(
+    home: &Path,
+    roots: &[&Path],
+    delay: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let listener = UnixListener::bind(home.join(".mdkb/daemon-hook.sock")).unwrap();
+    std::fs::write(
+        home.join(".mdkb/daemon.pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let roots: Vec<PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut header = [0; 4];
+        stream.read_exact(&mut header).unwrap();
+        let mut body = vec![0; u32::from_le_bytes(header) as usize];
+        stream.read_exact(&mut body).unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(request["method"], "daemon.repos");
+        std::thread::sleep(delay);
+        let response = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0", "id": request["id"], "result": {"roots": roots},
+        }))
+        .unwrap();
+        // A timed-out client has closed its side; that is expected here.
+        let _ = stream.write_all(&u32::try_from(response.len()).unwrap().to_le_bytes());
+        let _ = stream.write_all(&response);
+    })
+}
+
+/// Catches: a live daemon missing the 2 s list deadline aborting scoped search
+/// even though the persisted map identifies a readable store.
+#[test]
+fn a_slow_daemon_list_does_not_abort_scoped_search() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let home = home_knowing(tmp.path(), &[&alpha]);
+    let before = std::fs::read(home.join(".mdkb/repos.json")).unwrap();
+    let server = delayed_repo_list(&home, &[&alpha], std::time::Duration::from_millis(2250));
+
+    let out = search(
+        &home,
+        &alpha,
+        &["zonk_harvest", "--scope", "memory", "--root", "alpha"],
+    );
+    server.join().unwrap();
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("zonk_harvest"), "{}", stdout(&out));
+    let err = stderr(&out);
+    let notes: Vec<_> = err
+        .lines()
+        .filter(|line| line.contains("repos.json"))
+        .collect();
+    assert_eq!(notes.len(), 1, "{err}");
+    assert!(notes[0].contains("no answer within 2s"), "{err}");
+    assert!(notes[0].contains("using persisted"), "{err}");
+    assert_eq!(
+        std::fs::read(home.join(".mdkb/repos.json")).unwrap(),
+        before
+    );
+}
+
+/// Catches: always using the persisted map even when the live daemon answers
+/// a different list, causing a selector to miss an in-memory registration.
+#[test]
+fn a_timely_daemon_list_wins_over_the_persisted_map() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let beta = store(tmp.path(), "beta", "quux_ledger");
+    let home = home_knowing(tmp.path(), &[&beta]);
+    let server = delayed_repo_list(&home, &[&alpha], std::time::Duration::ZERO);
+
+    let out = search(
+        &home,
+        &beta,
+        &["zonk_harvest", "--scope", "memory", "--root", "alpha"],
+    );
+    server.join().unwrap();
+
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("zonk_harvest"), "{}", stdout(&out));
+    assert!(
+        !stderr(&out).contains("using persisted"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Catches: treating a corrupt fallback map as an empty successful search.
+#[test]
+fn a_slow_daemon_list_does_not_hide_a_corrupt_persisted_map() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let home = home_knowing(tmp.path(), &[&alpha]);
+    std::fs::write(home.join(".mdkb/repos.json"), "{broken").unwrap();
+    let server = delayed_repo_list(&home, &[&alpha], std::time::Duration::from_millis(2250));
+
+    let out = search(
+        &home,
+        &alpha,
+        &["zonk_harvest", "--scope", "memory", "--root", "alpha"],
+    );
+    server.join().unwrap();
+
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("repos.json"), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert_eq!(
+        std::fs::read_to_string(home.join(".mdkb/repos.json")).unwrap(),
+        "{broken"
+    );
+}
+
 /// Catches: the CLI/MCP parity gap itself — `--root <name>` ignored, so the
 /// search runs against the repo of the current directory and the other repo's
 /// entry never appears.
@@ -139,6 +262,69 @@ fn root_by_absolute_path_needs_no_repo_map_entry() {
 
     assert!(out.status.success(), "{out:?}");
     assert!(stdout(&out).contains("zonk_harvest"), "{}", stdout(&out));
+}
+
+/// Catches: dot being looked up as a repository name instead of the local path.
+#[test]
+fn dot_root_searches_the_containing_registered_repo() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let home = home_knowing(tmp.path(), &[&alpha]);
+    let subdir = alpha.join("src");
+    std::fs::create_dir(&subdir).unwrap();
+
+    let out = search(
+        &home,
+        &subdir,
+        &["zonk_harvest", "--scope", "memory", "--root", "."],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("zonk_harvest"), "{}", stdout(&out));
+}
+
+/// Catches: relative or absolute descendants opening the subdirectory instead of
+/// the nearest known store; explicit dot syntax distinguishes paths from names.
+#[test]
+fn root_paths_search_the_nearest_store_from_the_current_directory() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let nested = store(&alpha, "nested", "quux_ledger");
+    let leaf = nested.join("src");
+    std::fs::create_dir(&leaf).unwrap();
+    // Only the outer store is registered: the nearest initialized store wins.
+    let home = home_knowing(tmp.path(), &[&alpha]);
+    for root in ["./nested/src", "./nested/src/..", leaf.to_str().unwrap()] {
+        let out = search(
+            &home,
+            &alpha,
+            &["quux_ledger", "--scope", "memory", "--root", root],
+        );
+        assert!(out.status.success(), "{root}: {}", stderr(&out));
+        assert!(
+            stdout(&out).contains("quux_ledger"),
+            "{root}: {}",
+            stdout(&out)
+        );
+    }
+}
+
+/// Catches: silently opening an uninitialized outside path rather than refusing it.
+#[test]
+fn an_outside_path_exits_non_zero_and_names_the_path() {
+    let tmp = TempDir::new().unwrap();
+    let alpha = store(tmp.path(), "alpha", "zonk_harvest");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join(".mdkb")).unwrap();
+    let home = home_knowing(tmp.path(), &[&alpha]);
+    let raw = outside.to_str().unwrap();
+    let out = search(&home, &alpha, &["zonk_harvest", "--root", raw]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains(raw) && err.contains("not inside a known repo"),
+        "{err}"
+    );
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
 }
 
 /// Catches: a CLI that silently picks one of several repos sharing a name — it

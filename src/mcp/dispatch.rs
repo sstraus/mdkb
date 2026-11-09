@@ -248,6 +248,12 @@ pub(super) fn format_search_results(results: &[SearchResult], limit: usize) -> S
                 result.id, result.path, title, result.score
             ));
         }
+        if result.read_only {
+            output.push_str(&format!(
+                "  read-only, source: {}\n",
+                result.source.as_deref().unwrap_or("external")
+            ));
+        }
         for snippet in &result.snippets {
             output.push_str(&format!("  {snippet}\n"));
         }
@@ -2030,8 +2036,137 @@ pub async fn search_impl(
             mcp_error(format!("Invalid scope: '{invalid}'. Valid: {valid}."))
         })?;
     let limit = params.limit.min(100);
-
+    let alternatives = params.patterns.as_deref().unwrap_or(&[]);
+    if !alternatives.is_empty() && !params.query.is_empty() {
+        return Err(mcp_error("Choose query or patterns, not both"));
+    }
+    if !alternatives.is_empty()
+        && !matches!(
+            scope,
+            Some(crate::mcp::tools::SearchScope::Source | crate::mcp::tools::SearchScope::Literals)
+        )
+    {
+        return Err(mcp_error("patterns are for source/literals only"));
+    }
+    if params.regex && scope != Some(crate::mcp::tools::SearchScope::Source) {
+        return Err(mcp_error("regex is for source only"));
+    }
+    if params.path.is_some()
+        && !matches!(
+            scope,
+            Some(
+                crate::mcp::tools::SearchScope::Source
+                    | crate::mcp::tools::SearchScope::Literals
+                    | crate::mcp::tools::SearchScope::Symbols
+                    | crate::mcp::tools::SearchScope::Duplicates
+            )
+        )
+    {
+        return Err(mcp_error("path is not supported for this corpus"));
+    }
+    if params.path.is_some() && params.file.is_some() {
+        return Err(mcp_error("Choose path or legacy file, not both"));
+    }
+    if params
+        .contract
+        .as_deref()
+        .is_some_and(|version| version != "v2")
+    {
+        return Err(mcp_error("contract accepts only v2"));
+    }
+    if params.query.trim().is_empty()
+        && alternatives.is_empty()
+        && !matches!(
+            scope,
+            Some(crate::mcp::tools::SearchScope::Duplicates) | None
+        )
+    {
+        return Err(mcp_error("This scope needs query or patterns"));
+    }
     match scope {
+        Some(crate::mcp::tools::SearchScope::Source) => {
+            let patterns = if alternatives.is_empty() {
+                vec![params.query.clone()]
+            } else {
+                alternatives.to_vec()
+            };
+            let result = crate::core::source_search::search(
+                &handle.root,
+                crate::core::source_search::SourceRequest {
+                    patterns: &patterns,
+                    path: params.path.as_deref(),
+                    regex: params.regex,
+                    ignore_case: params.ignore_case,
+                    limit,
+                },
+            )
+            .map_err(|error| mcp_error(format!("Source search failed: {error}")))?;
+            let count = result.hits.len();
+            let output = serde_json::to_string_pretty(&result)
+                .map_err(|error| mcp_error(error.to_string()))?;
+            Ok((output, count))
+        }
+        Some(crate::mcp::tools::SearchScope::Literals) => {
+            let patterns = if alternatives.is_empty() {
+                vec![params.query.clone()]
+            } else {
+                alternatives.to_vec()
+            };
+            let result = crate::core::text_search::search_canonical(
+                &handle.root,
+                &patterns,
+                params.ignore_case,
+                params.path.as_deref(),
+                limit,
+            )
+            .map_err(|error| mcp_error(format!("Literal search failed: {error}")))?;
+            let count = result.hits.len();
+            let output = serde_json::to_string_pretty(&result)
+                .map_err(|error| mcp_error(error.to_string()))?;
+            Ok((output, count))
+        }
+        Some(crate::mcp::tools::SearchScope::Knowledge) => {
+            let query_embedding = embed_query_off_lock(&params.query).await;
+            let mut ctx_guard = handle.ctx.lock().await;
+            let (docs, memories) =
+                crate::core::run_guarded_read(&mut ctx_guard, "knowledge search", |ctx| {
+                    let docs = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        limit.saturating_add(1),
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )?;
+                    let memories = memory::search_entries_recall(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        limit.saturating_add(1),
+                        None,
+                        &handle.config.search.memory,
+                    )?;
+                    Ok((docs, memories))
+                })
+                .ok_or_else(|| mcp_error("Database not initialized"))?
+                .map_err(|error| mcp_error(format!("Knowledge search failed: {error}")))?;
+            let doc_count = docs.len().min(limit);
+            let memory_count = memories.len().min(limit.saturating_sub(doc_count));
+            let truncated = docs.len().saturating_add(memories.len()) > limit;
+            let hits: Vec<_> =
+                docs.iter()
+                    .take(doc_count)
+                    .map(|doc| serde_json::json!({"corpus": "docs", "value": doc}))
+                    .chain(memories.iter().take(memory_count).map(
+                        |entry| serde_json::json!({"corpus": "memory", "value": &entry.entry}),
+                    ))
+                    .collect();
+            let output = serde_json::json!({
+                "scope": "knowledge", "unit": "knowledge_result", "status": "partial",
+                "coverage": {"reason": "indexed corpus freshness not verified"},
+                "freshness": {"state": "unknown"}, "hits": hits, "truncated": truncated
+            });
+            Ok((output.to_string(), doc_count + memory_count))
+        }
         Some(crate::mcp::tools::SearchScope::Docs) => {
             let mut ctx_guard = handle.ctx.lock().await;
             let _hold = crate::core::SlotHold::start("search_impl");
@@ -2039,7 +2174,11 @@ pub async fn search_impl(
                 handle_hybrid_search(
                     ctx,
                     &params.query,
-                    limit,
+                    if params.contract.is_some() {
+                        limit.saturating_add(1)
+                    } else {
+                        limit
+                    },
                     params.collection.as_deref(),
                     params.include_superseded,
                 )
@@ -2047,6 +2186,16 @@ pub async fn search_impl(
             .ok_or_else(|| mcp_error("Database not initialized"))?
             .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
 
+            if params.contract.as_deref() == Some("v2") {
+                let output = crate::core::search_contract::indexed_envelope(
+                    "docs",
+                    "document",
+                    &results,
+                    limit,
+                    results.len(),
+                );
+                return Ok((output.to_string(), results.len().min(limit)));
+            }
             let top_score = results.first().map(|r| r.score);
             let mut output = format_search_results(&results, limit);
             if let Some(hint) = ood_hint(&params.query, results.len(), top_score) {
@@ -2068,7 +2217,11 @@ pub async fn search_impl(
                     &ctx.conn,
                     &params.query,
                     query_embedding.as_deref(),
-                    limit,
+                    if params.contract.is_some() {
+                        limit.saturating_add(1)
+                    } else {
+                        limit
+                    },
                     None,
                     &handle.config.search.memory,
                 )
@@ -2079,6 +2232,16 @@ pub async fn search_impl(
                 entries.into_iter().map(|result| result.entry).collect();
             let entries = apply_min_confidence(entries, params.min_confidence);
 
+            if params.contract.as_deref() == Some("v2") {
+                let output = crate::core::search_contract::indexed_envelope(
+                    "memory",
+                    "memory_entry",
+                    &entries,
+                    limit,
+                    entries.len(),
+                );
+                return Ok((output.to_string(), entries.len().min(limit)));
+            }
             let mut output = format_memory_search_results(&entries);
             if let Some(hint) = ood_hint(&params.query, entries.len(), None) {
                 output.push_str(hint);
@@ -2147,14 +2310,28 @@ pub async fn search_impl(
             .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, total))
         }
-        Some(crate::mcp::tools::SearchScope::Code | crate::mcp::tools::SearchScope::Symbols) => {
+        Some(
+            crate::mcp::tools::SearchScope::Code
+            | crate::mcp::tools::SearchScope::SemanticCode
+            | crate::mcp::tools::SearchScope::Symbols,
+        ) => {
             let mut idx_guard = acquire_handle_code_index(handle).await?;
             let Some(facade) = idx_guard.as_mut() else {
                 return Ok(("Code index is being rebuilt, retry shortly.".to_string(), 0));
             };
 
-            if scope == Some(crate::mcp::tools::SearchScope::Code) {
-                let code_limit = params.limit.min(5);
+            if matches!(
+                scope,
+                Some(
+                    crate::mcp::tools::SearchScope::Code
+                        | crate::mcp::tools::SearchScope::SemanticCode
+                )
+            ) {
+                let code_limit = if scope == Some(crate::mcp::tools::SearchScope::Code) {
+                    params.limit.min(5)
+                } else {
+                    limit
+                };
                 let results = crate::core::code::semantic_search_scoped(
                     facade,
                     &handle.config,
@@ -2165,6 +2342,16 @@ pub async fn search_impl(
                 )
                 .map_err(|e| mcp_error(e.to_string()))?;
 
+                if scope == Some(crate::mcp::tools::SearchScope::SemanticCode) {
+                    let count = results.len();
+                    let response = serde_json::json!({
+                        "scope": "semantic-code", "unit": "symbol", "status": "partial",
+                        "coverage": {"reason": "semantic ranking is not exhaustive"},
+                        "freshness": {"state": "unknown"}, "truncated": count == code_limit,
+                        "hits": results.iter().map(|(symbol, score)| serde_json::json!({"symbol": symbol, "score": score})).collect::<Vec<_>>()
+                    });
+                    return Ok((response.to_string(), count));
+                }
                 if results.is_empty() {
                     return Ok(("No semantic matches found.".to_string(), 0));
                 }
@@ -2187,6 +2374,16 @@ pub async fn search_impl(
                 .map_err(|e| mcp_error(e.to_string()))?;
                 let symbols = found.symbols;
 
+                if params.contract.as_deref() == Some("v2") {
+                    let output = crate::core::search_contract::indexed_envelope(
+                        "symbols",
+                        "symbol",
+                        &symbols,
+                        limit,
+                        found.total,
+                    );
+                    return Ok((output.to_string(), symbols.len()));
+                }
                 if symbols.is_empty() {
                     let total = facade.symbol_count();
                     return Ok((
@@ -2294,7 +2491,13 @@ pub fn resolve_root_selector(
     root: Option<&str>,
     scope: &[std::path::PathBuf],
 ) -> Result<ResolvedRoots, McpError> {
-    let selector = RootSelector::parse(root).map_err(mcp_error)?;
+    let selector = RootSelector::parse_at(
+        root,
+        scope
+            .first()
+            .map_or(std::path::Path::new("."), |p| p.as_path()),
+    )
+    .map_err(mcp_error)?;
     let open: Vec<std::path::PathBuf> = registry
         .all_handles()
         .iter()
@@ -2307,8 +2510,8 @@ pub fn resolve_root_selector(
         set.into_iter().collect::<Vec<_>>()
     };
     // Discovery is a recursive walk of every known root. Pay it only for the
-    // selectors whose answer it can change: an explicit path is itself, and
-    // walking 9355 directories to confirm that is latency charged to every
+    // selectors whose answer it can change: paths probe only their ancestors.
+    // Walking 9355 directories to confirm that is latency charged to every
     // interactive call for nothing.
     let known: Vec<std::path::PathBuf> = {
         let mut set: std::collections::BTreeSet<std::path::PathBuf> = if selector.needs_discovery()
@@ -2399,7 +2602,7 @@ pub fn single_root(
     }
     match roots.len() {
         0 => Err(mcp_error(
-            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+            "No repos registered. Register a repo or provide MCP roots/list.",
         )),
         1 => Ok(roots[0].clone()),
         // No `root` and several repos in scope is a different fact from a
@@ -2809,6 +3012,8 @@ fn search_one_repo(
                             snippets: vec![text],
                             status: None,
                             superseded_by: None,
+                            source: None,
+                            read_only: false,
                             repo_root: Some(repo_tag.clone()),
                         };
                         if let Some(e) = entries.first() {
@@ -2878,6 +3083,60 @@ fn search_roots_blocking(
         .collect()
 }
 
+/// Canonical AST-literal fan-out: keep each root's freshness evidence and use
+/// one limit for the combined hit list, unlike the legacy text alias.
+async fn cross_repo_literals_impl(
+    registry: &Arc<RepoRegistry>,
+    params: &SearchParams,
+    client_scope: &[std::path::PathBuf],
+    limit: usize,
+) -> Result<(String, usize), McpError> {
+    if limit == 0 {
+        return Err(mcp_error("literal limit must be 1..=1000"));
+    }
+    let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
+    if resolution.roots.is_empty() {
+        return Err(mcp_error(
+            "No repos registered. Register a repo or provide MCP roots/list.",
+        ));
+    }
+    let roots = resolution.roots.clone();
+    let registry = Arc::clone(registry);
+    let params = params.clone();
+    let outcomes = tokio::task::spawn_blocking(move || {
+        let patterns = params.patterns.unwrap_or_else(|| vec![params.query]);
+        roots
+            .into_iter()
+            .map(|root| {
+                let result = registry
+                    .read_only_context(&root)
+                    .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        crate::core::text_search::search_canonical(
+                            &root,
+                            &patterns,
+                            params.ignore_case,
+                            params.path.as_deref(),
+                            limit,
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                (root, result)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| mcp_error(format!("cross-repo literal search task failed: {error}")))?;
+
+    let output = crate::core::text_search::aggregate_canonical_roots(
+        outcomes,
+        resolution.excluded_by_scope,
+        limit,
+    );
+    let count = output["hits"].as_array().map_or(0, Vec::len);
+    Ok((output.to_string(), count))
+}
+
 /// `search` (cross-repo) — fan out across every repo the daemon knows, merge
 /// with score-descending sort, and truncate to `params.limit`. Memory results
 /// from each repo are formatted as a single pseudo-result for compatibility
@@ -2907,8 +3166,60 @@ pub async fn cross_repo_search_impl(
         .map_err(|()| mcp_error("Invalid search scope"))?;
     let limit = params.limit.min(100);
 
+    let canonical_indexed = match scope {
+        Some(crate::mcp::tools::SearchScope::Knowledge) => Some("knowledge"),
+        Some(crate::mcp::tools::SearchScope::Docs) if params.contract.as_deref() == Some("v2") => {
+            Some("docs")
+        }
+        Some(crate::mcp::tools::SearchScope::Memory)
+            if params.contract.as_deref() == Some("v2") =>
+        {
+            Some("memory")
+        }
+        _ => None,
+    };
+    if let Some(scope_name) = canonical_indexed {
+        let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
+        if resolution.roots.is_empty() {
+            return Err(mcp_error(
+                "No repos registered. Register a repo or provide MCP roots/list.",
+            ));
+        }
+        let roots = resolution.roots;
+        let excluded = resolution.excluded_by_scope;
+        let registry = Arc::clone(registry);
+        let params = params.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            crate::core::search_contract::search_indexed_roots(
+                &roots,
+                excluded,
+                scope_name,
+                &params.query,
+                limit,
+                params.collection.as_deref(),
+                params.include_superseded,
+                (scope_name == "memory")
+                    .then_some(params.kind.as_deref())
+                    .flatten(),
+                params.min_confidence,
+                |root| {
+                    registry
+                        .read_only_context(root)
+                        .map_err(|error| error.to_string())
+                },
+            )
+        })
+        .await
+        .map_err(|error| mcp_error(format!("cross-repo indexed search task failed: {error}")))?;
+        let count = output["hits"].as_array().map_or(0, Vec::len);
+        return Ok((output.to_string(), count));
+    }
+
     if scope == Some(crate::mcp::tools::SearchScope::Symbols) {
         return cross_repo_symbols_impl(registry, params, client_scope, limit).await;
+    }
+    if scope == Some(crate::mcp::tools::SearchScope::Literals) {
+        return cross_repo_literals_impl(registry, params, client_scope, limit).await;
     }
     if matches!(
         scope,
@@ -2918,6 +3229,14 @@ pub async fn cross_repo_search_impl(
             "Cross-repo search is not supported for code/duplicates scope. Specify a root.",
         ));
     }
+    if matches!(
+        scope,
+        Some(crate::mcp::tools::SearchScope::Source | crate::mcp::tools::SearchScope::SemanticCode)
+    ) {
+        return Err(mcp_error(
+            "This scope has no cross-repo result adapter yet; name one root. Do not treat this as a no-match.",
+        ));
+    }
 
     // Which repos, through the one parser. The stores themselves are opened
     // one at a time inside the blocking task below, so a selector naming a
@@ -2925,7 +3244,7 @@ pub async fn cross_repo_search_impl(
     let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
     if resolution.roots.is_empty() {
         return Err(mcp_error(
-            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+            "No repos registered. Register a repo or provide MCP roots/list.",
         ));
     }
 
@@ -3048,7 +3367,7 @@ async fn cross_repo_symbols_impl(
     let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
     if resolution.roots.is_empty() {
         return Err(mcp_error(
-            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+            "No repos registered. Register a repo or provide MCP roots/list.",
         ));
     }
 
@@ -3134,6 +3453,14 @@ fn render_document_content(
             }
             _ => mcp_store_error("Failed to get document content", e),
         })?;
+
+    if crate::store::external::source(&doc.collection).is_some() {
+        output = format!(
+            "{}\n\n{}",
+            crate::store::external::label(&doc.collection).trim(),
+            output
+        );
+    }
 
     let document_status = match evolution::get_document_status(&ctx.conn, doc.id) {
         Ok(status) => status,
@@ -4482,15 +4809,22 @@ pub async fn usage_impl(
 /// prints with. `registry` is the daemon's own list (global mode); without one,
 /// the persisted map, which is what the CLI reads when no daemon runs.
 pub async fn repos_impl(registry: Option<&RepoRegistry>) -> Result<String, McpError> {
-    let roots = match registry {
-        Some(registry) => registry.listed_roots(),
-        None => crate::daemon::repo_map::read_known_roots(
-            &crate::daemon::config::DaemonConfig::daemon_home().join("repos.json"),
-        ),
-    };
-    let rows = tokio::task::spawn_blocking(move || crate::daemon::repo_listing::list_repos(&roots))
+    let rows = if let Some(registry) = registry {
+        let roots = registry.listed_roots();
+        let opened = registry.last_opened();
+        tokio::task::spawn_blocking(move || {
+            crate::daemon::repo_listing::list_repos_with_opened(&roots, &opened)
+        })
         .await
-        .map_err(|e| mcp_error(format!("repos: listing task failed: {e}")))?;
+        .map_err(|e| mcp_error(format!("repos: listing task failed: {e}")))?
+    } else {
+        let roots = crate::daemon::repo_map::read_known_roots(
+            &crate::daemon::config::DaemonConfig::daemon_home().join("repos.json"),
+        );
+        tokio::task::spawn_blocking(move || crate::daemon::repo_listing::list_repos(&roots))
+            .await
+            .map_err(|e| mcp_error(format!("repos: listing task failed: {e}")))?
+    };
     if rows.is_empty() {
         return Ok("No repos known.\n".to_string());
     }
@@ -4616,6 +4950,13 @@ pub fn append_hook_log(path: &std::path::Path, line: &str) {
     {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// A tool hook that did nothing. Measured 2026-10-27 over 77 stores: 165,000 of
+/// 210,000 rows were these, at a median of 0 ms, and no consumer reads anything
+/// from them that `fired` rows do not already say.
+fn is_tool_hook_noop(event: &str, outcome: &str) -> bool {
+    matches!(event, "pre_tool_use" | "post_tool_use") && outcome == "skipped"
 }
 
 /// Append one line to `hook-events.jsonl` in the store the hook ran against;
@@ -4756,6 +5097,9 @@ fn log_hook_event_full(
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
+    if !crate::daemon::config::hook_telemetry_enabled() || is_tool_hook_noop(event, outcome) {
+        return;
+    }
     let ts = chrono::Utc::now().timestamp();
     let mut payload = serde_json::json!({
         "ts": ts,
@@ -5042,8 +5386,8 @@ fn admit_doc_hits(
 
 /// Pair each candidate with the file behind it, for [`take_present`]. The
 /// directory of a collection is resolved once; a collection the index does not
-/// know, or one without files on disk (sessions: their documents are virtual
-/// `{sid}-chunk-NNN` keys), pairs with `None`. This touches the index only, so
+/// know, or one without files on disk (sessions use virtual `{sid}-chunk-NNN`
+/// keys; external collections use owner IDs), pairs with `None`. This touches the index only, so
 /// it runs under the store guard; the filesystem is asked afterwards, outside
 /// it — a stat on a hung mount must not hold the store lock past the hook
 /// deadline.
@@ -5066,6 +5410,7 @@ fn with_files<T>(
                         .ok()
                         .flatten()
                         .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
+                        .filter(|c| crate::store::external::source(&c.name).is_none())
                         .map(|c| root.join(c.path))
                 })
                 .as_ref()
@@ -8014,6 +8359,21 @@ pub async fn dispatch_call(
     dctx: &DispatchContext,
 ) -> Result<Value, McpError> {
     match tool_name {
+        "external.upsert" | "external.delete" | "external.list" => {
+            let request = crate::store::external::Request::parse(tool_name, params)
+                .map_err(|error| McpError::invalid_params(error, None))?;
+            ensure_handle_context(&handle).await?;
+            let mut slot = handle.ctx.lock().await;
+            let operation = |ctx: &Context| request.execute(&ctx.conn);
+            let outcome = if request.is_write() {
+                crate::core::run_guarded_write(&mut slot, tool_name, operation)
+            } else {
+                crate::core::run_guarded_read(&mut slot, tool_name, operation)
+            };
+            outcome
+                .ok_or_else(|| mcp_error("Database not initialized"))?
+                .map_err(|error| mcp_store_error(tool_name, error))
+        }
         "cli.mutate" => {
             let mutation: CliMutation = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("cli.mutate: invalid params: {e}")))?;
@@ -8463,7 +8823,7 @@ mod tests {
         // Ample budget: every line emits.
         assert_eq!(fit_warmup_lines(&lines, 10_000), lines);
         // Empty input: empty output.
-        assert!(fit_warmup_lines(&[], 100).is_empty());
+        assert_eq!(fit_warmup_lines(&[], 100), [] as [String; 0]);
         // Budget = exactly the first line's tokens: the second would exceed → stop at one.
         let t0 = crate::metrics::tokens::count_tokens(&lines[0]);
         assert_eq!(fit_warmup_lines(&lines, t0), vec![lines[0].clone()]);
@@ -9973,6 +10333,40 @@ mod tests {
         );
     }
 
+    /// Catches automatic recall dropping owner-pushed documents because their IDs are not files.
+    #[tokio::test]
+    async fn external_ingest_reaches_automatic_recall_without_a_source_file() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        dispatch_call(
+            "external.upsert",
+            json!({
+                "source":"tuic-stories", "id":"030-9ce2", "revision":1,
+                "title":"Quarantine autoheal native story",
+                "body":"The autoheal routine quarantines a corrupt index before rebuilding it."
+            }),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("ingest owner content through the daemon dispatch");
+        assert!(!tmp.path().join("030-9ce2").exists());
+
+        let out = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"how does quarantine autoheal work", "session_id":"external-recall"}),
+            handle,
+            &dctx,
+        )
+        .await
+        .expect("automatic prompt recall");
+        let body = additional_context(&out);
+        assert!(body.contains("## mdkb: matching docs"), "{body}");
+        assert!(body.contains("030-9ce2"), "{body}");
+        assert!(body.contains("Quarantine autoheal native story"), "{body}");
+    }
+
     #[tokio::test]
     async fn recall_injects_matching_docs_alongside_memory() {
         let tmp = TempDir::new().unwrap();
@@ -10352,6 +10746,118 @@ mod tests {
         assert!(body.len() <= 2048, "{} B", body.len());
     }
 
+    async fn recorded_trigger_injections(handle: &RepoHandle) -> i64 {
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        conn.query_row("SELECT COUNT(*) FROM memory_trigger_injections", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_prompt_memory_trigger_cap_stops_further_once_per_session_writes() {
+        // Catches: the attempt counter never advancing, so every matching
+        // trigger memory is written and injected past max_injected_per_hook.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        assert_eq!(handle.config.priors.max_injected_per_hook, 1);
+        for id in ["cap-a", "cap-b", "cap-c"] {
+            seed_trigger_memory(
+                &handle,
+                id,
+                "Be brief.",
+                r#"[{"prompt_contains":"subagent"}]"#,
+            )
+            .await;
+        }
+        let body = prompt_body(&make_dctx(), &handle, "start a subagent", "cap").await;
+        assert_eq!(body.matches("mdkb memory [").count(), 1, "{body}");
+        assert_eq!(recorded_trigger_injections(&handle).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_tool_memory_trigger_cap_stops_further_once_per_session_writes() {
+        // Catches: the attempt counter never advancing, so every matching
+        // trigger memory is written and injected past max_injected_per_hook.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        assert_eq!(handle.config.priors.max_injected_per_hook, 1);
+        for id in ["cap-a", "cap-b", "cap-c"] {
+            seed_trigger_memory(&handle, id, "Be brief.", r#"[{"tool":"Edit"}]"#).await;
+        }
+        let out = hook_pre_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Edit", "tool_input": {"file_path": "a.rs"}, "session_id": "cap"}),
+        )
+        .await;
+        let body = additional_context(&out);
+        assert_eq!(body.matches("mdkb memory [").count(), 1, "{body}");
+        assert_eq!(recorded_trigger_injections(&handle).await, 1);
+    }
+
+    #[tokio::test]
+    async fn the_prompt_prior_session_line_follows_a_matched_prior_only() {
+        // Catches: the `mdkb prior session` line inverted: emitted for a
+        // memory-only injection, or omitted when a prior did match.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "only-memory",
+            "Be brief.",
+            r#"[{"prompt_contains":"subagent"}]"#,
+        )
+        .await;
+        let memory_only = prompt_body(&make_dctx(), &handle, "start a subagent", "s1").await;
+        assert!(
+            memory_only.contains("mdkb memory [only-memory]"),
+            "{memory_only}"
+        );
+        assert!(!memory_only.contains("mdkb prior session"), "{memory_only}");
+
+        let matcher = r#"{"prompt_contains":"ripgrep"}"#;
+        let key = crate::store::priors::canonical_trigger_key("prompt", matcher);
+        let cluster_id = crate::store::priors::cluster_id_for_key(&key);
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            crate::store::priors::upsert_cluster(
+                conn,
+                &crate::store::priors::PriorCluster {
+                    id: cluster_id.clone(),
+                    canonical_trigger_key: key,
+                    trigger_kind: "prompt".into(),
+                    trigger_matcher: matcher.into(),
+                    lesson: "Prefer ripgrep over grep.".into(),
+                    scope: r#"{"repo":"current"}"#.into(),
+                    evidence_count: 2,
+                    distinct_sessions: 2,
+                    injected_count: 0,
+                    confirmed_count: 0,
+                    refuted_count: 0,
+                    misfired_count: 0,
+                    state: "candidate".into(),
+                    promoted_memory_id: None,
+                    created_at: now,
+                    last_seen_at: now,
+                    last_unrefuted_injection_at: None,
+                    error_signature: None,
+                },
+            )
+            .unwrap();
+            crate::store::priors::promote_cluster(conn, &cluster_id, now).unwrap();
+        }
+        let with_prior = prompt_body(&make_dctx(), &handle, "use ripgrep here", "s2").await;
+        assert!(
+            with_prior.contains(&format!(
+                "mdkb prior [{cluster_id}]: Prefer ripgrep over grep.\nmdkb prior session: s2"
+            )),
+            "{with_prior}"
+        );
+    }
+
     #[tokio::test]
     async fn docs_cut_by_the_trim_surface_on_the_next_prompt() {
         // Catches: the session dedup marking docs seen before the trim, so a
@@ -10463,6 +10969,8 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
             cosine,
@@ -11410,6 +11918,8 @@ mod tests {
                         snippets: vec![],
                         status: None,
                         superseded_by: None,
+                        source: None,
+                        read_only: false,
                         repo_root: None,
                     },
                     None,
@@ -12530,21 +13040,24 @@ mod tests {
 
         // Same file, but the call did resolve — on the bare name, at the
         // unplaced tier. Equally in need of the disclosure.
-        assert!(
-            !receiver_inference_note("src/api/client.ts", &none, &[(TIER_UNPLACED, false)])
-                .is_empty()
+        assert_ne!(
+            receiver_inference_note("src/api/client.ts", &none, &[(TIER_UNPLACED, false)]),
+            ""
         );
 
         // Rust: inference ran. An unplaced call there means it ran and failed,
         // which `unplaced_suffix` already reports.
-        assert!(
-            receiver_inference_note("src/store/vectors.rs", &unknown, &[(TIER_UNPLACED, false)])
-                .is_empty()
+        assert_eq!(
+            receiver_inference_note("src/store/vectors.rs", &unknown, &[(TIER_UNPLACED, false)]),
+            ""
         );
 
         // Non-Rust, but every call landed at a near tier through a written
         // qualifier: as trustworthy as Rust, so the note would be noise.
-        assert!(receiver_inference_note("src/api/client.ts", &none, &[(1, true)]).is_empty());
+        assert_eq!(
+            receiver_inference_note("src/api/client.ts", &none, &[(1, true)]),
+            ""
+        );
     }
 
     #[test]
@@ -14484,6 +14997,11 @@ mod tests {
 
     fn search_params(query: &str, scope: Option<&str>) -> SearchParams {
         SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: query.to_string(),
             root: None,
             limit: 10,
@@ -14930,7 +15448,7 @@ mod tests {
             "text: {}",
             out.text
         );
-        assert!(out.symbols.is_empty());
+        assert_eq!(out.symbols, [] as [crate::code::symbol::Symbol; 0]);
     }
 
     #[tokio::test]
@@ -15218,7 +15736,7 @@ mod tests {
         .await
         .unwrap();
         let context = additional_context(&result);
-        assert!(!context.is_empty());
+        assert_ne!(context, "");
         let row = hook_event_row(&handle.root, "pre_tool_use").await;
         assert_eq!(row["payload_bytes"], context.len());
         assert_eq!(row["payload_blocks"]["search_redirect"], context.len());
@@ -15917,9 +16435,16 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result, json!({}), "unmatched {method} must stay silent");
-            let row = hook_event_row(&handle.root, row_name).await;
-            assert_eq!(row["outcome"], "skipped");
-            assert!(row.get("payload_bytes").is_none(), "no host payload: {row}");
+            // The row is written from a detached task; give it time to land
+            // before asserting that it never does.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let dir = crate::store::namespace::store_dir(&handle.root)
+                .unwrap_or_else(|_| handle.root.join(".mdkb"));
+            let log = std::fs::read_to_string(dir.join("hook-events.jsonl")).unwrap_or_default();
+            assert!(
+                !log.contains(&format!(r#""event":"{row_name}""#)),
+                "a tool hook that did nothing writes no row: {log}"
+            );
         }
     }
 
@@ -20073,7 +20598,7 @@ mod tests {
         };
         assert_eq!(take_present(candidates(), 2), [2, 3]);
         assert_eq!(take_present(candidates(), 10), [2, 3, 4]);
-        assert!(take_present(candidates(), 0).is_empty());
+        assert_eq!(take_present(candidates(), 0), [] as [i32; 0]);
     }
 
     /// Catches: `with_files` resolving a sessions collection or an unknown
@@ -20472,6 +20997,8 @@ mod file_stem_admission_critic_tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                source: None,
+                read_only: false,
                 repo_root: None,
             },
             cosine,

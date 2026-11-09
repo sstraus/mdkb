@@ -12,6 +12,8 @@
 //! Unlike the unit tests in server.rs that call methods directly, these tests
 //! exercise the actual wire protocol as Claude Code would use it.
 
+#[path = "common/cli.rs"]
+mod cli;
 mod common;
 #[path = "common/fixture.rs"]
 mod fixture;
@@ -136,6 +138,69 @@ fn test_mcp_tool_search() {
         "Should find rust document. Got: {}",
         text
     );
+}
+
+/// Catches: global stdio JSON-RPC silently routing canonical memory to the
+/// legacy pseudo-result fan-out although direct MCP dispatch matches the CLI.
+#[test]
+fn canonical_multi_root_memory_json_rpc_matches_cli() {
+    let mut harness = McpTestHarness::global();
+    let first = mdkb::domain::canonicalize_plain(&harness.root).unwrap();
+    let second = mdkb::domain::canonicalize_plain(&harness.root.join("second")).unwrap();
+    for (root, id) in [(&first, "first"), (&second, "second")] {
+        let result = cli::run(
+            &[
+                "memory",
+                "add",
+                id,
+                "-t",
+                "orbit_lantern decision",
+                "-c",
+                &format!("orbit_lantern {id} records a separate decision"),
+            ],
+            root,
+        );
+        assert!(result.status.success(), "{result:?}");
+    }
+    harness.initialize();
+    for query in ["orbit_lantern", "orbit_lantern decision"] {
+        let response = harness.call_tool(
+            "search",
+            json!({
+                "query": query, "scope": "memory", "contract": "v2",
+                "root": "*", "limit": 2,
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        let mcp: serde_json::Value =
+            serde_json::from_str(&McpTestHarness::get_text_content(&response)).unwrap();
+        let selected = format!("{},{}", first.display(), second.display());
+        let cli_output = cli::command()
+            .current_dir(&first)
+            .env("HOME", first.parent().unwrap().join("home"))
+            .env("USERPROFILE", first.parent().unwrap().join("home"))
+            .args([
+                "--format",
+                "json",
+                "search",
+                query,
+                "--scope",
+                "memory",
+                "--search-contract",
+                "v2",
+                "--root",
+                &selected,
+                "--limit",
+                "2",
+            ])
+            .output()
+            .unwrap();
+        assert!(cli_output.status.success(), "{cli_output:?}");
+        let cli: serde_json::Value = serde_json::from_slice(&cli_output.stdout).unwrap();
+        assert_eq!(mcp, cli, "stdio MCP and CLI disagree");
+        assert_eq!(mcp["hits"].as_array().unwrap().len(), 2, "{mcp}");
+        assert_eq!(mcp["coverage"]["roots"].as_array().unwrap().len(), 2);
+    }
 }
 
 /// Test: get tool retrieves document content.
@@ -771,4 +836,84 @@ fn test_mcp_memory_delete_archives_the_projection() {
             .is_file(),
         "the projection is archived, not destroyed"
     );
+}
+
+/// Catches: canonical scopes accepted by tools/list dispatching to a different
+/// corpus or root set than the real CLI, beyond the memory-only wire fixture.
+#[test]
+fn canonical_source_and_indexed_scopes_match_cli_on_the_wire() {
+    let mut harness = McpTestHarness::global();
+    let first = mdkb::domain::canonicalize_plain(&harness.root).unwrap();
+    let second = mdkb::domain::canonicalize_plain(&first.join("second")).unwrap();
+    for root in [&first, &second] {
+        std::fs::create_dir(root.join("docs")).unwrap();
+        std::fs::write(
+            root.join("docs/guide.md"),
+            "# orbit_lantern\n\nDistinct indexed document.\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("labels.js"), "const label = 'orbit_lantern';\n").unwrap();
+        for args in [vec!["collection", "add", "docs", "docs"], vec!["update"]] {
+            let result = cli::run(&args, root);
+            assert!(result.status.success(), "{result:?}");
+        }
+    }
+    harness.initialize();
+    let tools = harness.send_request("tools/list", json!({}));
+    assert!(
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "search")
+    );
+    for scope in ["source", "literals", "docs", "knowledge"] {
+        let single = scope == "source";
+        let mcp_root = if single { first.to_str().unwrap() } else { "*" };
+        let mut params =
+            json!({"query": "orbit_lantern", "scope": scope, "root": mcp_root, "limit": 10});
+        if scope == "docs" {
+            params["contract"] = json!("v2");
+        }
+        let response = harness.call_tool("search", params);
+        assert!(response.get("error").is_none(), "{scope}: {response}");
+        let mcp: serde_json::Value =
+            serde_json::from_str(&McpTestHarness::get_text_content(&response)).unwrap();
+        let selected = if single {
+            first.display().to_string()
+        } else {
+            format!("{},{}", first.display(), second.display())
+        };
+        let mut command = cli::command();
+        command
+            .current_dir(&first)
+            .env("HOME", first.parent().unwrap().join("home"))
+            .env("USERPROFILE", first.parent().unwrap().join("home"))
+            .args([
+                "--format",
+                "json",
+                "search",
+                "orbit_lantern",
+                "--scope",
+                scope,
+                "--root",
+                &selected,
+                "--limit",
+                "10",
+            ]);
+        if scope == "docs" {
+            command.args(["--search-contract", "v2"]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{scope}: {output:?}");
+        let cli: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(mcp, cli, "{scope}: stdio MCP and CLI disagree");
+        assert!(
+            !mcp["hits"].as_array().unwrap().is_empty(),
+            "{scope}: {mcp}"
+        );
+        if !single {
+            assert_eq!(mcp["coverage"]["roots"].as_array().unwrap().len(), 2);
+        }
+    }
 }

@@ -63,6 +63,11 @@ async fn memory_search_payload_exposes_confidence_and_counters() {
     let server = McpServer::new(root);
     let result = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: "payload signals".to_string(),
             root: None,
             limit: 10,
@@ -140,6 +145,11 @@ async fn memory_search_payload_marks_never_confirmed_entries() {
     let server = McpServer::new(root);
     let result = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: "freshly written".to_string(),
             root: None,
             limit: 10,
@@ -218,6 +228,11 @@ fn seed_three_priors(root: &std::path::Path) {
 async fn search_memory(server: &McpServer, query: &str, min_confidence: Option<f64>) -> String {
     let result = server
         .search(Parameters(SearchParams {
+            patterns: None,
+            path: None,
+            regex: false,
+            ignore_case: false,
+            contract: None,
             query: query.to_string(),
             root: None,
             limit: 10,

@@ -148,7 +148,7 @@ fn opening_a_map_whose_only_gap_is_a_scoped_gone_root_does_not_rewrite_it() {
     let a = live(&base, "a");
     let map = tmp.path().join("repos.json");
     let compact = format!(
-        "{{\"version\":1,\"repos\":[{{\"root\":\"{}\",\"scope\":\"home\"}},{{\"root\":\"{}\"}}]}}",
+        "{{\"version\":2,\"repos\":[{{\"root\":\"{}\",\"scope\":\"home\"}},{{\"root\":\"{}\",\"last_opened_at\":4102444800}}]}}",
         scoped.display(),
         a.display()
     );
@@ -265,7 +265,7 @@ fn a_gone_seed_with_a_scope_in_the_file_is_neither_known_nor_rewritten() {
     let a = live(&base, "a");
     let map = tmp.path().join("repos.json");
     let compact = format!(
-        "{{\"version\":1,\"repos\":[{{\"root\":\"{}\",\"scope\":\"home\"}},{{\"root\":\"{}\"}}]}}",
+        "{{\"version\":2,\"repos\":[{{\"root\":\"{}\",\"scope\":\"home\"}},{{\"root\":\"{}\",\"last_opened_at\":4102444800}}]}}",
         g.display(),
         a.display()
     );

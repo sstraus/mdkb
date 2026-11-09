@@ -527,10 +527,9 @@ mod tests {
         assert_eq!(inc[0].source_id, "a");
 
         // Relation filter that excludes it returns nothing.
-        assert!(
-            incoming(&conn, "b", Some(MemoryRelation::Contradicts))
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            incoming(&conn, "b", Some(MemoryRelation::Contradicts)).unwrap(),
+            [] as [crate::store::memory_graph::MemoryEdge; 0]
         );
     }
 
@@ -557,7 +556,10 @@ mod tests {
             0,
             "removing twice is a no-op"
         );
-        assert!(outgoing(&conn, "a", None).unwrap().is_empty());
+        assert_eq!(
+            outgoing(&conn, "a", None).unwrap(),
+            [] as [crate::store::memory_graph::MemoryEdge; 0]
+        );
     }
 
     #[test]

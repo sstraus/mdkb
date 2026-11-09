@@ -1648,11 +1648,17 @@ mod tests {
 
     #[test]
     fn unknown_keys_is_empty_for_every_shipped_key() {
-        assert!(unknown_keys(&Config::default_toml().unwrap()).is_empty());
+        assert_eq!(
+            unknown_keys(&Config::default_toml().unwrap()),
+            [] as [String; 0]
+        );
         // `None` is never serialised, so this key is absent from a serialised
         // default and has to be known by other means.
-        assert!(unknown_keys("[priors]\ndistiller_program = \"claude\"\n").is_empty());
-        assert!(unknown_keys("").is_empty());
+        assert_eq!(
+            unknown_keys("[priors]\ndistiller_program = \"claude\"\n"),
+            [] as [String; 0]
+        );
+        assert_eq!(unknown_keys(""), [] as [String; 0]);
         assert!(
             unknown_keys("not toml [").is_empty(),
             "a file that does not parse is Config::load's error, not a key report"
@@ -2032,7 +2038,7 @@ strategy = "invalid_strategy"
         let config = Config::default();
         assert!(config.code.enabled);
         assert_eq!(config.code.indexing.batch_size, 500);
-        assert!(!config.code.indexing.ignore_patterns.is_empty());
+        assert_ne!(config.code.indexing.ignore_patterns, [] as [String; 0]);
         assert!(
             config
                 .code
@@ -2214,7 +2220,7 @@ threshold = 0.5
         // Mining is a kill-switched opt-in: off, and no distiller wired.
         assert!(!config.priors.mining_enabled);
         assert!(config.priors.distiller_program.is_none());
-        assert!(config.priors.distiller_args.is_empty());
+        assert_eq!(config.priors.distiller_args, [] as [String; 0]);
         // Injecting already-promoted priors is safe/cheap and on by default,
         // hard-capped so a hook can never flood context.
         assert!(config.priors.injection_enabled);

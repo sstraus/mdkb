@@ -84,7 +84,14 @@ fn namespace_of(language: Language, rel_path: &str) -> Namespace {
         // Swift, C and Lua have no module system this index can resolve against,
         // and their parsers declare nothing. The file is the only address there
         // is; it still separates two same-named symbols in different files.
-        Language::Swift | Language::C | Language::Lua => Namespace::Path {
+        Language::Swift
+        | Language::C
+        | Language::Lua
+        | Language::Objc
+        | Language::Shell
+        | Language::Ruby
+        | Language::Sql
+        | Language::Json => Namespace::Path {
             base: rel_path.to_string(),
             nesting_separator: ".",
         },

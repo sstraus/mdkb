@@ -397,7 +397,11 @@ fn smoke_namespaced_hook_logs_telemetry_into_its_own_store() {
     let out = run_env(
         &["hook", "session-start"],
         &repo.root,
-        &[("MDKB_NO_DAEMON", "1"), ("MDKB_NAMESPACE", "test")],
+        &[
+            ("MDKB_NO_DAEMON", "1"),
+            ("MDKB_NAMESPACE", "test"),
+            ("MDKB_HOOK_TELEMETRY", "1"),
+        ],
     );
     assert_ok(&out, "namespaced hook session-start");
     assert!(
