@@ -1,0 +1,52 @@
+<svg viewBox="0 0 360 320" role="img" aria-label="mdkb keeps many entries, recalls only the three that match the prompt, and keeps superseded entries out.">
+  <text x="95" y="14" text-anchor="middle" class="t-sub">docs · memory · code</text>
+  <g>
+    <rect x="20" y="30" width="32" height="36" rx="4" class="box" />
+    <rect x="60" y="30" width="32" height="36" rx="4" class="box"><animate attributeName="fill" values="#fffdf7;#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.08;0.15;0.9;1" dur="6s" repeatCount="indefinite" /></rect>
+    <rect x="100" y="30" width="32" height="36" rx="4" class="box" />
+    <rect x="140" y="30" width="32" height="36" rx="4" class="box" />
+    <rect x="20" y="76" width="32" height="36" rx="4" fill="var(--paper-2)" stroke="var(--ink-3)" stroke-width="2" />
+    <path d="M24,108 L48,80" stroke="var(--ink-3)" stroke-width="2" />
+    <rect x="60" y="76" width="32" height="36" rx="4" class="box" />
+    <rect x="100" y="76" width="32" height="36" rx="4" class="box"><animate attributeName="fill" values="#fffdf7;#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.08;0.15;0.9;1" dur="6s" repeatCount="indefinite" /></rect>
+    <rect x="140" y="76" width="32" height="36" rx="4" class="box" />
+    <rect x="20" y="122" width="32" height="36" rx="4" class="box" />
+    <rect x="60" y="122" width="32" height="36" rx="4" class="box" />
+    <rect x="100" y="122" width="32" height="36" rx="4" class="box" />
+    <rect x="140" y="122" width="32" height="36" rx="4" class="box"><animate attributeName="fill" values="#fffdf7;#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.08;0.15;0.9;1" dur="6s" repeatCount="indefinite" /></rect>
+  </g>
+  <text x="20" y="186" class="t-sub">… thousands more, indexed locally</text>
+  <rect x="20" y="198" width="14" height="10" rx="2" fill="var(--paper-2)" stroke="var(--ink-3)" />
+  <text x="40" y="207" class="t-sub">superseded: stays out</text>
+
+  <rect x="210" y="20" width="130" height="220" rx="6" class="box" />
+  <text x="275" y="14" text-anchor="middle" class="t-sub">every prompt</text>
+  <text x="275" y="44" text-anchor="middle" class="t-sub">“why is recall empty?”</text>
+  <g>
+    <rect x="-48" y="-7" width="96" height="14" rx="3" fill="var(--yellow)" stroke="var(--ink)" stroke-width="1.2">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.15;0.2;0.9;1" dur="6s" repeatCount="indefinite" />
+    </rect>
+    <animateMotion path="M76,48 L275,70" keyPoints="0;0;1;1" keyTimes="0;0.2;0.42;1" calcMode="linear" dur="6s" repeatCount="indefinite" />
+  </g>
+  <g>
+    <rect x="-48" y="-7" width="96" height="14" rx="3" fill="var(--yellow)" stroke="var(--ink)" stroke-width="1.2">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.15;0.2;0.9;1" dur="6s" repeatCount="indefinite" />
+    </rect>
+    <animateMotion path="M116,94 L275,92" keyPoints="0;0;1;1" keyTimes="0;0.24;0.46;1" calcMode="linear" dur="6s" repeatCount="indefinite" />
+  </g>
+  <g>
+    <rect x="-48" y="-7" width="96" height="14" rx="3" fill="var(--yellow)" stroke="var(--ink)" stroke-width="1.2">
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.15;0.2;0.9;1" dur="6s" repeatCount="indefinite" />
+    </rect>
+    <animateMotion path="M156,140 L275,114" keyPoints="0;0;1;1" keyTimes="0;0.28;0.5;1" calcMode="linear" dur="6s" repeatCount="indefinite" />
+  </g>
+  <text x="275" y="150" text-anchor="middle" class="t-sub">3 entries,</text>
+  <text x="275" y="166" text-anchor="middle" class="t-sub">ranked by the prompt</text>
+
+  <text x="20" y="266" class="t-sub">tokens spent on memory, per prompt</text>
+  <rect x="20" y="274" width="320" height="14" rx="7" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <rect x="20" y="274" width="0" height="14" rx="7" fill="var(--green)">
+    <animate attributeName="width" values="0;0;56;56;0" keyTimes="0;0.2;0.5;0.9;1" dur="6s" repeatCount="indefinite" />
+  </rect>
+  <text x="20" y="308" class="t-sub">the store grows; the prompt does not</text>
+</svg>

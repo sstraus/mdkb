@@ -1,0 +1,47 @@
+<svg viewBox="0 0 900 240" role="img" aria-label="A query goes to BM25 and to vector search, the scores are fused, expanded by one graph hop, and returned as a ranked list with superseded entries flagged.">
+  <defs>
+    <path id="r1" d="M140,120 C170,120 170,65 200,65 L350,65 C380,65 380,120 410,120 L770,120" />
+    <path id="r2" d="M140,120 C170,120 170,175 200,175 L350,175 C380,175 380,120 410,120 L770,120" />
+  </defs>
+  <path d="M140,120 C170,120 170,65 200,65" class="wire" />
+  <path d="M140,120 C170,120 170,175 200,175" class="wire" />
+  <path d="M350,65 C380,65 380,120 410,120" class="wire" />
+  <path d="M350,175 C380,175 380,120 410,120" class="wire" />
+  <path d="M530,120 H590" class="wire" />
+  <path d="M720,120 H770" class="wire" />
+  <circle r="6" class="dot-y"><animateMotion dur="3s" repeatCount="indefinite"><mpath href="#r1" /></animateMotion></circle>
+  <circle r="6" class="dot-b"><animateMotion dur="3s" repeatCount="indefinite"><mpath href="#r2" /></animateMotion></circle>
+
+  <rect x="10" y="95" width="130" height="50" rx="8" class="box-y" />
+  <text x="75" y="117" text-anchor="middle" class="t-title">prompt</text>
+  <text x="75" y="134" text-anchor="middle" class="t-sub">or search query</text>
+
+  <rect x="200" y="40" width="150" height="50" rx="8" class="box" />
+  <text x="275" y="62" text-anchor="middle" class="t-title">BM25 · FTS5</text>
+  <text x="275" y="79" text-anchor="middle" class="t-sub">exact terms, identifiers</text>
+  <rect x="200" y="150" width="150" height="50" rx="8" class="box" />
+  <text x="275" y="172" text-anchor="middle" class="t-title">Vectors · ONNX</text>
+  <text x="275" y="189" text-anchor="middle" class="t-sub">meaning, paraphrase</text>
+
+  <rect x="410" y="95" width="120" height="50" rx="8" class="box-b" />
+  <text x="470" y="117" text-anchor="middle" class="t-title">hybrid score</text>
+  <text x="470" y="134" text-anchor="middle" class="t-sub">normalised per query</text>
+
+  <rect x="590" y="95" width="130" height="50" rx="8" class="box" />
+  <text x="655" y="117" text-anchor="middle" class="t-title">+1 hop</text>
+  <text x="655" y="134" text-anchor="middle" class="t-sub">typed memory edges</text>
+
+  <rect x="770" y="30" width="120" height="180" rx="8" class="box" />
+  <text x="830" y="52" text-anchor="middle" class="t-title">ranked</text>
+  <g>
+    <rect x="782" y="64" width="96" height="22" rx="4" fill="var(--blue-soft)" stroke="var(--ink)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.55;0.6;0.95;1" dur="3s" repeatCount="indefinite" /></rect>
+    <rect x="782" y="94" width="96" height="22" rx="4" fill="var(--blue-soft)" stroke="var(--ink)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.62;0.67;0.95;1" dur="3s" repeatCount="indefinite" /></rect>
+    <rect x="782" y="124" width="96" height="22" rx="4" fill="var(--blue-soft)" stroke="var(--ink)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.69;0.74;0.95;1" dur="3s" repeatCount="indefinite" /></rect>
+    <g>
+      <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.76;0.81;0.95;1" dur="3s" repeatCount="indefinite" />
+      <rect x="782" y="154" width="96" height="22" rx="4" fill="var(--paper-2)" stroke="var(--ink-3)" stroke-dasharray="3 3" />
+      <text x="830" y="169" text-anchor="middle" class="t-sub">⚑ superseded</text>
+    </g>
+  </g>
+  <text x="830" y="198" text-anchor="middle" class="t-sub">id · score · path:line</text>
+</svg>

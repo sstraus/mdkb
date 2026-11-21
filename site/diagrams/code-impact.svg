@@ -1,0 +1,67 @@
+<svg viewBox="0 0 900 340" role="img" aria-label="Changing one function lights its callers at depth one, two and three; a same-named method on another type is not affected.">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--ink)" />
+    </marker>
+  </defs>
+  <g class="t-sub" text-anchor="middle">
+    <text x="140" y="20" class="t-sub">depth 3</text>
+    <text x="350" y="20" class="t-sub">depth 2</text>
+    <text x="560" y="20" class="t-sub">depth 1</text>
+    <text x="770" y="20" class="t-sub">changed</text>
+  </g>
+  <g fill="none" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#arr)">
+    <path d="M635,100 C665,100 665,160 695,160" />
+    <path d="M635,220 C665,220 665,160 695,160" />
+    <path d="M425,60 C455,60 455,100 485,100" />
+    <path d="M425,160 C455,160 455,100 485,100" />
+    <path d="M425,160 C455,160 455,220 485,220" />
+    <path d="M425,260 C455,260 455,220 485,220" />
+    <path d="M215,110 C245,110 245,60 275,60" />
+    <path d="M215,110 C245,110 245,160 275,160" />
+    <path d="M215,230 C245,230 245,260 275,260" />
+    <path d="M635,310 H695" stroke="var(--ink-3)" />
+  </g>
+  <g class="t-mono" text-anchor="middle">
+    <rect x="695" y="140" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#f3d2cb;#f3d2cb;#fffdf7" keyTimes="0;0.05;0.75;1" dur="4s" repeatCount="indefinite" />
+    </rect>
+    <text x="770" y="165">store.write()</text>
+
+    <rect x="485" y="80" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.6;1" dur="4s" begin="0.5s" repeatCount="indefinite" />
+    </rect>
+    <text x="560" y="105">save_entry()</text>
+    <rect x="485" y="200" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.6;1" dur="4s" begin="0.5s" repeatCount="indefinite" />
+    </rect>
+    <text x="560" y="225">reindex_file()</text>
+
+    <rect x="275" y="40" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.5;1" dur="4s" begin="1s" repeatCount="indefinite" />
+    </rect>
+    <text x="350" y="65">memory_add()</text>
+    <rect x="275" y="140" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.5;1" dur="4s" begin="1s" repeatCount="indefinite" />
+    </rect>
+    <text x="350" y="165">watch_loop()</text>
+    <rect x="275" y="240" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.5;1" dur="4s" begin="1s" repeatCount="indefinite" />
+    </rect>
+    <text x="350" y="265">update_cmd()</text>
+
+    <rect x="65" y="90" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.4;1" dur="4s" begin="1.5s" repeatCount="indefinite" />
+    </rect>
+    <text x="140" y="115">mcp_handler()</text>
+    <rect x="65" y="210" width="150" height="40" rx="8" class="box">
+      <animate attributeName="fill" values="#fffdf7;#fbe7a1;#fbe7a1;#fffdf7" keyTimes="0;0.05;0.4;1" dur="4s" begin="1.5s" repeatCount="indefinite" />
+    </rect>
+    <text x="140" y="235">cli_main()</text>
+
+    <rect x="485" y="290" width="150" height="40" rx="8" fill="var(--paper-2)" stroke="var(--ink-3)" stroke-width="2" />
+    <text x="560" y="315" fill="var(--ink-3)">warm_cache()</text>
+    <rect x="695" y="290" width="150" height="40" rx="8" fill="var(--paper-2)" stroke="var(--ink-3)" stroke-width="2" />
+    <text x="770" y="315" fill="var(--ink-3)">cache.write()</text>
+  </g>
+</svg>
