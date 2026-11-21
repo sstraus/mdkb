@@ -1,0 +1,47 @@
+<svg viewBox="0 0 900 310" role="img" aria-label="Durable entries change confidence when confirmed or refuted; lifecycle entries decay with age; a newer decision supersedes an older one.">
+  <!-- lane 1: durable -->
+  <text x="20" y="46" class="t-title">Durable</text>
+  <text x="20" y="66" class="t-sub">topic · problem · decision</text>
+  <text x="300" y="30" class="t-sub">confidence</text>
+  <rect x="300" y="40" width="440" height="22" rx="11" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <rect x="300" y="40" width="250" height="22" rx="11" fill="var(--blue)">
+    <animate attributeName="width" values="250;250;320;320;380;380;230;230;250" keyTimes="0;0.1;0.15;0.35;0.4;0.6;0.65;0.9;1" dur="9s" repeatCount="indefinite" />
+  </rect>
+  <text x="756" y="56" fill="var(--green)" font-weight="700" font-size="13" opacity="0">+ confirmed<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.1;0.13;0.32;0.35;1" dur="9s" repeatCount="indefinite" /></text>
+  <text x="756" y="56" fill="var(--green)" font-weight="700" font-size="13" opacity="0">+ confirmed<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.35;0.38;0.57;0.6;1" dur="9s" repeatCount="indefinite" /></text>
+  <text x="756" y="56" fill="var(--red)" font-weight="700" font-size="13" opacity="0">− refuted<animate attributeName="opacity" values="0;0;1;1;0;0" keyTimes="0;0.6;0.63;0.87;0.9;1" dur="9s" repeatCount="indefinite" /></text>
+
+  <!-- lane 2: lifecycle -->
+  <text x="20" y="136" class="t-title">Lifecycle</text>
+  <text x="20" y="156" class="t-sub">reminder · prior · handoff</text>
+  <text x="300" y="120" class="t-sub">weight</text>
+  <rect x="300" y="130" width="440" height="22" rx="11" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <rect x="300" y="130" width="440" height="22" rx="11" fill="var(--yellow)">
+    <animate attributeName="width" values="440;440;30;30" keyTimes="0;0.05;0.9;1" dur="9s" repeatCount="indefinite" />
+  </rect>
+  <text x="756" y="146" class="t-sub">decays with age</text>
+
+  <!-- lane 3: supersedes -->
+  <text x="20" y="246" class="t-title">Superseded</text>
+  <text x="20" y="266" class="t-sub">explicit, never silent</text>
+  <g>
+    <rect x="300" y="218" width="170" height="60" rx="8" class="box" />
+    <text x="318" y="242" class="t-mono">decision · v1</text>
+    <text x="318" y="262" class="t-sub">embed with model A</text>
+    <rect x="300" y="218" width="170" height="60" rx="8" fill="var(--paper-2)" opacity="0">
+      <animate attributeName="opacity" values="0;0;0.75;0.75;0" keyTimes="0;0.45;0.5;0.92;1" dur="9s" repeatCount="indefinite" />
+    </rect>
+    <path d="M306,272 L464,224" stroke="var(--red)" stroke-width="2" stroke-dasharray="170" stroke-dashoffset="170">
+      <animate attributeName="stroke-dashoffset" values="170;170;0;0;170" keyTimes="0;0.45;0.52;0.92;1" dur="9s" repeatCount="indefinite" />
+    </path>
+  </g>
+  <g opacity="0">
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.25;0.3;0.92;1" dur="9s" repeatCount="indefinite" />
+    <path d="M570,248 H478" class="wire" />
+    <path d="M486,242 L478,248 L486,254" class="wire-solid" />
+    <text x="524" y="238" text-anchor="middle" class="t-sub">supersedes</text>
+    <rect x="570" y="218" width="170" height="60" rx="8" class="box-y" />
+    <text x="588" y="242" class="t-mono">decision · v2</text>
+    <text x="588" y="262" class="t-sub">embed with model B</text>
+  </g>
+</svg>

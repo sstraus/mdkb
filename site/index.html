@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>mdkb — repository memory for coding agents</title>
+    <meta
+      name="description"
+      content="mdkb gives coding agents one local retrieval layer for the repository: durable memory, Markdown docs, code symbols and call edges. One Rust binary, SQLite, on-device embeddings."
+    />
+    <meta property="og:title" content="mdkb — repository memory for coding agents" />
+    <meta
+      property="og:description"
+      content="Memory that ages by evidence, recall without a tool call, and code intelligence in one local binary."
+    />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://mdkb.tuicommander.com/" />
+    <meta property="og:image" content="https://mdkb.tuicommander.com/wordmark.png" />
+    <link rel="canonical" href="https://mdkb.tuicommander.com/" />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/main.js"></script>
+  </head>
+  <body>
+    <header class="nav">
+      <div class="wrap">
+        <a href="/" aria-label="mdkb home"><img src="/wordmark.png" alt="mdkb" width="124" height="38" /></a>
+        <nav class="nav-links">
+          <a href="#value">Why</a>
+          <a href="#recall">Recall</a>
+          <a href="#memory">Memory</a>
+          <a href="#code">Code</a>
+          <a href="#start">Start</a>
+          <a class="nav-gh" href="https://github.com/sstraus/mdkb" rel="noopener noreferrer">GitHub</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <!-- ============ HERO ============ -->
+      <section class="hero">
+        <div class="wrap">
+          <div>
+            <p class="kicker">Local · open source · one binary</p>
+            <h1>Repository memory for <span class="hl">coding agents</span>.</h1>
+            <p class="lede">
+              mdkb gives Claude Code, Codex and any MCP client one retrieval layer for the repository:
+              what the team decided, what the docs say, and what the code does. It finds the part that
+              matters for this prompt, so the agent does not load the whole repository every turn.
+            </p>
+            <div class="install">
+              <span id="install-cmd">brew install sstraus/tap/mdkb</span>
+              <button type="button" data-copy="install-cmd">Copy</button>
+            </div>
+            <div class="cta">
+              <a href="#start">Quick start →</a>
+              <a href="https://github.com/sstraus/mdkb/releases" rel="noopener noreferrer">Pre-built binaries</a>
+            </div>
+            <ul class="facts">
+              <li>SQLite + FTS5</li>
+              <li>On-device ONNX embeddings</li>
+              <li>14 languages</li>
+              <li>13 MCP tools, each with a CLI twin</li>
+              <li>Apache 2.0</li>
+            </ul>
+          </div>
+
+          <figure class="fig">
+            <!-- @include hero-flow -->
+          </figure>
+        </div>
+      </section>
+
+      <!-- ============ VALUE ============ -->
+      <section id="value">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">01</div>
+            <p class="kicker">The difference</p>
+            <h2>A notes file grows. A memory should <span class="hl">select</span>.</h2>
+            <p class="lede">
+              The usual agent memory is a file of notes that loads into every prompt, or a store of chat
+              snippets that a tool call may or may not search. Both grow, both keep wrong notes, and
+              neither knows the code. mdkb ranks what the repository knows against each prompt and sends
+              only the part that matches.
+            </p>
+          </div>
+
+          <div class="pair">
+            <figure class="fig bad">
+              <p class="fig-title">Typical memory: one growing file</p>
+              <!-- @include notes-file -->
+            </figure>
+
+            <figure class="fig good">
+              <p class="fig-title">mdkb: ranked recall per prompt</p>
+              <!-- @include ranked-recall -->
+            </figure>
+          </div>
+
+          <table class="vs">
+            <thead>
+              <tr>
+                <th></th>
+                <th>Typical agent memory</th>
+                <th>mdkb</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <th>Scope</th>
+                <td>What was said in a conversation.</td>
+                <td>The repository: docs, decisions, solved problems, symbols and call edges, searched as one context.</td>
+              </tr>
+              <tr>
+                <th>Cost</th>
+                <td>The whole file in every prompt. It grows forever.</td>
+                <td>Hybrid BM25 + vector ranking against the prompt. Only matching entries are injected.</td>
+              </tr>
+              <tr>
+                <th>Staleness</th>
+                <td>A wrong note stays until a person finds it.</td>
+                <td>Entries are superseded, refuted or confirmed by evidence. Reminders, priors and handoffs decay with age.</td>
+              </tr>
+              <tr>
+                <th>Trust</th>
+                <td>No source, no history.</td>
+                <td>Provenance, source-authority weight, Bayesian confirmation signal, revision diffs, typed edges.</td>
+              </tr>
+              <tr>
+                <th>Recall</th>
+                <td>Depends on the agent deciding to call a tool.</td>
+                <td>Hooks inject context at session start, on every prompt, and around tool calls.</td>
+              </tr>
+              <tr>
+                <th>Code</th>
+                <td>Not covered.</td>
+                <td>tree-sitter index for 14 languages: callers, callees, impact, duplicates, hidden coupling.</td>
+              </tr>
+              <tr>
+                <th>Where it lives</th>
+                <td>Often a hosted memory API or vector service.</td>
+                <td>One local Rust binary. SQLite, on-device embeddings. Durable memory exported as Markdown for Git review.</td>
+              </tr>
+              <tr>
+                <th>Proof</th>
+                <td>Rarely measured.</td>
+                <td><code>mdkb eval</code> fails CI below a recall floor; <code>mdkb stats</code> reports hit rate and latency.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ RECALL / HOOKS ============ -->
+      <section id="recall">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">02</div>
+            <p class="kicker">Recall without a tool call</p>
+            <h2>Context arrives at the moment it is useful.</h2>
+            <p class="lede">
+              Lifecycle hooks for Claude Code and Codex run through one dispatcher (command hooks, a Unix
+              socket or native HTTP). The agent does not have to remember to ask.
+            </p>
+          </div>
+
+          <figure class="fig">
+            <!-- @include hook-timeline -->
+            <ol class="steps">
+              <li><b>warmup</b>A ranked session warmup with the latest handoff and due reminders.</li>
+              <li><b>prompt recall</b>Memory and docs ranked against the prompt, one hop through typed edges.</li>
+              <li><b>code redirect</b>A grep for a definition gets the real <code>file:line</code> from the index.</li>
+              <li><b>reindex</b>The edited file is reindexed, so the index follows the edit.</li>
+              <li><b>mining (opt-in)</b>The episode is distilled into a lesson; past injections are settled.</li>
+            </ol>
+          </figure>
+
+          <div class="sec-head" style="margin-top: 72px">
+            <div class="sec-num">03</div>
+            <p class="kicker">Hybrid retrieval</p>
+            <h2>Exact words and meaning, fused, then one hop further.</h2>
+            <p class="lede">
+              Hook recall and <code>mdkb search</code> use the same score. Full-text search catches
+              identifiers and error strings; on-device embeddings catch paraphrase. Typed memory edges pull
+              in the entry that supports the hit, and flag it when its support was superseded.
+            </p>
+          </div>
+
+          <figure class="fig">
+            <!-- @include hybrid-retrieval -->
+            <figcaption>
+              Scores are normalised per query: the top hit is always near 1.00, so read the gap, not the number.
+              Superseded documents are hidden unless you pass <code>--include-superseded</code>.
+            </figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <!-- ============ MEMORY ============ -->
+      <section id="memory">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">04</div>
+            <p class="kicker">Memory that ages by evidence</p>
+            <h2>Not by the calendar. Not by accident.</h2>
+            <p class="lede">
+              Durable knowledge stays valid until something proves it wrong. Session state fades on its own.
+              Every change is explicit, and near-duplicates are rejected at write time.
+            </p>
+          </div>
+
+          <figure class="fig">
+            <!-- @include memory-lifecycle -->
+            <figcaption>
+              Each entry carries provenance, a source-authority weight, a Bayesian confirmation signal
+              (<code>mdkb memory confirm</code>), up to three revision diffs and typed edges:
+              <code>supports</code>, <code>contradicts</code>, <code>supersedes</code>, <code>derived_from</code>,
+              <code>relates_to</code>. Durable entries are projected to <code>.mdkb/memory/entries/*.md</code> for
+              review in Git.
+            </figcaption>
+          </figure>
+
+          <div class="split" style="margin-top: 72px">
+            <div>
+              <div class="sec-head" style="margin-bottom: 24px">
+                <div class="sec-num">05</div>
+                <p class="kicker">A self-learning loop</p>
+                <h2>It learns from its own sessions.</h2>
+                <p class="lede">Off by default. When on, each lesson must earn its place.</p>
+              </div>
+              <ol class="loop-list">
+                <li><span>At <code>Stop</code>, mdkb reads the episode that just ended.</span></li>
+                <li><span>It detects an error that was fixed, or a correction from the user.</span></li>
+                <li><span>A configured local or remote CLI distils one falsifiable lesson with a machine-matchable trigger.</span></li>
+                <li><span>Lessons that recur across sessions are promoted to <b>priors</b>.</span></li>
+                <li><span>Priors are injected where their trigger fires, then settled as confirmed or refuted at the next <code>Stop</code>.</span></li>
+              </ol>
+            </div>
+            <figure class="fig">
+              <!-- @include learning-loop -->
+            </figure>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ CODE ============ -->
+      <section id="code">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">06</div>
+            <p class="kicker">Structural code intelligence</p>
+            <h2>Know what breaks before you change it.</h2>
+            <p class="lede">
+              tree-sitter indexes 14 languages into persistent symbols and typed edges. Calls resolve
+              through a tiered cascade that keeps the receiver type, so <code>store.write()</code> and
+              <code>cache.write()</code> are different edges, and an unresolved call says so instead of
+              inventing one.
+            </p>
+          </div>
+
+          <figure class="fig">
+            <!-- @include code-impact -->
+            <figcaption>
+              Illustrative call graph for <code>mdkb code impact write --depth 3</code>. The same method name on
+              another receiver type is a different edge, so it stays out of the blast radius.
+            </figcaption>
+          </figure>
+
+          <div class="cards" style="margin-top: 40px">
+            <div class="card">
+              <h3>Callers, callees, impact</h3>
+              <p>Edges for <code>Calls</code>, <code>Uses</code>, <code>Implements</code>, <code>Expands</code> and <code>Defines</code>, with a resolution tier on every call.</p>
+              <pre>mdkb code callers NAME
+mdkb code impact NAME --depth 2</pre>
+            </div>
+            <div class="card">
+              <h3>What the repo says twice</h3>
+              <p>A structural duplicate report, bucketed by how trustworthy each finding is. No model needed.</p>
+              <pre>mdkb dup --since main</pre>
+            </div>
+            <div class="card">
+              <h3>Hidden coupling</h3>
+              <p>Files that change together in Git with no confidently resolved call edge between them.</p>
+              <pre>mdkb coupling --min-cochanges 3</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ MEASURE ============ -->
+      <section id="measure">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">07</div>
+            <p class="kicker">Retrieval you can measure</p>
+            <h2>Numbers from commands, not from adjectives.</h2>
+          </div>
+          <div class="cards">
+            <div class="card">
+              <h3>Eval with a floor</h3>
+              <p><code>mdkb eval</code> scores memory search against a held-out fixture and fails CI below a floor.</p>
+            </div>
+            <div class="card">
+              <h3>Hook statistics</h3>
+              <p><code>mdkb stats</code> reports hook activation, hit rate, latency and mining outcomes.</p>
+            </div>
+            <div class="card">
+              <h3>Private telemetry</h3>
+              <p>An opt-in developer profile records recall quality without storing prompt text. It stays on the machine.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ START ============ -->
+      <section id="start">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">08</div>
+            <p class="kicker">Quick start</p>
+            <h2>Three steps, one binary.</h2>
+            <p class="lede">
+              The embedding model downloads on first use and then runs on-device. No memory API, hosted
+              vector database or LLM extraction service is required.
+            </p>
+          </div>
+          <div class="start">
+            <div>
+              <h3>1 · Install</h3>
+<pre>brew install sstraus/tap/mdkb
+<span class="c"># or, from a checkout</span>
+cargo install --path .</pre>
+            </div>
+            <div>
+              <h3>2 · Index a repository</h3>
+<pre>cd your-project
+mdkb init
+mdkb collection add docs ./docs
+mdkb update</pre>
+            </div>
+            <div>
+              <h3>3 · Connect the agent</h3>
+<pre>mdkb setup mcp claude --scope local
+<span class="c"># then restart Claude Code</span></pre>
+            </div>
+          </div>
+          <p class="lede" style="margin-top: 32px">
+            Pre-built binaries for macOS, Linux and Windows are on
+            <a href="https://github.com/sstraus/mdkb/releases" rel="noopener noreferrer">GitHub Releases</a>.
+            Hooks, priors and every command are documented in the
+            <a href="https://github.com/sstraus/mdkb#readme" rel="noopener noreferrer">README</a>.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="wrap">
+        <img src="/mark.png" alt="" width="62" height="40" />
+        <span>Apache 2.0 © 2026 Stefano Straus. Built in Rust.</span>
+        <nav>
+          <a href="https://github.com/sstraus/mdkb" rel="noopener noreferrer">GitHub</a>
+          <a href="https://github.com/sstraus/mdkb/releases" rel="noopener noreferrer">Releases</a>
+          <a href="https://github.com/sstraus/mdkb/blob/main/CHANGES.md" rel="noopener noreferrer">Changelog</a>
+          <a href="https://tuicommander.com" rel="noopener">TUICommander</a>
+        </nav>
+      </div>
+    </footer>
+  </body>
+</html>

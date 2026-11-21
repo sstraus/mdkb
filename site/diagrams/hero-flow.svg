@@ -1,0 +1,62 @@
+<svg viewBox="0 0 600 380" role="img" aria-labelledby="hero-t">
+  <title id="hero-t">Four corpora feed one local store; the agent receives context through hooks, MCP and the CLI.</title>
+  <defs>
+    <path id="h1" d="M166,53 C205,53 205,190 238,190" />
+    <path id="h2" d="M166,141 C205,141 205,190 238,190" />
+    <path id="h3" d="M166,229 C205,229 205,190 238,190" />
+    <path id="h4" d="M166,317 C205,317 205,190 238,190" />
+    <path id="ho1" d="M362,190 C400,190 400,170 440,170" />
+    <path id="ho2" d="M362,190 L440,190" />
+    <path id="ho3" d="M362,190 C400,190 400,210 440,210" />
+  </defs>
+  <use href="#h1" class="wire" />
+  <use href="#h2" class="wire" />
+  <use href="#h3" class="wire" />
+  <use href="#h4" class="wire" />
+  <use href="#ho1" class="wire" />
+  <use href="#ho2" class="wire" />
+  <use href="#ho3" class="wire" />
+
+  <circle r="5" class="dot-y"><animateMotion dur="2.4s" repeatCount="indefinite"><mpath href="#h1" /></animateMotion></circle>
+  <circle r="5" class="dot-y"><animateMotion dur="2.4s" begin="0.6s" repeatCount="indefinite"><mpath href="#h2" /></animateMotion></circle>
+  <circle r="5" class="dot-y"><animateMotion dur="2.4s" begin="1.2s" repeatCount="indefinite"><mpath href="#h3" /></animateMotion></circle>
+  <circle r="5" class="dot-y"><animateMotion dur="2.4s" begin="1.8s" repeatCount="indefinite"><mpath href="#h4" /></animateMotion></circle>
+  <circle r="5" class="dot-b"><animateMotion dur="1.6s" repeatCount="indefinite"><mpath href="#ho1" /></animateMotion></circle>
+  <circle r="5" class="dot-b"><animateMotion dur="1.6s" begin="0.5s" repeatCount="indefinite"><mpath href="#ho2" /></animateMotion></circle>
+  <circle r="5" class="dot-b"><animateMotion dur="1.6s" begin="1.0s" repeatCount="indefinite"><mpath href="#ho3" /></animateMotion></circle>
+
+  <g>
+    <rect x="16" y="24" width="150" height="58" rx="8" class="box" />
+    <text x="30" y="48" class="t-title">Docs</text>
+    <text x="30" y="67" class="t-sub">Markdown, by collection</text>
+    <rect x="16" y="112" width="150" height="58" rx="8" class="box-y" />
+    <text x="30" y="136" class="t-title">Memory</text>
+    <text x="30" y="155" class="t-sub">typed, reviewable entries</text>
+    <rect x="16" y="200" width="150" height="58" rx="8" class="box" />
+    <text x="30" y="224" class="t-title">Code</text>
+    <text x="30" y="243" class="t-sub">symbols + call edges</text>
+    <rect x="16" y="288" width="150" height="58" rx="8" class="box" />
+    <text x="30" y="312" class="t-title">Graph</text>
+    <text x="30" y="331" class="t-sub">frontmatter, wikilinks</text>
+  </g>
+
+  <g>
+    <path d="M238,120 V260 A62,16 0 0 0 362,260 V120" class="box-b" />
+    <ellipse cx="300" cy="120" rx="62" ry="16" class="box-b" />
+    <ellipse cx="300" cy="120" rx="62" ry="16" fill="none" stroke="var(--ink)" stroke-width="2">
+      <animate attributeName="ry" values="16;19;16" dur="2.4s" repeatCount="indefinite" />
+    </ellipse>
+    <text x="300" y="186" text-anchor="middle" class="t-title t-mono">.mdkb/</text>
+    <text x="300" y="206" text-anchor="middle" class="t-sub">SQLite · FTS5</text>
+    <text x="300" y="222" text-anchor="middle" class="t-sub">ONNX vectors</text>
+    <text x="300" y="300" text-anchor="middle" class="t-sub">one store per repository</text>
+  </g>
+
+  <g>
+    <rect x="440" y="140" width="144" height="100" rx="10" class="box-y" />
+    <text x="512" y="176" text-anchor="middle" class="t-title">Your agent</text>
+    <text x="512" y="196" text-anchor="middle" class="t-sub">Claude Code · Codex</text>
+    <text x="512" y="212" text-anchor="middle" class="t-sub">any MCP client</text>
+    <text x="512" y="264" text-anchor="middle" class="t-sub">via hooks · MCP · CLI</text>
+  </g>
+</svg>

@@ -1,0 +1,30 @@
+<svg viewBox="0 0 360 320" role="img" aria-label="Every note, stale ones included, is pasted into every prompt; the token cost grows with the file.">
+  <rect x="20" y="20" width="150" height="220" rx="6" class="box" />
+  <text x="95" y="14" text-anchor="middle" class="t-sub">NOTES.md</text>
+  <g>
+    <rect x="34" y="36" width="118" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.04;0.06;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="56" width="96" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.115;0.135;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="76" width="122" height="8" rx="3" fill="var(--red)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.19;0.21;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="96" width="84" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.265;0.285;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="116" width="110" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.34;0.36;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="136" width="100" height="8" rx="3" fill="var(--red)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.415;0.435;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="156" width="118" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.49;0.51;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="176" width="90" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.565;0.585;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="196" width="112" height="8" rx="3" fill="var(--red)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.64;0.66;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+    <rect x="34" y="216" width="76" height="8" rx="3" fill="var(--ink-2)"><animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.715;0.735;0.92;1" dur="8s" repeatCount="indefinite" /></rect>
+  </g>
+  <path d="M174,130 H204" class="wire" />
+  <path d="M198,124 L206,130 L198,136" class="wire-solid" />
+  <rect x="210" y="20" width="130" height="220" rx="6" class="box" />
+  <text x="275" y="14" text-anchor="middle" class="t-sub">every prompt</text>
+  <rect x="222" y="32" width="106" height="0" rx="3" fill="var(--red-soft)" stroke="var(--red)">
+    <animate attributeName="height" values="0;196;196;0" keyTimes="0;0.74;0.92;1" dur="8s" repeatCount="indefinite" />
+  </rect>
+  <text x="20" y="266" class="t-sub">tokens spent on memory, per prompt</text>
+  <rect x="20" y="274" width="320" height="14" rx="7" fill="none" stroke="var(--ink)" stroke-width="1.5" />
+  <rect x="20" y="274" width="0" height="14" rx="7" fill="var(--red)">
+    <animate attributeName="width" values="0;320;320;0" keyTimes="0;0.74;0.92;1" dur="8s" repeatCount="indefinite" />
+  </rect>
+  <rect x="20" y="300" width="10" height="8" rx="2" fill="var(--red)" />
+  <text x="36" y="308" class="t-sub">stale notes load too, until someone deletes them</text>
+</svg>
