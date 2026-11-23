@@ -368,8 +368,8 @@ fn dup_cache_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
         return std::path::PathBuf::from(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return std::path::PathBuf::from(home).join(".cache/fastembed");
+    if let Ok(home) = crate::daemon::config::home_dir() {
+        return home.join(".cache/fastembed");
     }
     std::path::PathBuf::from(".fastembed_cache")
 }

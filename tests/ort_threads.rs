@@ -44,11 +44,12 @@ fn os_threads() -> usize {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_session_built_like_fastembed_adds_at_most_the_bounded_threads() {
-    let cores = std::thread::available_parallelism().unwrap().get();
-    assert!(
-        cores > mdkb::llm::DEFAULT_ORT_THREADS + 2,
-        "{cores} cores cannot tell a per-core pool from the bounded one"
-    );
+    // Ask for more threads than the bound can explain even on a small runner
+    // (CI has 4 cores): ORT honours the request regardless of the core count.
+    let cores = std::thread::available_parallelism()
+        .unwrap()
+        .get()
+        .max(mdkb::llm::DEFAULT_ORT_THREADS + 3);
     let before = os_threads();
 
     mdkb::llm::bound_onnx_threads();

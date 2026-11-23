@@ -437,8 +437,10 @@ fn shared_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache/fastembed");
+    // HOME, then USERPROFILE: Windows sets only the second, and reading HOME
+    // alone put the model in a per-directory `.fastembed_cache` there.
+    if let Ok(home) = crate::daemon::config::home_dir() {
+        return home.join(".cache/fastembed");
     }
     // Fallback: use CWD-relative (original fastembed behavior)
     PathBuf::from(".fastembed_cache")

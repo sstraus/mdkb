@@ -132,11 +132,17 @@ fn smoke_consolidated_removed_names_print_a_command_that_runs() {
         (vec!["coupling", "--docs"], "mdkb graph coupling".into()),
         (
             vec!["journal", "import", journals, "-n"],
-            format!("mdkb memory import --journal {journals} --dry-run"),
+            format!(
+                "mdkb memory import --journal {} --dry-run",
+                mdkb::cli::usage_errors::shell_quote(journals)
+            ),
         ),
         (
             vec!["journal", "import-all", "--dir", journals],
-            format!("mdkb memory import --journal {journals}"),
+            format!(
+                "mdkb memory import --journal {}",
+                mdkb::cli::usage_errors::shell_quote(journals)
+            ),
         ),
         (
             vec![
