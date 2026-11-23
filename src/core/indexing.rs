@@ -369,7 +369,7 @@ fn run_document_update_mode(
     // Backfill embeddings for memory entries written without one (CLI cold-model
     // writes, or entries that predate embed-on-write). Runs after the index
     // commit so ONNX inference never holds the write lock. Failure is logged,
-    // never fatal to `update` — the count surfaces in `mdkb stats`.
+    // never fatal to `update` — the count surfaces in `mdkb status`.
     match memory::backfill_memory_embeddings(&ctx.conn) {
         Ok(n) => result.memory_embeddings_backfilled = n,
         Err(e) => tracing::warn!("memory embedding backfill failed: {e}"),
@@ -509,7 +509,7 @@ fn report_collection_deltas(
             result.errors.push(format!(
                 "collection `{name}` held {count} document(s) before this run and is no longer \
                  registered — nothing re-registers it; restore with `mdkb collection add {name} \
-                 <path> && mdkb update`, and check `mdkb stats` for a quarantine that wiped it"
+                 <path> && mdkb update`, and check `mdkb status` for a quarantine that wiped it"
             ));
         }
     }
@@ -525,7 +525,7 @@ fn report_collection_deltas(
 
     // Record what this run ended with, for the next run to compare against.
     // Vanished collections are deliberately NOT carried forward: once reported,
-    // a deliberate `mdkb collection remove` must stop warning, or the message
+    // a deliberate `mdkb collection rm` must stop warning, or the message
     // becomes permanent and gets ignored — which is how the original loss went
     // unnoticed in the first place.
     write_collections_snapshot(ctx, &after);
@@ -615,7 +615,7 @@ fn prune_vanished_convention_collections(
     if vanished.len() > 1 && vanished.len() == convention.len() {
         result.errors.push(format!(
             "every convention collection ({}) has a missing directory; none pruned — \
-             check for an unmounted volume, or run `mdkb collection remove <name>` for a \
+             check for an unmounted volume, or run `mdkb collection rm <name>` for a \
              directory deleted on purpose",
             vanished
                 .iter()

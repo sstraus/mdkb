@@ -9,7 +9,19 @@ use crate::core::memory::handle_memory_search;
 use crate::core::search::handle_hybrid_search;
 use crate::error::{Error, Result};
 
-/// Search each selected indexed store once, then apply a single global limit.
+/// Documents and memory entries each keep up to `limit` hits in the knowledge
+/// scope, so a full document list never starves memory. Returns the number of
+/// documents and memory entries to keep, and whether either corpus had more.
+pub fn knowledge_counts(docs: usize, memories: usize, limit: usize) -> (usize, usize, bool) {
+    (
+        docs.min(limit),
+        memories.min(limit),
+        docs > limit || memories > limit,
+    )
+}
+
+/// Search each selected indexed store once, then apply the limit to each corpus.
+/// Documents come first, then memory; `knowledge` keeps `limit` of each.
 /// Each hit keeps its repository because document IDs and memory IDs are local
 /// to a store. Indexed readers do not establish working-tree freshness.
 #[allow(clippy::too_many_arguments)]
@@ -28,7 +40,8 @@ pub fn search_indexed_roots<F>(
 where
     F: FnMut(&Path) -> std::result::Result<Context, String>,
 {
-    let mut hits = Vec::new();
+    let mut doc_hits = Vec::new();
+    let mut memory_hits = Vec::new();
     let mut coverage = Vec::new();
     let mut searched = 0;
     let mut truncated = false;
@@ -75,26 +88,26 @@ where
                     "root": repo, "status": "partial", "freshness": {"state": "unknown"},
                     "reason": "indexed corpus freshness not verified",
                 }));
-                truncated |= docs.len().saturating_add(memories.len()) > fetch_limit - 1;
+                truncated |= knowledge_counts(docs.len(), memories.len(), limit).2;
                 for doc in docs {
-                    if hits.len() > limit {
+                    if doc_hits.len() > limit {
                         break;
                     }
                     let mut hit = serde_json::json!({"repo": repo, "value": doc});
                     if scope == "knowledge" {
                         hit["corpus"] = serde_json::json!("docs");
                     }
-                    hits.push(hit);
+                    doc_hits.push(hit);
                 }
                 for entry in memories {
-                    if hits.len() > limit {
+                    if memory_hits.len() > limit {
                         break;
                     }
                     let mut hit = serde_json::json!({"repo": repo, "value": entry});
                     if scope == "knowledge" {
                         hit["corpus"] = serde_json::json!("memory");
                     }
-                    hits.push(hit);
+                    memory_hits.push(hit);
                 }
             }
             Err(reason) => coverage.push(serde_json::json!({
@@ -102,8 +115,11 @@ where
             })),
         }
     }
-    truncated |= hits.len() > limit;
-    hits.truncate(limit);
+    truncated |= knowledge_counts(doc_hits.len(), memory_hits.len(), limit).2;
+    doc_hits.truncate(limit);
+    memory_hits.truncate(limit);
+    let mut hits = doc_hits;
+    hits.append(&mut memory_hits);
     let unit = match scope {
         "docs" => "document",
         "memory" => "memory_entry",
@@ -166,7 +182,13 @@ pub struct Request<'a> {
     pub contract: Option<&'a str>,
 }
 
+/// Message for the removed search filter `file` (CLI `--file`), shared by the CLI and MCP.
+pub const REMOVED_FILE_FILTER: &str = "search `file` was removed; use `path` (CLI: `--path PREFIX`), a repository-relative path prefix";
+
 pub fn validate(request: Request<'_>) -> Result<Purpose> {
+    if request.file.is_some() {
+        return Err(Error::other(REMOVED_FILE_FILTER));
+    }
     let purpose = match request.scope {
         None => Purpose::LegacyDefault,
         Some("text" | "strings") => Purpose::LegacyText,
@@ -214,12 +236,6 @@ pub fn validate(request: Request<'_>) -> Result<Purpose> {
         )
     {
         return Err(Error::other("path is not supported for this corpus"));
-    }
-    if request.path.is_some() && request.file.is_some() {
-        return Err(Error::other("choose path or legacy file, not both"));
-    }
-    if purpose == Purpose::Source && request.file.is_some() {
-        return Err(Error::other("source uses path, not legacy file"));
     }
     if request.ignore_case
         && !matches!(

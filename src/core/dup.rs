@@ -1,4 +1,4 @@
-//! `mdkb dup`: the duplication audit, independent of how it was asked for.
+//! `mdkb code dup`: the duplication audit, independent of how it was asked for.
 //!
 //! The CLI command and the MCP `scope="duplicates"` both land here, so the two
 //! surfaces cannot answer differently for the same repository.
@@ -85,7 +85,7 @@ pub fn handle_dup(
     let code_path = root.join(".mdkb/code.sqlite");
     let missing = |root: &Path| DupReport {
         markdown: format!(
-            "# Duplication\n\nNo code index in {}. Run `mdkb code index` first.\n",
+            "# Duplication\n\nNo code index in {}. Run `mdkb update --code` first.\n",
             root.display()
         ),
         findings: Vec::new(),
@@ -136,6 +136,31 @@ pub fn handle_dup(
         ),
         None => None,
     };
+
+    // An anchor that names no indexed file would print "No clusters found",
+    // which reads as "this file has no clones". Say what actually happened.
+    if let Some(prefix) = &overrides.file {
+        let like = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+        let indexed: i64 = code
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\'",
+                [&like],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if indexed == 0 {
+            return Ok(DupReport {
+                markdown: format!(
+                    "# Duplication\n\nNo indexed symbol under `{prefix}`. Check the path, or run `mdkb update --code`.\n"
+                ),
+                findings: Vec::new(),
+                considered: 0,
+                ignored: 0,
+                hamming_threshold: config.code.duplication.hamming_threshold,
+                indexed: true,
+            });
+        }
+    }
 
     let settings = &config.code.duplication;
     let options = DupOptions {
@@ -251,7 +276,7 @@ mod tests {
             report.markdown
         );
         assert!(
-            report.markdown.contains("mdkb code index"),
+            report.markdown.contains("mdkb update --code"),
             "and says what to do about it: {}",
             report.markdown
         );
@@ -260,7 +285,7 @@ mod tests {
     /// A code index with the schema and no rows.
     ///
     /// `mdkb init` leaves exactly this behind, so it is the state a first
-    /// `mdkb dup` in a fresh repository actually meets.
+    /// `mdkb code dup` in a fresh repository actually meets.
     fn empty_index(root: &Path) {
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
         let code = Connection::open(root.join(".mdkb/code.sqlite")).unwrap();
@@ -402,7 +427,7 @@ mod tests {
         );
     }
 
-    /// A default `mdkb dup` never constructs the embedder.
+    /// A default `mdkb code dup` never constructs the embedder.
     ///
     /// The model name is one `fastembed_model` rejects outright, so building it
     /// would fail without reaching the network. `handle_dup` swallows that

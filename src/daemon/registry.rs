@@ -50,13 +50,47 @@ pub struct RepoHandle {
     /// Single-flight guard for the background memory-embedding backfill. Set while
     /// a drain is in flight so concurrent hook triggers (session-start + stop)
     /// don't stack redundant ONNX passes; reset via an RAII guard even on panic.
-    pub backfill_in_flight: AtomicBool,
+    pub backfill_in_flight: Arc<AtomicBool>,
+    pub(crate) embedding_retry:
+        Arc<std::sync::Mutex<Option<(Option<Vec<u8>>, std::time::Instant)>>>,
     /// Handle to the spawned file watcher task. Aborted on drop to prevent
     /// orphan watcher threads (notify-rs debouncer + fsevents) after LRU eviction.
     watcher_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
-    /// The cross-encoder automatic recall reranks with. Every handle points at
-    /// the one process-wide instance; a test swaps in its own.
-    pub reranker: Arc<dyn crate::llm::rerank::Reranker>,
+}
+
+/// Reloads and evicted handles still refer to the same physical store.
+type EmbeddingRetry = Arc<std::sync::Mutex<Option<(Option<Vec<u8>>, std::time::Instant)>>>;
+type EmbeddingState = (std::sync::Weak<AtomicBool>, EmbeddingRetry);
+
+fn embedding_backfill_guard(root: &Path) -> (Arc<AtomicBool>, EmbeddingRetry) {
+    use std::sync::{Mutex, OnceLock};
+    static FLIGHTS: OnceLock<Mutex<std::collections::HashMap<PathBuf, EmbeddingState>>> =
+        OnceLock::new();
+    let key = crate::store::namespace::store_dir(root).unwrap_or_else(|_| root.to_path_buf());
+    let key = crate::domain::canonicalize_plain(&key).unwrap_or(key);
+    let mut flights = FLIGHTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // A failed store keeps its memo through eviction until the retry is due.
+    // Otherwise dead handles do not turn encountered paths into a permanent cache.
+    flights.retain(|_, (flight, retry)| {
+        flight.strong_count() > 0
+            || retry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|(_, until)| std::time::Instant::now() < *until)
+    });
+    let (weak, retry) = flights
+        .entry(key)
+        .or_insert_with(|| (std::sync::Weak::new(), Arc::new(Mutex::new(None))));
+    let flag = weak.upgrade().unwrap_or_else(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        *weak = Arc::downgrade(&flag);
+        flag
+    });
+    (flag, Arc::clone(retry))
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -70,15 +104,16 @@ impl std::fmt::Debug for RepoHandle {
 impl RepoHandle {
     /// Open (or create) a repo handle for the given root path.
     ///
-    /// `global_priors` is the daemon-wide `[priors]` base (from `~/.mdkb/daemon.toml`);
-    /// the repo's own `[priors]` overrides it field-by-field. Passing it in (rather
-    /// than reading `daemon.toml` here) keeps `open` free of hidden global state so
-    /// tests stay deterministic.
-    pub fn open(root: &Path, global_priors: &toml::Table) -> Result<Self> {
+    /// `global` is the daemon-wide base (from `~/.mdkb/daemon.toml`): its
+    /// `[priors]` and `[telemetry]` sit under the repo's own sections, which
+    /// override them key by key. Passing it in (rather than reading
+    /// `daemon.toml` here) keeps `open` free of hidden global state so tests
+    /// stay deterministic.
+    pub fn open(root: &Path, global: &DaemonConfig) -> Result<Self> {
         let root = canonicalize_root(root)?;
         let config_path = config_path(&root);
         let identity = ConfigIdentity::of(&config_path);
-        let config = load_config(&config_path, global_priors, false)?;
+        let config = load_config(&config_path, global, false)?;
         Ok(Self::with_state(
             root,
             config,
@@ -99,12 +134,12 @@ impl RepoHandle {
     ///
     /// A malformed reload keeps the last good config; removed rerank controls
     /// refuse new requests. Neither replaces restrictive settings with defaults.
-    fn reopen(&self, global_priors: &toml::Table) -> Result<Self> {
+    fn reopen(&self, global: &DaemonConfig) -> Result<Self> {
         let config_path = config_path(&self.root);
         // Identity first: an edit landing during the read is then seen as a
         // change on the next access instead of being recorded as already read.
         let identity = ConfigIdentity::of(&config_path);
-        let config = load_config(&config_path, global_priors, true)?;
+        let config = load_config(&config_path, global, true)?;
         Ok(Self::with_state(
             self.root.clone(),
             config,
@@ -127,6 +162,7 @@ impl RepoHandle {
     ) -> Self {
         let code_ignore_patterns = config.code.indexing.ignore_patterns.clone();
         let (reindex_tx, reindex_rx) = mpsc::channel(64);
+        let (backfill_in_flight, embedding_retry) = embedding_backfill_guard(&root);
         Self {
             root,
             ctx,
@@ -141,9 +177,9 @@ impl RepoHandle {
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
             reindex_send_warned: AtomicBool::new(false),
-            backfill_in_flight: AtomicBool::new(false),
+            backfill_in_flight,
+            embedding_retry,
             watcher_handle: std::sync::Mutex::new(None),
-            reranker: crate::llm::rerank::shared(),
         }
     }
 
@@ -160,6 +196,7 @@ impl RepoHandle {
     ) -> Self {
         let (reindex_tx, reindex_rx) = mpsc::channel(64);
         let config_identity = ConfigIdentity::of(&config_path(&root));
+        let (backfill_in_flight, embedding_retry) = embedding_backfill_guard(&root);
         Self {
             root,
             ctx,
@@ -174,9 +211,9 @@ impl RepoHandle {
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
             reindex_send_warned: AtomicBool::new(false),
-            backfill_in_flight: AtomicBool::new(false),
+            backfill_in_flight,
+            embedding_retry,
             watcher_handle: std::sync::Mutex::new(None),
-            reranker: crate::llm::rerank::shared(),
         }
     }
 
@@ -226,16 +263,23 @@ fn config_path(root: &Path) -> PathBuf {
     root.join(".mdkb/config.toml")
 }
 
-/// `config.toml` read strictly, with the daemon's global `[priors]` layered
-/// under the repo's own. A missing file is the defaults, not an error.
-fn load_config(path: &Path, global_priors: &toml::Table, reload: bool) -> Result<Config> {
+/// `config.toml` read strictly, with the daemon's global `[priors]` and
+/// `[telemetry]` layered under the repo's own. A missing file is the defaults,
+/// not an error.
+fn load_config(path: &Path, global: &DaemonConfig, reload: bool) -> Result<Config> {
     let mut config = if reload && path.exists() {
         Config::load(path)?
     } else {
         Config::load_for_repo(path)?
     };
     let repo_priors = crate::config::raw_priors_layer(path);
-    config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
+    config.priors = crate::config::merge_priors(&global.priors, repo_priors.as_ref());
+    let repo_telemetry = crate::config::raw_telemetry_layer(path);
+    crate::config::layer_telemetry(
+        &mut config.telemetry,
+        &global.telemetry,
+        repo_telemetry.as_ref(),
+    );
     Ok(config)
 }
 
@@ -293,8 +337,15 @@ impl std::fmt::Display for ReadRefusal {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RegistryLifetime {
+    Daemon,
+    OneShot,
+}
+
 /// Registry managing multiple repo handles with LRU eviction.
 pub struct RepoRegistry {
+    lifetime: RegistryLifetime,
     handles: DashMap<PathBuf, Arc<RepoHandle>>,
     max_active: usize,
     daemon_config: DaemonConfig,
@@ -348,6 +399,7 @@ impl RepoRegistry {
         );
         let ignored = config.ignored_paths();
         Self {
+            lifetime: RegistryLifetime::Daemon,
             handles: DashMap::new(),
             max_active,
             daemon_config: config,
@@ -357,6 +409,13 @@ impl RepoRegistry {
             open_gate: std::sync::Mutex::new(()),
             discovery: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Retain registry admission and discovery without starting daemon watchers.
+    pub(crate) fn one_shot(config: DaemonConfig) -> Self {
+        let mut registry = Self::new(config);
+        registry.lifetime = RegistryLifetime::OneShot;
+        registry
     }
 
     /// Create a single-repo registry around an already-open standalone handle.
@@ -378,7 +437,7 @@ impl RepoRegistry {
 
         // Fast path: already open
         if let Some(handle) = self.open_handle(&canonical)? {
-            self.repo_map.record(&canonical);
+            self.record_unignored(&canonical);
             return Ok(handle);
         }
 
@@ -392,7 +451,7 @@ impl RepoRegistry {
         // Re-check after acquiring the gate: another caller may have just inserted this key.
         if let Some(handle) = self.handles.get(&canonical) {
             handle.touch();
-            self.repo_map.record(&canonical);
+            self.record_unignored(&canonical);
             return Ok(Arc::clone(&handle));
         }
 
@@ -402,7 +461,7 @@ impl RepoRegistry {
         }
 
         // Open new handle
-        let handle = match RepoHandle::open(&canonical, &self.daemon_config.priors) {
+        let handle = match RepoHandle::open(&canonical, &self.daemon_config) {
             Ok(handle) => Arc::new(handle),
             Err(e) => {
                 // An open that fails is not evidence the repo is gone: a schema
@@ -421,7 +480,7 @@ impl RepoRegistry {
         self.handles.insert(canonical.clone(), Arc::clone(&handle));
         // Recorded only here: after the whitelist check and after the store
         // opened, so a refused or broken root never enters the map.
-        self.repo_map.record(&canonical);
+        self.record_unignored(&canonical);
         tracing::info!("Registered repo: {}", canonical.display());
 
         drop(_gate);
@@ -429,7 +488,9 @@ impl RepoRegistry {
         // Spawn the file watcher for this repo exactly once (on first open).
         // Story 017-91cb: the watcher lives only inside the daemon — standalone
         // MCP stdio sessions never touch files.
-        spawn_watcher_for_handle(&handle);
+        if self.lifetime == RegistryLifetime::Daemon {
+            spawn_watcher_for_handle(&handle);
+        }
 
         Ok(handle)
     }
@@ -495,6 +556,15 @@ impl RepoRegistry {
         roots.into_iter().collect()
     }
 
+    /// Drop Gone roots from the map and `repos.json`; see [`RepoMap::prune_gone`].
+    pub fn prune_gone_roots(
+        &self,
+        selected: Option<&[PathBuf]>,
+        dry_run: bool,
+    ) -> std::result::Result<super::repo_map::PruneReport, String> {
+        self.repo_map.prune_gone(selected, dry_run)
+    }
+
     pub(crate) fn last_opened(&self) -> std::collections::BTreeMap<PathBuf, i64> {
         self.repo_map.last_opened()
     }
@@ -529,6 +599,15 @@ impl RepoRegistry {
         roots.extend(self.walk_for(&walk));
         self.retain_unignored(&mut roots);
         roots.into_iter().collect()
+    }
+
+    /// Record an opened root on the map unless `daemon.toml` ignores it: an
+    /// ignored root is served while open but never enters `repos.json`, so
+    /// scratch repositories under an ignored directory leave no registry row.
+    fn record_unignored(&self, canonical: &Path) {
+        if !super::repo_map::is_ignored(canonical, &self.ignored) {
+            self.repo_map.record(canonical);
+        }
     }
 
     /// Drop the roots `daemon.toml` says to ignore.
@@ -678,14 +757,16 @@ impl RepoRegistry {
         if !current.config_identity.changed() {
             return Ok(Some(current));
         }
-        match current.reopen(&self.daemon_config.priors) {
+        match current.reopen(&self.daemon_config) {
             Ok(fresh) => {
                 let fresh = Arc::new(fresh);
                 self.handles
                     .insert(canonical.to_path_buf(), Arc::clone(&fresh));
                 drop(_gate);
                 tracing::info!("Reloaded config: {}", canonical.display());
-                spawn_watcher_for_handle(&fresh);
+                if self.lifetime == RegistryLifetime::Daemon {
+                    spawn_watcher_for_handle(&fresh);
+                }
                 Ok(Some(fresh))
             }
             Err(e) => {
@@ -824,6 +905,7 @@ mod tests {
     fn make_repo(tmp: &TempDir) -> PathBuf {
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        std::fs::write(root.join(".mdkb/index.sqlite"), b"").unwrap();
         root
     }
 
@@ -1114,7 +1196,7 @@ mod tests {
             "[hooks]\nrecall_rerank_it = true\nuser_prompt_submit_require_sigil = true\n",
         )
         .unwrap();
-        let error = RepoHandle::open(&root, &toml::Table::new())
+        let error = RepoHandle::open(&root, &DaemonConfig::default())
             .unwrap_err()
             .to_string();
         assert!(error.contains("recall_rerank_languages"), "{error}");
@@ -1148,7 +1230,7 @@ mod tests {
     fn test_repo_handle_open() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let handle = RepoHandle::open(&root, &toml::Table::new()).unwrap();
+        let handle = RepoHandle::open(&root, &DaemonConfig::default()).unwrap();
         assert_eq!(
             handle.root,
             crate::domain::canonicalize_plain(&root).unwrap()
@@ -1169,6 +1251,11 @@ mod tests {
         let global: toml::Table =
             toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"\n").unwrap();
 
+        let global = DaemonConfig {
+            priors: global,
+            ..DaemonConfig::default()
+        };
+
         let handle = RepoHandle::open(&root, &global).unwrap();
         assert!(
             !handle.config.priors.mining_enabled,
@@ -1181,11 +1268,57 @@ mod tests {
         );
     }
 
+    /// Catches: a repo whose tracked config.toml has no `[telemetry]` ignoring
+    /// the developer's daemon.toml opt-in, and the opt-in overriding a repo
+    /// that disabled query telemetry explicitly.
+    #[test]
+    fn open_layers_global_telemetry_under_repo_override() {
+        let global = DaemonConfig {
+            telemetry: crate::daemon::config::DaemonTelemetry {
+                query_events: Some(true),
+                retention_days: Some(14),
+                ..Default::default()
+            },
+            ..DaemonConfig::default()
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let silent = make_repo(&tmp);
+        std::fs::write(
+            silent.join(".mdkb/config.toml"),
+            "[graph]\nenabled = true\n",
+        )
+        .unwrap();
+        let handle = RepoHandle::open(&silent, &global).unwrap();
+        assert!(
+            handle.config.telemetry.query_events,
+            "repo silent: daemon.toml opt-in applies"
+        );
+        assert_eq!(handle.config.telemetry.retention_days, 14);
+
+        let other = TempDir::new().unwrap();
+        let refusing = make_repo(&other);
+        std::fs::write(
+            refusing.join(".mdkb/config.toml"),
+            "[telemetry]\nquery_events = false\n",
+        )
+        .unwrap();
+        let handle = RepoHandle::open(&refusing, &global).unwrap();
+        assert!(
+            !handle.config.telemetry.query_events,
+            "explicit repo key wins"
+        );
+        assert_eq!(
+            handle.config.telemetry.retention_days, 14,
+            "a key the repo leaves unset still comes from daemon.toml"
+        );
+    }
+
     #[test]
     fn test_repo_handle_touch() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let handle = RepoHandle::open(&root, &toml::Table::new()).unwrap();
+        let handle = RepoHandle::open(&root, &DaemonConfig::default()).unwrap();
         let t1 = handle.last_access_time();
         handle.touch();
         let t2 = handle.last_access_time();
@@ -1507,6 +1640,26 @@ mod tests {
             state_dir: Some(state.to_path_buf()),
             ..allow_temp_config()
         }
+    }
+
+    /// Catches an ignored scratch root still written to `repos.json` when an
+    /// agent opens it: it must be served but never recorded.
+    #[test]
+    fn an_opened_root_under_an_ignored_directory_is_served_but_not_recorded() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let canonical = canonicalize_root(&root).unwrap();
+        let registry = RepoRegistry::new(DaemonConfig {
+            ignore: vec![canonical.to_string_lossy().to_string()],
+            ..allow_temp_config_with_state(state.path())
+        });
+
+        registry.get_or_open(&root).unwrap();
+        registry.get_or_open(&root).unwrap();
+
+        assert!(registry.known_roots().is_empty());
+        assert!(!state.path().join("repos.json").exists());
     }
 
     /// Catches recording only newly created handles: a repo already live in
@@ -1847,5 +2000,26 @@ mod tests {
         let c = registry.get(&root).unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(Arc::ptr_eq(&a, &c));
+    }
+
+    /// Catches a cached handle re-recording a pruned root: once the directory is
+    /// gone, `get_or_open` fails to resolve it before `record`, so the pruned
+    /// entry cannot return through a live handle.
+    #[test]
+    fn a_pruned_root_is_not_re_recorded_through_its_cached_handle() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let registry = RepoRegistry::new(allow_temp_config_with_state(state.path()));
+        registry.get_or_open(&root).unwrap();
+        let canonical = canonicalize_root(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let pruned = registry.prune_gone_roots(None, false).unwrap();
+        let reopened = registry.get_or_open(&root);
+
+        assert_eq!(pruned.removed, vec![canonical.clone()]);
+        assert!(reopened.is_err());
+        assert!(!registry.known_roots().contains(&canonical));
     }
 }

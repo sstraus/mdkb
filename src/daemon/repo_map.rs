@@ -53,7 +53,7 @@ struct MapEntry {
     last_opened_at: Option<i64>,
 }
 
-/// Remove only healthy, unpinned roots whose inactivity exceeds the limit.
+/// Remove unpinned roots whose inactivity exceeds the limit, unless unreadable.
 fn expire(
     roots: &mut BTreeMap<PathBuf, i64>,
     pinned: &BTreeSet<PathBuf>,
@@ -65,7 +65,13 @@ fn expire(
         roots.retain(|root, last| {
             let expired = at.saturating_sub(*last) >
                 i64::try_from(expiry_days).unwrap_or(i64::MAX).saturating_mul(DAY_SECS);
-            if expired && !pinned.contains(root) && classify(root) == RootHealth::Healthy {
+            if expired
+                && !pinned.contains(root)
+                && matches!(
+                    classify(root),
+                    RootHealth::Healthy | RootHealth::Gone | RootHealth::NoStore
+                )
+            {
                 tracing::info!(root = %root.display(), reason = "inactivity exceeded repo_expiry_days",
                     last_opened_at = *last, expiry_days, "Dropped repo from the map");
                 false
@@ -89,7 +95,8 @@ pub enum RootHealth {
     Healthy,
     /// Nothing exists at that path any more.
     Gone,
-    /// The path exists but holds no `.mdkb` store.
+    /// The path exists but holds no `.mdkb` store: none at all, or a `.mdkb`
+    /// that is empty or holds only lock files.
     NoStore,
     /// The store is there and this process cannot read it. Carries the reason.
     Unreadable(String),
@@ -140,9 +147,23 @@ pub fn classify(root: &Path) -> RootHealth {
         Err(e) => return RootHealth::Unreadable(e.to_string()),
     }
 
-    match std::fs::read_dir(&store) {
-        Ok(_) => RootHealth::Healthy,
-        Err(e) => RootHealth::Unreadable(e.to_string()),
+    let entries = match std::fs::read_dir(&store) {
+        Ok(entries) => entries,
+        Err(e) => return RootHealth::Unreadable(e.to_string()),
+    };
+    // A `.mdkb` that holds nothing, or only lock files, is what a scratch
+    // cleanup or a retired store leaves behind: no store. Anything else — a
+    // memory projection, a config, a quarantined index — may be the only copy
+    // of something, so the root stays even without `index.sqlite`.
+    let holds_data = entries.filter_map(|e| e.ok()).any(|e| {
+        !e.file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".lock"))
+    });
+    if holds_data {
+        RootHealth::Healthy
+    } else {
+        RootHealth::NoStore
     }
 }
 
@@ -369,7 +390,14 @@ pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
 pub fn try_read_scope_overrides(path: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        // Windows reports a parent that is a file as NotFound, where Unix says
+        // ENOTDIR; either way the map exists in some form and cannot be read.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !path.parent().is_some_and(|p| p.exists() && !p.is_dir()) =>
+        {
+            return Ok(BTreeMap::new());
+        }
         Err(e) => return Err(e.to_string()),
     };
     let file = serde_json::from_str::<RepoMapFile>(&content).map_err(|e| e.to_string())?;
@@ -606,15 +634,22 @@ impl RepoMap {
     /// losing the map costs a re-discovery, failing the open that triggered it
     /// costs the caller their tool call.
     fn persist(&self, roots: &mut BTreeMap<PathBuf, i64>) {
+        if let Err(why) = self.try_persist(roots) {
+            tracing::warn!("{why}");
+        }
+    }
+
+    /// [`persist`](Self::persist) that says when the file does not hold `roots`.
+    /// Only an explicit operator action (`prune_gone`) reports this to its caller.
+    fn try_persist(&self, roots: &mut BTreeMap<PathBuf, i64>) -> Result<(), String> {
         let Some(path) = &self.path else {
-            return;
+            return Ok(());
         };
         if !self.replaceable {
-            tracing::warn!(
-                path = %path.display(),
-                "Not overwriting a repo map this binary could not read; the set is correct in memory only"
-            );
-            return;
+            return Err(format!(
+                "Not overwriting the repo map {} this binary could not read; the set is correct in memory only",
+                path.display()
+            ));
         }
         // The scopes are written by hand, and this process never records one:
         // read them back from the file so a rewrite for a new root cannot erase
@@ -624,29 +659,132 @@ impl RepoMap {
         let scopes = match try_read_scope_overrides(path) {
             Ok(scopes) => scopes,
             Err(why) => {
-                tracing::warn!(
-                    path = %path.display(),
-                    "Not persisting the repo map: it cannot be read right now ({why}); the set is correct in memory only"
-                );
                 self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return Err(format!(
+                    "Not persisting the repo map {}: it cannot be read right now ({why}); the set is correct in memory only",
+                    path.display()
+                ));
             }
         };
         // Never roll back another live map's activity in a whole-map write.
         if let Err(why) = self.merge_persisted_activity(roots) {
-            tracing::warn!(path = %path.display(), "Not persisting repo activity: {why}");
             self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            return;
+            return Err(format!(
+                "Not persisting repo activity in {}: {why}",
+                path.display()
+            ));
         }
-        let failed = write_atomic(path, roots, &scopes).map_err(|e| {
-            tracing::warn!(
-                path = %path.display(),
-                "Could not persist the repo map: {e} — the set is still correct in memory"
-            );
+        let written = write_atomic(path, roots, &scopes).map_err(|e| {
+            format!(
+                "Could not persist the repo map {}: {e} — the set is still correct in memory",
+                path.display()
+            )
         });
         self.dirty
-            .store(failed.is_err(), std::sync::atomic::Ordering::Relaxed);
+            .store(written.is_err(), std::sync::atomic::Ordering::Relaxed);
+        written
     }
+
+    /// Remove roots that are [`RootHealth::Gone`] or [`RootHealth::NoStore`]
+    /// from the map and the file — the same absence that drops a root at load.
+    ///
+    /// `selected` names roots exactly as the map spells them (after
+    /// [`canonical_key`]); `None` selects every absent root and silently skips
+    /// the rest. With `selected`, a root that is unknown, healthy or unreadable
+    /// is refused and reported, and the eligible roots of the same selection
+    /// are still removed. `Unreadable` is not evidence that the repo was
+    /// deleted. Nothing on disk except `repos.json` is touched — a
+    /// hand-written scope stays in the file (see `write_atomic`) and
+    /// `daemon.toml` is never written. `dry_run` reports without changing
+    /// memory or file. A persistence failure restores the removed roots in
+    /// memory and returns the reason, so memory and file never disagree about a
+    /// success that did not happen.
+    ///
+    /// The filesystem is probed outside the `roots` lock, from a snapshot of
+    /// the keys, so a slow or hung mount cannot stall `record` and every
+    /// registry open behind it. A path can come back between the probe and the
+    /// removal; the registry lock cannot prevent filesystem changes either.
+    /// Only the registry entry is removed, never a directory, and the next
+    /// successful open records the root again.
+    pub fn prune_gone(
+        &self,
+        selected: Option<&[PathBuf]>,
+        dry_run: bool,
+    ) -> Result<PruneReport, String> {
+        let known: BTreeSet<PathBuf> = self
+            .roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        let mut report = PruneReport {
+            dry_run,
+            ..PruneReport::default()
+        };
+        let candidates: BTreeSet<PathBuf> = match selected {
+            None => known.clone(),
+            Some(paths) => paths.iter().map(|p| canonical_key(p)).collect(),
+        };
+        for root in candidates {
+            if !known.contains(&root) {
+                report.refused.push(PruneRefusal {
+                    reason: "not in the repository registry; give the path exactly as `mdkb repos list` prints it".into(),
+                    path: root,
+                });
+                continue;
+            }
+            match classify(&root) {
+                health if health.is_absence() => report.removed.push(root),
+                other if selected.is_some() => report.refused.push(PruneRefusal {
+                    reason: format!(
+                        "{}; only roots gone from disk or without a store are pruned",
+                        other.reason()
+                    ),
+                    path: root,
+                }),
+                _ => {}
+            }
+        }
+        if dry_run || report.removed.is_empty() {
+            return Ok(report);
+        }
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        // Only what is still on the map: another prune may have taken a root
+        // while this one probed.
+        let taken: Vec<(PathBuf, i64)> = report
+            .removed
+            .iter()
+            .filter_map(|root| roots.remove_entry(root))
+            .collect();
+        report.removed = taken.iter().map(|(root, _)| root.clone()).collect();
+        if report.removed.is_empty() {
+            return Ok(report);
+        }
+        if let Err(why) = self.try_persist(&mut roots) {
+            roots.extend(taken);
+            return Err(why);
+        }
+        for root in &report.removed {
+            tracing::info!(root = %root.display(), reason = "explicit prune", "Dropped repo from the map");
+        }
+        Ok(report)
+    }
+}
+
+/// One root `prune_gone` was asked to remove and did not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneRefusal {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+/// What `prune_gone` removed, or with `dry_run` would remove.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneReport {
+    pub dry_run: bool,
+    pub removed: Vec<PathBuf>,
+    pub refused: Vec<PruneRefusal>,
 }
 
 /// What a read of the persisted map produced.
@@ -866,6 +1004,7 @@ mod tests {
     fn make_repo(parent: &Path, name: &str) -> PathBuf {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        std::fs::write(root.join(".mdkb/index.sqlite"), b"").unwrap();
         canonical_key(&root)
     }
 
@@ -903,27 +1042,76 @@ mod tests {
         );
     }
 
-    /// Catches a >= boundary, ignored configuration, or expiring a live daemon
-    /// only at startup. The file is populated by real record calls.
+    /// Catches expiry measured with >=, ignored configuration, or a live map
+    /// retaining vanished/storeless roots forever. Only registry state expires.
     #[test]
     fn expiry_obeys_boundary_custom_limit_and_off_without_restart() {
-        let tmp = TempDir::new().unwrap();
-        let root = make_repo(tmp.path(), "repo");
         let start = 1_767_225_600;
-        for (days, age, kept) in [
-            (30, 30 * 86_400, true),
-            (30, 30 * 86_400 + 1, false),
-            (7, 8 * 86_400, false),
-            (0, 365 * 86_400, true),
-        ] {
-            let map = RepoMap::open_at(None, &[], days, start);
-            map.record_at(&root, start);
-            assert_eq!(
-                map.roots_at(start + age).contains(&root),
-                kept,
-                "{days} days, age {age}"
-            );
+        let mut failures = Vec::new();
+        for health in ["healthy", "gone", "nostore"] {
+            for (days, age, kept) in [
+                (30, 30 * 86_400, true),
+                (30, 30 * 86_400 + 1, false),
+                (7, 8 * 86_400, false),
+                (0, 365 * 86_400, true),
+            ] {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("repos.json");
+                let root = make_repo(tmp.path(), "repo");
+                std::fs::write(root.join("keep.txt"), b"repository data stays").unwrap();
+                let map = RepoMap::open_at(Some(path.clone()), &[], days, start);
+                map.record_at(&root, start);
+                match health {
+                    "gone" => std::fs::remove_dir_all(&root).unwrap(),
+                    "nostore" => std::fs::remove_dir_all(root.join(".mdkb")).unwrap(),
+                    _ => {}
+                }
+                let listed = map.roots_at(start + age).contains(&root);
+                let persisted = file_roots(&path).contains(&root);
+                if listed != kept || persisted != kept {
+                    failures.push(format!(
+                        "{health}, {days} days, age {age}: listed={listed}, persisted={persisted}, expected={kept}"
+                    ));
+                }
+                if health != "gone" {
+                    let bytes = std::fs::read(root.join("keep.txt"));
+                    if !matches!(&bytes, Ok(data) if data == b"repository data stays") {
+                        failures.push(format!(
+                            "{health}, {days} days: repository data changed: {bytes:?}"
+                        ));
+                    }
+                }
+                if health == "healthy" && !root.join(".mdkb").is_dir() {
+                    failures.push(format!("{days} days: healthy store was removed"));
+                }
+            }
         }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Catches the old path surviving a real move and rename, or expiry
+    /// forgetting the recently used new path or altering its store contents.
+    #[test]
+    fn expiry_preserves_a_repo_renamed_or_moved_to_a_recently_used_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let old = make_repo(tmp.path(), "original");
+        std::fs::write(old.join(".mdkb/keep.txt"), b"preserve these store bytes").unwrap();
+        let start = 1_767_225_600;
+        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+        map.record_at(&old, start);
+        let moved = tmp.path().join("nested/renamed");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&old, &moved).unwrap();
+        let moved = canonical_key(&moved);
+        map.record_at(&moved, start + 29 * 86_400);
+
+        assert_eq!(map.roots_at(start + 31 * 86_400), vec![moved.clone()]);
+        assert_eq!(file_roots(&path), BTreeSet::from([moved.clone()]));
+        assert_eq!(
+            std::fs::read(moved.join(".mdkb/keep.txt")).unwrap(),
+            b"preserve these store bytes"
+        );
     }
 
     /// Catches writes on every hook and activity frozen on first registration.
@@ -1025,24 +1213,33 @@ mod tests {
         assert!(old.join(".mdkb").is_dir());
     }
 
-    /// Catches an old unreadable root being treated like an unused healthy root.
+    /// Catches an old unreadable root being treated as unused or deleted,
+    /// both during a restart and in the map that originally opened it.
     #[cfg(unix)]
     #[test]
     fn expiry_never_removes_an_unreadable_store() {
         use std::os::unix::fs::PermissionsExt;
-        let tmp = TempDir::new().unwrap();
-        let path = tmp.path().join("repos.json");
-        let root = make_repo(tmp.path(), "locked");
-        let start = 1_767_225_600;
-        let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
-        map.record_at(&root, start);
-        std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o000))
-            .unwrap();
-        let map = RepoMap::open_at(Some(path), &[], 30, start + 31 * 86_400);
-        let roots = map.roots_at(start + 31 * 86_400);
-        std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
-        assert_eq!(roots, vec![root]);
+        for restart in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("repos.json");
+            let root = make_repo(tmp.path(), "locked");
+            let start = 1_767_225_600;
+            let map = RepoMap::open_at(Some(path.clone()), &[], 30, start);
+            map.record_at(&root, start);
+            std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let at = start + 31 * 86_400;
+            let map = if restart {
+                RepoMap::open_at(Some(path.clone()), &[], 30, at)
+            } else {
+                map
+            };
+            let roots = map.roots_at(at);
+            std::fs::set_permissions(root.join(".mdkb"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert_eq!(roots, vec![root.clone()], "restart={restart}");
+            assert!(file_roots(&path).contains(&root));
+        }
     }
 
     /// Catches legacy entries being lost or their migration grace being renewed
@@ -1529,5 +1726,292 @@ mod tests {
         let found = discover_nested_stores(&[parent], std::slice::from_ref(&silenced));
 
         assert_eq!(found, BTreeSet::from([kept]));
+    }
+
+    // ── prune_gone ──────────────────────────────────────────────────────────
+
+    fn file_roots(path: &Path) -> BTreeSet<PathBuf> {
+        let file: RepoMapFile = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        file.repos
+            .into_iter()
+            .map(|e| PathBuf::from(e.repo.root))
+            .collect()
+    }
+
+    /// A live map whose `gone` roots vanished after it loaded: the only way a
+    /// Gone root is in a running daemon's map, because `open` already drops them.
+    fn live_map_with(
+        tmp: &TempDir,
+        live: &[&str],
+        vanish: &[&str],
+    ) -> (RepoMap, PathBuf, Vec<PathBuf>) {
+        let path = tmp.path().join("state/repos.json");
+        let map = RepoMap::open(Some(path.clone()), &[]);
+        let mut gone = Vec::new();
+        for name in live.iter().chain(vanish) {
+            map.record(&make_repo(tmp.path(), name));
+        }
+        for name in vanish {
+            let root = tmp.path().join(name);
+            let key = canonical_key(&root);
+            std::fs::remove_dir_all(&root).unwrap();
+            gone.push(key);
+        }
+        (map, path, gone)
+    }
+
+    /// Catches a manual prune waiting for expiry: a root that vanished during
+    /// this process stays before its inactivity limit, but can be pruned now.
+    #[test]
+    fn a_recently_opened_root_that_disappears_can_be_pruned_before_expiry() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["keep"], &["stale"]);
+        assert!(
+            map.roots().contains(&gone[0]),
+            "hypothesis: roots() keeps a vanished root"
+        );
+
+        let report = map.prune_gone(None, false).unwrap();
+
+        assert_eq!(report.removed, gone);
+        assert!(!map.roots().contains(&gone[0]));
+        assert!(!file_roots(&path).contains(&gone[0]));
+        assert!(file_roots(&path).contains(&canonical_key(&tmp.path().join("keep"))));
+    }
+
+    /// Catches an exact-path prune that removes every Gone root, or one that
+    /// removes a different spelling of the path.
+    #[test]
+    fn prune_with_a_path_removes_only_that_gone_root() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["keep"], &["stale-a", "stale-b"]);
+
+        let report = map.prune_gone(Some(&gone[..1]), false).unwrap();
+
+        assert_eq!(report.removed, vec![gone[0].clone()]);
+        assert!(
+            map.roots().contains(&gone[1]),
+            "the unselected Gone root stays"
+        );
+        assert!(file_roots(&path).contains(&gone[1]));
+        assert!(!file_roots(&path).contains(&gone[0]));
+    }
+
+    /// Catches a dry run that writes: memory and the file stay byte-identical.
+    #[test]
+    fn dry_run_reports_and_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["keep"], &["stale"]);
+        let before = std::fs::read(&path).unwrap();
+        let roots_before = map.roots();
+
+        let report = map.prune_gone(None, true).unwrap();
+
+        assert!(report.dry_run);
+        assert_eq!(report.removed, gone);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(map.roots(), roots_before);
+    }
+
+    /// Catches pruning healthy or unknown roots on an explicit selection, and
+    /// a prune that keeps a root without a store although load drops it.
+    #[test]
+    fn prune_removes_absent_roots_and_refuses_the_rest_naming_why() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["healthy", "nostore"], &["stale"]);
+        let healthy = canonical_key(&tmp.path().join("healthy"));
+        let nostore = canonical_key(&tmp.path().join("nostore"));
+        std::fs::remove_dir_all(nostore.join(".mdkb")).unwrap();
+        let unknown = tmp.path().join("never-registered");
+
+        let report = map
+            .prune_gone(
+                Some(&[
+                    healthy.clone(),
+                    nostore.clone(),
+                    unknown.clone(),
+                    gone[0].clone(),
+                ]),
+                false,
+            )
+            .unwrap();
+
+        let removed: BTreeSet<_> = report.removed.iter().cloned().collect();
+        assert_eq!(removed, BTreeSet::from([nostore.clone(), gone[0].clone()]));
+        let refused: BTreeMap<_, _> = report
+            .refused
+            .iter()
+            .map(|r| (r.path.clone(), r.reason.as_str()))
+            .collect();
+        assert_eq!(refused.len(), 2, "{refused:?}");
+        assert!(refused[&healthy].starts_with("healthy;"));
+        assert!(refused[&unknown].starts_with("not in the repository registry"));
+        let kept = file_roots(&path);
+        assert!(kept.contains(&healthy) && !kept.contains(&nostore));
+    }
+
+    /// Catches the scratch-cleanup leftover: a `.mdkb` emptied of its index is
+    /// listed as NoStore, so prune (and the load triage) must treat it as one
+    /// instead of calling the bare directory a healthy store.
+    #[test]
+    fn an_emptied_store_directory_is_no_store_and_pruned_without_a_selection() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, _gone) = live_map_with(&tmp, &["keep", "emptied"], &[]);
+        let emptied = canonical_key(&tmp.path().join("emptied"));
+        std::fs::remove_file(emptied.join(".mdkb/index.sqlite")).unwrap();
+        assert!(emptied.join(".mdkb").is_dir());
+
+        assert_eq!(classify(&emptied), RootHealth::NoStore);
+        let report = map.prune_gone(None, false).unwrap();
+
+        assert_eq!(report.removed, vec![emptied.clone()]);
+        assert!(!file_roots(&path).contains(&emptied));
+        assert!(file_roots(&path).contains(&canonical_key(&tmp.path().join("keep"))));
+    }
+
+    /// Catches an unreadable store being treated as deleted: with no selection
+    /// it stays, with one it is refused, and the store directory is untouched.
+    #[cfg(unix)]
+    #[test]
+    fn prune_never_removes_an_unreadable_store() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let (map, _path, _gone) = live_map_with(&tmp, &["locked"], &[]);
+        let locked = canonical_key(&tmp.path().join("locked"));
+        let store = locked.join(".mdkb");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let all = map.prune_gone(None, false);
+        let named = map.prune_gone(Some(std::slice::from_ref(&locked)), false);
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(all.unwrap().removed.is_empty());
+        let named = named.unwrap();
+        assert!(named.removed.is_empty());
+        assert!(
+            named.refused[0]
+                .reason
+                .starts_with("the store cannot be read;")
+        );
+        assert!(map.contains(&locked) && store.is_dir());
+    }
+
+    /// Catches a prune that erases a hand-written scope or daemon.toml: the
+    /// root leaves the map, its declared scope stays in the file.
+    #[test]
+    fn prune_keeps_a_hand_written_scope_of_the_removed_root() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["keep"], &["stale"]);
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for entry in file["repos"].as_array_mut().unwrap() {
+            if entry["root"] == gone[0].to_string_lossy().as_ref() {
+                entry["scope"] = "home".into();
+            }
+        }
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let report = map.prune_gone(None, false).unwrap();
+
+        assert_eq!(report.removed, gone);
+        assert!(!map.roots().contains(&gone[0]));
+        assert_eq!(read_scope_overrides(&path)[&gone[0]], "home");
+    }
+
+    /// Catches pruning despite an unreadable registry: a state directory
+    /// replaced by a file prevents reading hand-owned scopes before writing.
+    #[test]
+    fn prune_reports_an_unreadable_map_and_restores_memory() {
+        let tmp = TempDir::new().unwrap();
+        let (map, _path, gone) = live_map_with(&tmp, &["keep"], &["stale"]);
+        let state = tmp.path().join("state");
+        std::fs::remove_dir_all(&state).unwrap();
+        std::fs::write(&state, b"not a directory").unwrap();
+
+        let why = map.prune_gone(None, false).unwrap_err();
+
+        assert!(why.starts_with("Not persisting the repo map"), "{why}");
+        assert!(
+            map.roots().contains(&gone[0]),
+            "memory restored after the failed scope read"
+        );
+        assert_eq!(std::fs::read(&state).unwrap(), b"not a directory");
+    }
+
+    /// Catches a swallowed atomic-write failure after successful scope/activity
+    /// reads: the existing registry bytes and removed in-memory roots must stay.
+    #[test]
+    fn prune_reports_a_write_failure_and_restores_memory() {
+        let tmp = TempDir::new().unwrap();
+        let (map, path, gone) = live_map_with(&tmp, &["keep"], &["stale"]);
+        let before = std::fs::read(&path).unwrap();
+        // Block the writer's temp file without making the registry unreadable.
+        let blocked = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        std::fs::create_dir(&blocked).unwrap();
+
+        let why = map.prune_gone(None, false).unwrap_err();
+
+        assert!(why.starts_with("Could not persist the repo map"), "{why}");
+        assert!(map.roots().contains(&gone[0]), "memory was not restored");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(blocked.is_dir());
+    }
+
+    /// Catches overwriting a map written by a newer mdkb: the map loaded from
+    /// such a file (root still on disk) is not replaceable, so a later prune
+    /// returns the reason, keeps the root in memory and leaves the file alone.
+    #[test]
+    fn prune_refuses_to_rewrite_a_map_written_by_a_newer_mdkb() {
+        let tmp = TempDir::new().unwrap();
+        let (first, path, _) = live_map_with(&tmp, &["keep", "stale"], &[]);
+        drop(first);
+        let mut file: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        file["version"] = (FORMAT_VERSION + 1).into();
+        std::fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+        let map = RepoMap::open(Some(path.clone()), &[]);
+        let stale = canonical_key(&tmp.path().join("stale"));
+        assert!(map.contains(&stale));
+        std::fs::remove_dir_all(&stale).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let why = map.prune_gone(None, false).unwrap_err();
+
+        assert!(why.starts_with("Not overwriting the repo map"), "{why}");
+        assert!(map.contains(&stale));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// Characterizes the documented cross-process whole-map write. A second map
+    /// loaded while the root existed rewrites the file with it after the prune.
+    /// Pins the bound: the root never returns to the pruning map, never shows in
+    /// a read of the file (triage drops Gone roots), and the next load drops it.
+    #[test]
+    fn a_stale_writer_can_restore_the_file_entry_but_never_a_listed_root() {
+        let tmp = TempDir::new().unwrap();
+        let (daemon, path, gone) = live_map_with(&tmp, &["keep"], &[]);
+        // Canonicalize after creation: a nonexistent /var path cannot resolve
+        // its /private/var alias, so it would not match the persisted key.
+        let stale = make_repo(tmp.path(), "stale");
+        daemon.record(&stale);
+        let hook = RepoMap::open(Some(path.clone()), &[]);
+        assert!(gone.is_empty() && hook.contains(&stale));
+        std::fs::remove_dir_all(&stale).unwrap();
+        daemon.prune_gone(None, false).unwrap();
+        assert!(!file_roots(&path).contains(&stale));
+
+        hook.record(&make_repo(tmp.path(), "other"));
+
+        assert!(
+            file_roots(&path).contains(&stale),
+            "documented lost-update window"
+        );
+        assert!(!daemon.roots().contains(&stale));
+        assert!(!try_read_known_roots(&path).unwrap().contains(&stale));
+        assert!(!RepoMap::open(Some(path.clone()), &[]).contains(&stale));
+        assert!(
+            !file_roots(&path).contains(&stale),
+            "the next load heals the file"
+        );
     }
 }

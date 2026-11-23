@@ -10,18 +10,20 @@ pub mod hasher;
 pub mod module_path;
 pub mod pipeline;
 pub mod receiver;
+pub(crate) mod refresh;
 pub mod types;
 pub mod walker;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 
 use crate::code::relationship::CallTarget;
 use crate::code::semantic::{SemanticSearch, format_symbol_text};
 use crate::code::storage::CodeDb;
 use crate::code::symbol::Symbol;
 use crate::code::types::SymbolId;
+use crate::llm::embeddings::Model;
 
 use self::pipeline::PipelineConfig;
 use self::types::IndexStats;
@@ -34,7 +36,10 @@ use self::types::IndexStats;
 pub struct IndexFacade {
     db: CodeDb,
     config: PipelineConfig,
-    semantic: OnceLock<Option<SemanticSearch>>,
+    /// Semantic store opened for the model that `config.toml` selected at the time.
+    /// A different selection (config reload, completed re-embed) reopens it; a failed
+    /// open is never cached, so it is retried once the cause is fixed.
+    semantic: Mutex<Option<(Model, Arc<SemanticSearch>)>>,
 }
 
 impl IndexFacade {
@@ -47,7 +52,7 @@ impl IndexFacade {
         Ok(Self {
             db,
             config: PipelineConfig::default(),
-            semantic: OnceLock::new(),
+            semantic: Mutex::new(None),
         })
     }
 
@@ -59,7 +64,7 @@ impl IndexFacade {
         Ok(Self {
             db,
             config: PipelineConfig::default(),
-            semantic: OnceLock::new(),
+            semantic: Mutex::new(None),
         })
     }
 
@@ -72,7 +77,7 @@ impl IndexFacade {
         Ok(Self {
             db,
             config: PipelineConfig::default(),
-            semantic: OnceLock::new(),
+            semantic: Mutex::new(None),
         })
     }
 
@@ -83,13 +88,21 @@ impl IndexFacade {
         self
     }
 
-    /// Lazily initialize semantic search on first use.
+    /// Lazily initialize semantic search on first use, and again whenever the
+    /// selected embedding model differs from the one the cached store was opened for.
     ///
     /// Loads the ONNX model (~300-800 MB RSS) only when actually needed.
-    fn ensure_semantic(&self) -> Option<&SemanticSearch> {
-        self.semantic
-            .get_or_init(|| init_semantic(self.db.path()))
-            .as_ref()
+    fn ensure_semantic(&self) -> Option<Arc<SemanticSearch>> {
+        let model = selected_model(self.db.path())?;
+        let mut slot = self.semantic.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((opened_for, search)) = slot.as_ref() {
+            if *opened_for == model {
+                return Some(Arc::clone(search));
+            }
+        }
+        let search = Arc::new(init_semantic(self.db.path(), model)?);
+        *slot = Some((model, Arc::clone(&search)));
+        Some(search)
     }
 
     /// Get a reference to the underlying database.
@@ -635,6 +648,19 @@ impl IndexFacade {
         })
     }
 
+    /// Timestamp of the last completed scan, for freshness checks.
+    pub fn last_index_scan_at(&self) -> rusqlite::Result<Option<i64>> {
+        self.db.last_index_scan_at()
+    }
+
+    /// Does any symbol carry exactly this name? Unlike [`Self::query_symbols`]
+    /// a database error is returned, never read as "no such symbol".
+    pub fn defines_symbol(&self, name: &str) -> rusqlite::Result<bool> {
+        self.db
+            .query_symbols(crate::code::storage::NameMatch::Exact(name), None, None, 1)
+            .map(|(_, total)| total > 0)
+    }
+
     /// Symbol lookup with name, kind and file filters applied in SQL.
     ///
     /// Returns the capped rows and the total number of matches before the cap.
@@ -642,7 +668,7 @@ impl IndexFacade {
         &self,
         name: crate::code::storage::NameMatch<'_>,
         kind: Option<&str>,
-        file_pattern: Option<&str>,
+        file_pattern: Option<crate::code::storage::FileMatch<'_>>,
         limit: usize,
     ) -> (Vec<Symbol>, usize) {
         self.db
@@ -774,11 +800,8 @@ impl IndexFacade {
 
     /// Number of stored semantic embeddings.
     pub fn semantic_count(&self) -> usize {
-        self.semantic
-            .get()
-            .and_then(|opt| opt.as_ref())
-            .and_then(|s| s.count().ok())
-            .unwrap_or(0)
+        let slot = self.semantic.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().and_then(|(_, s)| s.count().ok()).unwrap_or(0)
     }
 
     // -----------------------------------------------------------------------
@@ -1065,10 +1088,20 @@ fn split_by_reuse(
     (carried, to_embed)
 }
 
-fn init_semantic(db_path: &Path) -> Option<SemanticSearch> {
+/// The model `config.toml` selects, or `None` when the config is refused.
+fn selected_model(db_path: &Path) -> Option<Model> {
+    Some(
+        crate::config::Config::load_for_repo(db_path.parent()?.join("config.toml"))
+            .ok()?
+            .embedding
+            .model,
+    )
+}
+
+fn init_semantic(db_path: &Path, model: Model) -> Option<SemanticSearch> {
     // vectors.bin lives next to code.sqlite in the .mdkb directory
     let vectors_path = db_path.parent()?.join("vectors.bin");
-    match SemanticSearch::new(&vectors_path) {
+    match SemanticSearch::new_for_model(&vectors_path, model) {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::error!(
@@ -1094,10 +1127,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let facade = IndexFacade::create(dir.path().join("code.sqlite")).unwrap();
 
-        // Semantic should NOT be initialized on construction (lazy via OnceLock)
+        // Semantic should NOT be initialized on construction (lazy)
         assert!(
-            facade.semantic.get().is_none(),
-            "semantic OnceLock should be uninitialized on create"
+            facade.semantic.lock().unwrap().is_none(),
+            "semantic store should be uninitialized on create"
         );
     }
 
@@ -1107,9 +1140,24 @@ mod tests {
         let facade = IndexFacade::open_or_create(dir.path().join("code.sqlite")).unwrap();
 
         assert!(
-            facade.semantic.get().is_none(),
-            "semantic OnceLock should be uninitialized on open_or_create"
+            facade.semantic.lock().unwrap().is_none(),
+            "semantic store should be uninitialized on open_or_create"
         );
+    }
+
+    /// Catches a refused config being cached as "no semantic search" for the life
+    /// of the facade: a daemon that first saw an unknown encoder must recover once
+    /// the file is corrected.
+    #[test]
+    fn semantic_store_recovers_after_a_refused_config_is_fixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[embedding]\nmodel='unknown-encoder'\n").unwrap();
+        let facade = IndexFacade::create(dir.path().join("code.sqlite")).unwrap();
+        assert!(!facade.has_semantic_search());
+
+        fs::write(&config, "").unwrap();
+        assert!(facade.has_semantic_search());
     }
 
     #[test]
@@ -2495,7 +2543,7 @@ export function snapshot(id: string) {
         assert_eq!(left, HashSet::from([kept_id]), "seeded {seeded:?}");
     }
 
-    /// The `mdkb code index` path, which decides what changed by mtime.
+    /// The `mdkb update --code` path, which decides what changed by mtime.
     ///
     /// Re-embedding is the whole cost of a reparse: on 177 files of this
     /// repository it was 71 s wall and 626 s CPU for text that was

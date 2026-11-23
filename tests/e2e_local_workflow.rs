@@ -4,6 +4,8 @@
 
 #[path = "common/cli.rs"]
 mod cli;
+#[path = "common/recall.rs"]
+mod recall;
 
 use std::fs;
 use std::path::Path;
@@ -28,6 +30,7 @@ fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
 /// Catches: an update reports success while stale document or vector rows survive a deletion.
 #[test]
 fn cli_update_replaces_and_deletes_searchable_documents_and_vectors() {
+    recall::require_production_model();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::create_dir(root.join("docs")).unwrap();
@@ -91,6 +94,7 @@ fn cli_update_replaces_and_deletes_searchable_documents_and_vectors() {
 /// Catches: update refreshes documents but leaves removed or renamed code symbols searchable.
 #[test]
 fn cli_update_keeps_code_search_in_sync_with_source() {
+    recall::require_production_model();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     fs::create_dir(root.join("src")).unwrap();

@@ -116,6 +116,7 @@ pub fn add_evolution(
     // Atomic: evolution record + status update must be consistent.
     // Use SAVEPOINT (not BEGIN) to support nesting inside existing transactions.
     documents::with_savepoint(conn, "add_evolution", || {
+        refuse_cycle(conn, source_doc_id, target_doc_id)?;
         conn.execute(
             "INSERT INTO evolution (source_doc_id, target_doc_id, relationship, scope, reason, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -144,6 +145,85 @@ pub fn add_evolution(
 
         Ok(id)
     })
+}
+
+/// Refuse an edge `source -> target` that would close an evolution cycle.
+///
+/// Edges run newer -> older. The new edge closes a cycle when `target` already
+/// reaches `source` through existing edges of any relation, or when the two are
+/// the same document. A cycle marks every member superseded or retracted, so it
+/// removes the current version from default search and recall.
+fn refuse_cycle(conn: &Connection, source_doc_id: i64, target_doc_id: i64) -> Result<()> {
+    let chain = if source_doc_id == target_doc_id {
+        Some(vec![source_doc_id])
+    } else {
+        path_between(conn, target_doc_id, source_doc_id)?
+    };
+    let Some(mut chain) = chain else {
+        return Ok(());
+    };
+    chain.push(target_doc_id);
+    let names = chain
+        .iter()
+        .map(|id| doc_label(conn, *id))
+        .collect::<Result<Vec<_>>>()?
+        .join(" -> ");
+    Err(crate::error::ErrorKind::EvolutionCycle { chain: names }.into())
+}
+
+/// Shortest newer -> older path from `from` to `to`, as document ids.
+fn path_between(conn: &Connection, from: i64, to: i64) -> Result<Option<Vec<i64>>> {
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE walk(id, path) AS (
+             SELECT ?1, ',' || ?1 || ','
+             UNION
+             SELECT e.target_doc_id, walk.path || e.target_doc_id || ','
+             FROM evolution e JOIN walk ON e.source_doc_id = walk.id
+             WHERE instr(walk.path, ',' || e.target_doc_id || ',') = 0
+         )
+         SELECT path FROM walk WHERE id = ?2 ORDER BY length(path) LIMIT 1",
+    )?;
+    let path: Option<String> = stmt.query_row(params![from, to], |r| r.get(0)).optional()?;
+    Ok(path.map(|p| p.split(',').filter_map(|id| id.parse().ok()).collect()))
+}
+
+fn doc_label(conn: &Connection, id: i64) -> Result<String> {
+    Ok(documents::get_document(conn, id)?
+        .map(|d| d.relative_path)
+        .unwrap_or_else(|| format!("#{id}")))
+}
+
+/// Every evolution cycle in the store, one chain of document labels per cycle.
+///
+/// The write path refuses new cycles; this reports the ones written before it did.
+pub fn find_cycles(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT source_doc_id, target_doc_id FROM evolution ORDER BY id")?;
+    let edges = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut seen_members = std::collections::HashSet::new();
+    let mut cycles = Vec::new();
+    for (source, target) in edges {
+        if seen_members.contains(&source) {
+            continue;
+        }
+        let chain = if source == target {
+            Some(vec![source])
+        } else {
+            path_between(conn, target, source)?
+        };
+        if let Some(mut chain) = chain {
+            seen_members.extend(chain.iter().copied());
+            chain.push(target);
+            let labels = chain
+                .iter()
+                .map(|id| doc_label(conn, *id))
+                .collect::<Result<Vec<_>>>()?;
+            cycles.push(labels.join(" -> "));
+        }
+    }
+    Ok(cycles)
 }
 
 /// Update a document's status.
@@ -248,9 +328,39 @@ pub fn get_document_status(
 }
 
 /// Delete an evolution relationship.
+///
+/// The target becomes current again when no remaining supersedes or retracts
+/// edge hides it; otherwise it takes the status of the newest remaining one.
 pub fn delete_evolution(conn: &Connection, id: i64) -> Result<bool> {
-    let rows = conn.execute("DELETE FROM evolution WHERE id = ?1", params![id])?;
-    Ok(rows > 0)
+    documents::with_savepoint(conn, "delete_evolution", || {
+        let target: Option<i64> = conn
+            .query_row(
+                "SELECT target_doc_id FROM evolution WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        conn.execute("DELETE FROM evolution WHERE id = ?1", params![id])?;
+        let remaining: Option<(String, Option<String>)> = conn
+            .query_row(
+                "SELECT relationship, reason FROM evolution
+                 WHERE target_doc_id = ?1 AND relationship IN ('supersedes', 'retracts')
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+                params![target],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let (status, reason) = match remaining {
+            Some((rel, reason)) if rel == "retracts" => (DocumentStatus::Retracted, reason),
+            Some((_, reason)) => (DocumentStatus::Superseded, reason),
+            None => (DocumentStatus::Current, None),
+        };
+        update_document_status(conn, target, status, reason.as_deref())?;
+        Ok(true)
+    })
 }
 
 #[cfg(test)]
@@ -300,6 +410,198 @@ mod tests {
         let new_id = conn.last_insert_rowid();
 
         (old_id, new_id)
+    }
+
+    /// A third document, so a chain of two edges can be closed into a cycle.
+    fn insert_third_doc(conn: &Connection) -> i64 {
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
+            ["hash3", "# Doc 3", "1706700000"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ["docs", "newest.md", "hash3", "Newest Document", "1706700000", "1706700000"],
+        ).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn status_of(conn: &Connection, id: i64) -> String {
+        conn.query_row(
+            "SELECT COALESCE(status, 'current') FROM documents WHERE id = ?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reversed_supersede_is_refused_and_leaves_the_newer_doc_current() {
+        let conn = setup_db();
+        let (old_id, new_id) = insert_test_docs(&conn);
+        add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let err = add_evolution(
+            &conn,
+            old_id,
+            new_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .expect_err("closing a supersede cycle must fail");
+
+        assert!(
+            err.to_string().contains("cycle"),
+            "error names the cycle: {err}"
+        );
+        assert!(
+            err.to_string().contains("new.md"),
+            "error names the chain: {err}"
+        );
+        assert_eq!(status_of(&conn, new_id), "current");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM evolution", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the refused edge is not written");
+    }
+
+    #[test]
+    fn a_cycle_through_a_longer_chain_and_any_relation_is_refused() {
+        let conn = setup_db();
+        let (old_id, new_id) = insert_test_docs(&conn);
+        let newest = insert_third_doc(&conn);
+        add_evolution(&conn, new_id, old_id, RelationshipType::Extends, None, None).unwrap();
+        add_evolution(&conn, newest, new_id, RelationshipType::Updates, None, None).unwrap();
+
+        let err = add_evolution(
+            &conn,
+            old_id,
+            newest,
+            RelationshipType::Retracts,
+            None,
+            None,
+        )
+        .expect_err("a three-node cycle must fail");
+        assert!(err.to_string().contains("cycle"), "{err}");
+        assert_eq!(status_of(&conn, newest), "current");
+    }
+
+    #[test]
+    fn a_document_cannot_evolve_itself() {
+        let conn = setup_db();
+        let (old_id, _) = insert_test_docs(&conn);
+        assert!(
+            add_evolution(
+                &conn,
+                old_id,
+                old_id,
+                RelationshipType::Supersedes,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert_eq!(status_of(&conn, old_id), "current");
+    }
+
+    #[test]
+    fn a_second_successor_of_the_same_doc_is_not_a_cycle() {
+        let conn = setup_db();
+        let (old_id, new_id) = insert_test_docs(&conn);
+        let newest = insert_third_doc(&conn);
+        add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
+        add_evolution(
+            &conn,
+            newest,
+            old_id,
+            RelationshipType::Corrects,
+            None,
+            None,
+        )
+        .expect("two docs evolving one older doc form no cycle");
+    }
+
+    #[test]
+    fn removing_the_only_supersede_edge_makes_the_old_doc_current_again() {
+        let conn = setup_db();
+        let (old_id, new_id) = insert_test_docs(&conn);
+        let newest = insert_third_doc(&conn);
+        let first = add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
+        let second = add_evolution(
+            &conn,
+            newest,
+            old_id,
+            RelationshipType::Retracts,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(delete_evolution(&conn, second).unwrap());
+        assert_eq!(
+            status_of(&conn, old_id),
+            "superseded",
+            "the remaining supersede still hides it"
+        );
+        assert!(delete_evolution(&conn, first).unwrap());
+        assert_eq!(status_of(&conn, old_id), "current");
+        assert!(
+            !delete_evolution(&conn, first).unwrap(),
+            "a missing id reports false"
+        );
+    }
+
+    #[test]
+    fn find_cycles_reports_a_cycle_written_by_an_older_binary() {
+        let conn = setup_db();
+        let (old_id, new_id) = insert_test_docs(&conn);
+        add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(find_cycles(&conn).unwrap().is_empty());
+        conn.execute(
+            "INSERT INTO evolution (source_doc_id, target_doc_id, relationship, created_at) VALUES (?1, ?2, 'supersedes', 0)",
+            params![old_id, new_id],
+        )
+        .unwrap();
+        let cycles = find_cycles(&conn).unwrap();
+        assert_eq!(cycles.len(), 1, "{cycles:?}");
+        assert!(
+            cycles[0].contains("old.md") && cycles[0].contains("new.md"),
+            "{cycles:?}"
+        );
     }
 
     #[test]

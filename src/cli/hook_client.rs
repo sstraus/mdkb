@@ -63,23 +63,30 @@ const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(unix)]
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for a routed mutation to come back.
+/// How often a client waiting on a routed mutation checks that the daemon still
+/// answers `ping`, and how long each check may take.
 ///
-/// Not a correctness bound — [`MutationFailure::Undetermined`] is what keeps a slow
-/// daemon from becoming a second writer. This is only a liveness bound so a
-/// wedged daemon does not hang the terminal forever, which is why it is an hour
-/// rather than a tuned figure: `mdkb update` on a large store walks the tree,
-/// embeds through ONNX and reindexes the whole code graph, and guessing low
-/// costs a spurious failure on exactly the command that most needs to finish.
+/// A routed mutation has no deadline of its own. [`MutationFailure::Undetermined`]
+/// is what keeps a slow daemon from becoming a second writer; the wait only has to
+/// end when the daemon is gone or hung. A fixed one-hour deadline used to stand in
+/// for that, and it abandoned work that was still running: measured 2026-11-20, a
+/// routed `embed --reembed` of tuicommander outlived it and the client failed
+/// while the daemon finished the regeneration.
 #[cfg(unix)]
-const MUTATION_TIMEOUT: Duration = Duration::from_hours(1);
+const MUTATION_LIVENESS_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How the client waits for a daemon answer after the request is delivered.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Wait {
+    /// Give up after this long overall.
+    Deadline(Duration),
+    /// Wait as long as the daemon answers a `ping` sent every interval, each
+    /// within the interval. Sending the request still has [`CALL_TIMEOUT`].
+    WhileAlive(Duration),
+}
 
 // ── Public entry points ──────────────────────────────────────────────────────
-
-/// Send a `status` call.
-pub async fn call_status(root: Option<PathBuf>) -> Result<()> {
-    run("status", json!({}), root).await
-}
 
 /// Send an `update` (reindex) call, scoped to `files` when given.
 pub async fn call_reindex(files: Vec<String>, root: Option<PathBuf>) -> Result<()> {
@@ -304,7 +311,7 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
         &hook_socket_path(),
         method,
         &params,
-        hook_timeout(method, &hooks),
+        Wait::Deadline(hook_timeout(method, &hooks)),
     )
     .await
     {
@@ -329,6 +336,10 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
             tracing::warn!(
                 "hook {method}: daemon took the request but did not report back ({e}); skipping fallback"
             );
+            Ok(())
+        }
+        Err(MutationFailure::Rejected(e)) => {
+            tracing::warn!("hook {method}: refused by the store ({e})");
             Ok(())
         }
     };
@@ -396,8 +407,6 @@ fn in_process_config(root: &Path) -> Result<DaemonConfig> {
 /// a source snippet, so it is folded onto one line: a host shows hook stderr
 /// as-is.
 async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: impl FnOnce(&Value)) {
-    // This process ends with the hook: a reranker loaded here is never ready.
-    crate::llm::rerank::forbid_load();
     let config = match in_process_config(root) {
         Ok(config) => config,
         Err(e) => {
@@ -413,7 +422,7 @@ async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: imp
             return;
         }
     };
-    let registry = Arc::new(RepoRegistry::new(config));
+    let registry = Arc::new(RepoRegistry::one_shot(config));
     // This process exits as soon as the hook returns, so work a hook detaches is
     // dropped before it runs — Stop-hook mining never produced anything on this
     // route. Collect it here and wait below.
@@ -558,7 +567,7 @@ async fn call_daemon_with_timeout(
     params: &Value,
     timeout: Duration,
 ) -> std::result::Result<Value, String> {
-    call_daemon_phased(socket_path, method, params, timeout)
+    call_daemon_phased(socket_path, method, params, Wait::Deadline(timeout))
         .await
         .map_err(|e| e.to_string())
 }
@@ -630,13 +639,16 @@ pub enum MutationFailure {
     /// process must not also run it — that is the second writer the routing
     /// exists to remove.
     Undetermined(String),
+    /// The daemon ran the method and the store refused it before writing:
+    /// final, nothing to retry, and the message is the cause to print.
+    Rejected(String),
 }
 
 #[cfg(unix)]
 impl std::fmt::Display for MutationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unstarted(m) | Self::Undetermined(m) => f.write_str(m),
+            Self::Unstarted(m) | Self::Undetermined(m) | Self::Rejected(m) => f.write_str(m),
         }
     }
 }
@@ -652,14 +664,40 @@ async fn call_daemon_phased(
     socket_path: &Path,
     method: &str,
     params: &Value,
-    timeout: Duration,
+    wait: Wait,
 ) -> std::result::Result<Value, MutationFailure> {
     use MutationFailure::Unstarted;
 
     ensure_daemon_running(socket_path)
         .await
         .map_err(|e| Unstarted(format!("daemon unavailable: {e}")))?;
-    call_connected(socket_path, method, params, timeout).await
+    call_connected(socket_path, method, params, wait).await
+}
+
+/// Read the answer to a delivered request for as long as the daemon answers a
+/// `ping` on a second connection every `interval`.
+#[cfg(unix)]
+async fn read_while_alive(
+    stream: &mut UnixStream,
+    socket_path: &Path,
+    interval: Duration,
+) -> std::result::Result<std::io::Result<Vec<u8>>, MutationFailure> {
+    let read = read_response(stream);
+    tokio::pin!(read);
+    loop {
+        tokio::select! {
+            response = &mut read => return Ok(response),
+            () = tokio::time::sleep(interval) => {
+                let params = json!({});
+                let ping = Box::pin(call_connected(socket_path, "ping", &params, Wait::Deadline(interval)));
+                if let Err(e) = ping.await {
+                    return Err(MutationFailure::Undetermined(format!(
+                        "the daemon stopped answering while it held the request: {e}"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 /// Ask the daemon that is already running one question, without ever starting
@@ -671,7 +709,7 @@ pub async fn call_running_daemon(
     params: &Value,
     timeout: Duration,
 ) -> std::result::Result<Value, String> {
-    call_connected(&hook_socket_path(), method, params, timeout)
+    call_connected(&hook_socket_path(), method, params, Wait::Deadline(timeout))
         .await
         .map_err(|e| e.to_string())
 }
@@ -681,7 +719,7 @@ async fn call_connected(
     socket_path: &Path,
     method: &str,
     params: &Value,
-    timeout: Duration,
+    wait: Wait,
 ) -> std::result::Result<Value, MutationFailure> {
     use MutationFailure::{Undetermined, Unstarted};
 
@@ -700,6 +738,10 @@ async fn call_connected(
 
     // One deadline over both phases: `delivered` — not which phase timed out —
     // decides whether a fallback is safe.
+    let timeout = match wait {
+        Wait::Deadline(timeout) => timeout,
+        Wait::WhileAlive(_) => CALL_TIMEOUT,
+    };
     let deadline = tokio::time::Instant::now() + timeout;
     let mut delivered = false;
     let sent = tokio::time::timeout_at(deadline, send_request(&mut stream, &body, &mut delivered))
@@ -714,10 +756,13 @@ async fn call_connected(
         });
     }
 
-    let response = tokio::time::timeout_at(deadline, read_response(&mut stream))
-        .await
-        .map_err(|_| Undetermined(format!("no answer within {timeout:?}")))?
-        .map_err(|e| Undetermined(format!("io: {e}")))?;
+    let response = match wait {
+        Wait::Deadline(_) => tokio::time::timeout_at(deadline, read_response(&mut stream))
+            .await
+            .map_err(|_| Undetermined(format!("no answer within {timeout:?}")))?,
+        Wait::WhileAlive(interval) => read_while_alive(&mut stream, socket_path, interval).await?,
+    }
+    .map_err(|e| Undetermined(format!("io: {e}")))?;
 
     let envelope: Value = serde_json::from_slice(&response)
         .map_err(|e| Undetermined(format!("parse response: {e}")))?;
@@ -734,6 +779,9 @@ async fn call_connected(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("(no message)");
+        if code == i64::from(crate::daemon::hook_runtime::REJECTED_ERROR_CODE) {
+            return Err(MutationFailure::Rejected(msg.to_string()));
+        }
         let text = format!("daemon error {code}: {msg}");
         // A refusal is the daemon declining before it dispatched anything — most
         // often "this repo is not in my whitelist", which means it is not this
@@ -764,7 +812,7 @@ async fn call_connected(
 /// that silently does nothing is data loss. The caller falls back in-process on
 /// [`MutationFailure::Unstarted`] and only on that — see the type.
 ///
-/// The deadline is [`MUTATION_TIMEOUT`], not [`hook_timeout`]: a hook budget is
+/// The wait is [`Wait::WhileAlive`], not [`hook_timeout`]: a hook budget is
 /// sized so an editor keystroke never stalls, and applying it to a write means
 /// abandoning `mdkb update` half a minute into a job that legitimately runs for
 /// many.
@@ -778,7 +826,13 @@ pub async fn call_store_mutation(
     params["root"] = json!(root.display().to_string());
 
     let socket_path = hook_socket_path();
-    call_daemon_phased(&socket_path, method, &params, MUTATION_TIMEOUT).await
+    call_daemon_phased(
+        &socket_path,
+        method,
+        &params,
+        Wait::WhileAlive(MUTATION_LIVENESS_INTERVAL),
+    )
+    .await
 }
 
 /// Send the one typed internal CLI mutation request and decode its typed result.
@@ -847,7 +901,8 @@ mod tests {
         spawn_slow_hook_server(socket_path, response, Duration::ZERO)
     }
 
-    /// A fake hook daemon that answers `delay` after it read the request.
+    /// A fake hook daemon that answers `delay` after it read the request, and a
+    /// `ping` at once.
     fn spawn_slow_hook_server(
         socket_path: PathBuf,
         response: Value,
@@ -869,7 +924,9 @@ mod tests {
                         return;
                     }
                     let req: Value = serde_json::from_slice(&buf).unwrap();
-                    tokio::time::sleep(delay).await;
+                    if req["method"] != "ping" {
+                        tokio::time::sleep(delay).await;
+                    }
                     let mut envelope = response.clone();
                     envelope["id"] = req.get("id").cloned().unwrap_or(Value::Null);
                     let body = serde_json::to_vec(&envelope).unwrap();
@@ -965,6 +1022,158 @@ mod tests {
         );
     }
 
+    // Catches: a one-shot hook starting the daemon watcher, whose bootstrap
+    // can recreate a missing code index while telemetry warms the store.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_pre_tool_use_never_spawns_code_bootstrap() {
+        if std::env::var_os("MDKB_ONESHOT_WATCHER_CHILD").is_none() {
+            let home = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::hook_client::tests::in_process_pre_tool_use_never_spawns_code_bootstrap",
+                    "--nocapture",
+                ])
+                .env("MDKB_ONESHOT_WATCHER_CHILD", "1")
+                .env("HOME", home.path())
+                .env("USERPROFILE", home.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let root = crate::domain::canonicalize_plain(tmp.path()).unwrap();
+        drop(crate::core::Context::init(&root).unwrap());
+        assert!(!root.join(".mdkb/code.sqlite").exists());
+        let mut response = None;
+        dispatch_in_process(
+            "hook.pre_tool_use",
+            json!({"tool_name":"Grep", "tool_input":{"pattern":"fn missing_symbol"}}),
+            &root,
+            |value| response = Some(value.clone()),
+        )
+        .await;
+        assert!(response.unwrap().to_string().contains("code search"));
+        assert_eq!(
+            crate::mcp::server::watcher_spawns_for_root(&root),
+            0,
+            "one-shot hook started the daemon's bootstrap watcher"
+        );
+        assert!(
+            !root.join(".mdkb/code.sqlite").exists(),
+            "one-shot hook recreated the code index"
+        );
+    }
+
+    // Catches: runtime presence launching an abandoned full migration from the
+    // actual one-shot dispatch path. A real isolated store retains its vectors
+    // and never begins a new generation, even after background joins.
+    #[tokio::test]
+    async fn in_process_stale_store_never_starts_full_migration() {
+        if std::env::var_os("MDKB_ONESHOT_MIGRATION_CHILD").is_none() {
+            let cache = TempDir::new().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cli::hook_client::tests::in_process_stale_store_never_starts_full_migration",
+                    "--nocapture",
+                ])
+                .env("MDKB_ONESHOT_MIGRATION_CHILD", "1")
+                .env("FASTEMBED_CACHE_DIR", cache.path())
+                .env_remove("HF_HOME")
+                .env("HF_ENDPOINT", "http://127.0.0.1:9")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read_dir(cache.path()).unwrap().count(),
+                0,
+                "one-shot dispatch attempted model acquisition"
+            );
+            return;
+        }
+        assert_one_shot_preserves_stale_generation().await;
+    }
+
+    // Catches full migration being scheduled on a short-lived route even when
+    // weights are already present and acquisition failure cannot hide it.
+    #[tokio::test]
+    #[ignore = "requires cached Granite weights"]
+    async fn correction_in_process_cached_weights_cannot_start_full_migration() {
+        crate::llm::service_for(crate::llm::embeddings::Model::Granite107M, false).unwrap();
+        assert_one_shot_preserves_stale_generation().await;
+    }
+
+    async fn assert_one_shot_preserves_stale_generation() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = crate::core::Context::init(tmp.path()).unwrap();
+        ctx.conn.execute_batch("INSERT INTO collections(name,path,pattern,created_at,updated_at) VALUES('notes','.','*.md',0,0); INSERT INTO content(hash,body,created_at) VALUES('hash','recovery instructions',0); INSERT INTO documents(id,collection,relative_path,hash,file_modified_at,indexed_at) VALUES(1,'notes','recovery.md','hash',0,0);").unwrap();
+        crate::store::vectors::store_embedding(
+            &ctx.conn,
+            1,
+            &[0.25; 384],
+            crate::llm::embeddings::Model::MiniLm.identity(),
+        )
+        .unwrap();
+        std::fs::write(&ctx.config_path, "[embedding]\nmodel='granite107m'\n").unwrap();
+        let registry = RepoRegistry::new(in_process_config(tmp.path()).unwrap());
+        let observer = registry.get_or_open(tmp.path()).unwrap();
+        let mut response = None;
+        dispatch_in_process("get", json!({"id":"1"}), tmp.path(), |value| {
+            response = Some(value.clone())
+        })
+        .await;
+        assert!(
+            response
+                .unwrap()
+                .to_string()
+                .contains("recovery instructions")
+        );
+        assert!(
+            !observer
+                .backfill_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            "one-shot get detached a full migration"
+        );
+        dispatch_in_process("hook.stop", json!({}), tmp.path(), |_| {}).await;
+        assert!(
+            !observer
+                .backfill_in_flight
+                .load(std::sync::atomic::Ordering::Acquire),
+            "one-shot stop detached a full migration"
+        );
+        let (model, pending): (String, Option<String>) = ctx
+            .conn
+            .query_row(
+                "SELECT current_model,pending_model FROM embedding_identity",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, crate::llm::embeddings::Model::MiniLm.identity());
+        assert_eq!(pending, None);
+        let persisted: Vec<u8> = ctx
+            .conn
+            .query_row(
+                "SELECT embedding FROM embeddings WHERE document_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted, 0.25f32.to_le_bytes().repeat(384));
+    }
+
     #[tokio::test]
     async fn run_in_process_executes_status_without_daemon() {
         // Build a minimal repo and invoke in-process dispatch.
@@ -1044,9 +1253,14 @@ mod tests {
         let sock = tmp.path().join("hook.sock");
         let _srv = spawn_deaf_hook_server(sock.clone(), false);
 
-        let err = call_daemon_phased(&sock, "update", &json!({"root":"/tmp"}), CALL_TIMEOUT)
-            .await
-            .expect_err("a daemon that never answers must not look like success");
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::Deadline(CALL_TIMEOUT),
+        )
+        .await
+        .expect_err("a daemon that never answers must not look like success");
         assert!(
             matches!(err, MutationFailure::Undetermined(_)),
             "the request was fully written, so the outcome is unknowable: {err:?}"
@@ -1065,9 +1279,14 @@ mod tests {
         let _srv = spawn_deaf_hook_server(sock.clone(), true);
 
         let short = Duration::from_millis(150);
-        let err = call_daemon_phased(&sock, "update", &json!({"root":"/tmp"}), short)
-            .await
-            .expect_err("a daemon that holds the request must not look like success");
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::Deadline(short),
+        )
+        .await
+        .expect_err("a daemon that holds the request must not look like success");
         assert!(
             matches!(err, MutationFailure::Undetermined(_)),
             "a read timeout says nothing about whether the daemon is writing: {err:?}"
@@ -1091,14 +1310,46 @@ mod tests {
             }}),
         );
 
-        let err = call_daemon_phased(&sock, "update", &json!({"root":"/tmp"}), CALL_TIMEOUT)
-            .await
-            .expect_err("an error envelope is a failure");
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::Deadline(CALL_TIMEOUT),
+        )
+        .await
+        .expect_err("an error envelope is a failure");
         match err {
             MutationFailure::Undetermined(m) => assert!(m.contains("disk full"), "message: {m}"),
-            MutationFailure::Unstarted(m) => {
+            MutationFailure::Unstarted(m) | MutationFailure::Rejected(m) => {
                 panic!("the method ran, so it may have written: {m}")
             }
+        }
+    }
+
+    /// A store refusal from inside a method is final: the CLI prints the cause
+    /// and neither retries in-process nor warns that a write may be in flight.
+    #[tokio::test]
+    async fn a_store_refusal_is_rejected_with_its_bare_cause() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let _srv = spawn_fake_hook_server(
+            sock.clone(),
+            json!({"jsonrpc":"2.0","error":{
+                "code": crate::daemon::hook_runtime::REJECTED_ERROR_CODE,
+                "message": "memory entry not found: nope",
+            }}),
+        );
+        let err = call_daemon_phased(
+            &sock,
+            "cli.mutate",
+            &json!({"root":"/tmp"}),
+            Wait::Deadline(CALL_TIMEOUT),
+        )
+        .await
+        .expect_err("an error envelope is a failure");
+        match err {
+            MutationFailure::Rejected(m) => assert_eq!(m, "memory entry not found: nope"),
+            other => panic!("a store refusal must be final, got {other:?}"),
         }
     }
 
@@ -1121,12 +1372,17 @@ mod tests {
             }}),
         );
 
-        let err = call_daemon_phased(&sock, "update", &json!({"root":"/foo"}), CALL_TIMEOUT)
-            .await
-            .expect_err("an error envelope is a failure");
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/foo"}),
+            Wait::Deadline(CALL_TIMEOUT),
+        )
+        .await
+        .expect_err("an error envelope is a failure");
         match err {
             MutationFailure::Unstarted(m) => assert!(m.contains("whitelist"), "message: {m}"),
-            MutationFailure::Undetermined(m) => {
+            MutationFailure::Undetermined(m) | MutationFailure::Rejected(m) => {
                 panic!("the daemon refused before dispatch, so it wrote nothing: {m}")
             }
         }
@@ -1145,9 +1401,14 @@ mod tests {
             json!({"jsonrpc":"2.0","error":{"message":"something went wrong"}}),
         );
 
-        let err = call_daemon_phased(&sock, "update", &json!({"root":"/tmp"}), CALL_TIMEOUT)
-            .await
-            .expect_err("an error envelope is a failure");
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::Deadline(CALL_TIMEOUT),
+        )
+        .await
+        .expect_err("an error envelope is a failure");
         assert!(
             matches!(err, MutationFailure::Undetermined(_)),
             "an envelope with no code proves nothing: {err:?}"
@@ -1168,23 +1429,50 @@ mod tests {
             CALL_TIMEOUT,
             "if `update` ever gains a hook-table entry, this test is checking the wrong thing"
         );
-        assert!(
-            MUTATION_TIMEOUT > CALL_TIMEOUT * 10,
-            "a mutation budget of {MUTATION_TIMEOUT:?} is close enough to the {CALL_TIMEOUT:?} \
-             hook fallthrough to abandon a long update again"
+    }
+
+    /// Catches a routed mutation held to a fixed deadline: a full regeneration
+    /// outlived the old one-hour budget and the client failed while the daemon
+    /// finished the work. A daemon that answers `ping` is still working.
+    #[tokio::test]
+    async fn a_routed_mutation_waits_past_any_fixed_budget_while_the_daemon_answers_ping() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let interval = Duration::from_millis(50);
+        let _srv = spawn_slow_hook_server(
+            sock.clone(),
+            json!({"jsonrpc":"2.0","result":{"done":true}}),
+            interval * 6,
         );
-        for event in [
-            "hook.session_start",
-            "hook.user_prompt_submit",
-            "hook.post_tool_use",
-            "hook.pre_tool_use",
-            "hook.stop",
-        ] {
-            assert!(
-                MUTATION_TIMEOUT > hook_timeout(event, &HooksConfig::default()),
-                "{event} must never bound a write"
-            );
-        }
+
+        let result = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::WhileAlive(interval),
+        )
+        .await
+        .expect("a daemon that still answers ping must be waited for");
+        assert_eq!(result, json!({"done":true}));
+    }
+
+    /// Catches a liveness wait that never ends: a daemon that holds the request
+    /// and no longer answers `ping` ends the wait, as an undetermined outcome.
+    #[tokio::test]
+    async fn a_routed_mutation_ends_when_the_daemon_stops_answering_ping() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let _srv = spawn_deaf_hook_server(sock.clone(), true);
+
+        let err = call_daemon_phased(
+            &sock,
+            "update",
+            &json!({"root":"/tmp"}),
+            Wait::WhileAlive(Duration::from_millis(50)),
+        )
+        .await
+        .expect_err("a daemon that answers nothing must not be waited for forever");
+        assert!(matches!(err, MutationFailure::Undetermined(_)), "{err:?}");
     }
 
     /// Daemon and client must agree on the hook socket path. The daemon

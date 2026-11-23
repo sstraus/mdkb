@@ -17,7 +17,11 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
     let hook_fixes = crate::cli::setup::hook_fix_commands(root, None);
     let week_ago = chrono::Utc::now().timestamp() - 7 * 86_400;
 
+    let unknown_config_keys = std::fs::read_to_string(&config_path)
+        .map(|raw| crate::config::unknown_keys(&raw))
+        .unwrap_or_default();
     let mut facts = Facts {
+        unknown_config_keys,
         hooks_missing: drift.missing,
         hooks_duplicated: drift.duplicated,
         hooks_missing_fix: Some(hook_fixes.missing),
@@ -47,6 +51,45 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
             .collect();
     }
     if let Some(ctx) = ctx {
+        // The daemon rebuilds stale and ambiguous stores alike; only an identity
+        // it cannot read at all (`embedding_encounter_needs_work`) stays manual.
+        let mut unverifiable = false;
+        facts.embedding_problem = match crate::store::vectors::identity_status(&ctx.conn) {
+            Ok(s) if s.stale => Some(format!(
+                "embedding vectors stale: selected {}, current {:?}, pending {:?}, ambiguous {}",
+                s.selected_model, s.current_model, s.pending_model, s.ambiguous
+            )),
+            Ok(_) => None,
+            Err(e) => {
+                unverifiable = true;
+                Some(format!("embedding identity cannot be verified: {e}"))
+            }
+        };
+        if let Ok(model) = crate::store::vectors::selected_model(&ctx.conn) {
+            let code = crate::code::semantic::identity_status(
+                &ctx.db_path.parent().unwrap().join("vectors.bin"),
+                model,
+            );
+            if code.stale {
+                let detail = format!(
+                    "code embedding vectors stale: selected {}, current {:?}, ambiguous {}",
+                    code.selected_model, code.current_model, code.ambiguous
+                );
+                match &mut facts.embedding_problem {
+                    Some(problem) => {
+                        problem.push_str("; ");
+                        problem.push_str(&detail);
+                    }
+                    None => facts.embedding_problem = Some(detail),
+                }
+            }
+        }
+        facts.embedding_auto_recovery = facts.embedding_problem.is_some()
+            && !unverifiable
+            && facts.config_error.is_none()
+            && crate::store::vectors::automatic_reembedding_available();
+        facts.evolution_cycles =
+            crate::store::evolution::find_cycles(&ctx.conn).unwrap_or_default();
         facts.doc_count = crate::store::search::get_status(&ctx.conn)
             .map_or(0, |s| i64::try_from(s.documents).unwrap_or(i64::MAX));
         facts.projection = crate::core::memory_sync::projection_file_and_row_counts(ctx).ok();
@@ -86,11 +129,19 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
             Ok(Some(_)) => {}
         }
     }
-    if full
-        && let crate::cli::setup::DistillerCheck::Fail { program, detail } =
-            crate::cli::setup::check_distiller(root)
-    {
-        facts.distiller_failure = Some(format!("{program}: {detail}"));
+    if full {
+        use crate::cli::setup::DistillerCheck;
+        match crate::cli::setup::check_distiller(root) {
+            DistillerCheck::NotConfigured(reason) => {
+                facts.distiller_note = Some(format!("not configured ({reason})"));
+            }
+            DistillerCheck::Pass { program, lesson } => {
+                facts.distiller_note = Some(format!("OK ({program}); distilled: {lesson}"));
+            }
+            DistillerCheck::Fail { program, detail } => {
+                facts.distiller_failure = Some(format!("{program}: {detail}"));
+            }
+        }
     }
     facts
 }

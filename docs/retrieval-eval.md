@@ -14,7 +14,7 @@ Three modes exercise the same function with different legs fed:
 | `embedding` | starved (a term no memory holds) | query embedding | isolates what the vector pass contributes |
 | `hybrid` | query | query embedding | warm model |
 
-Recall queries are OR-expanded with `store::search::build_recall_query`, which after story 084 is the expression **every** memory surface builds: the CLI `search --scope memory`, the MCP `search` tool with `scope: memory`, and the `UserPromptSubmit` hook. One number therefore covers all three. `OR` is only safe because admission is decided afterwards and absolutely — the expression generates candidates, it does not decide relevance.
+Recall queries are OR-expanded with `store::search::build_recall_query`, which after story 084 is the expression **every** memory surface builds: the CLI `memory search` (and `search --memory`), the MCP `search` tool with `scope: memory`, and the `UserPromptSubmit` hook. One number therefore covers all three. `OR` is only safe because admission is decided afterwards and absolutely — the expression generates candidates, it does not decide relevance.
 
 ## The fixture
 

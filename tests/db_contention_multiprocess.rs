@@ -173,7 +173,7 @@ fn long_lived_writer(root: &Path, iters: usize) {
             )
             .expect("insert memory entry");
         let rowid = ctx.conn.last_insert_rowid();
-        vectors::store_memory_embedding(&ctx.conn, rowid, &embedding, "stress")
+        vectors::store_memory_embedding(&ctx.conn, rowid, &embedding, "AllMiniLML6V2")
             .expect("store memory embedding");
     }
 }

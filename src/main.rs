@@ -20,33 +20,30 @@ use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
     EmbedResult, EvalOptions, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
     handle_collection_remove, handle_collection_rename, handle_collection_update, handle_current,
-    handle_embed, handle_eval_judge, handle_eval_recall, handle_evolve_corrects,
-    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
-    handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
-    handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
-    handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
-    handle_graph_path, handle_graph_relations, handle_history, handle_init, handle_memory_confirm,
-    handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_eval_judge, handle_eval_recall, handle_evolve_corrects, handle_evolve_extends,
+    handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates, handle_get,
+    handle_graph_backlinks, handle_graph_dangling, handle_graph_hubs, handle_graph_links,
+    handle_graph_neighbors, handle_graph_path, handle_graph_relations, handle_history, handle_init,
+    handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_purge, handle_metrics_show,
-    handle_metrics_status, handle_prune_sessions, handle_superseded_by, parse_retention_secs,
+    handle_prune_sessions, handle_superseded_by, parse_retention_secs,
 };
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
-    GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
-    RemoveHooksCommand, RemoveMcpCommand, ReposCommand, SessionCommand, SetupCommand,
-    SetupHooksCommand, SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
+    Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, GraphCommand,
+    HookCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand, RemoveMcpCommand,
+    ReposCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand, SetupRemoveCommand,
+    parse_eval_modes,
 };
 use mdkb::core::Context;
 use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
 use mdkb::core::search::{handle_hybrid_search, handle_mget};
 use mdkb::core::sessions::handle_session_index;
 use mdkb::mcp::server::run_server;
-use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use rmcp::ServiceExt;
 
@@ -154,7 +151,7 @@ fn announce_no_collections(ctx: &mdkb::core::Context) -> mdkb::error::Result<()>
 }
 
 fn main() {
-    // A `Result` returned from `main` is printed with `{:?}`, which for our
+    // A `Result` returned from `main` is printed with `{:?}` is printed with `{:?}`, which for our
     // error type is the struct dump `Error { kind: .., backtrace: .. }` and
     // hides every `#[error]` Display string. Print the Display form once,
     // where the error finally surfaces, and exit 1 as the default would.
@@ -295,7 +292,18 @@ async fn run() -> Result<()> {
 
     let result = run_cli(cli).await;
     if let Err(ref e) = result {
-        if matches!(format, OutputFormat::Json) {
+        let json = matches!(format, OutputFormat::Json);
+        // A usage error is the caller's mistake, not a failure: one line that
+        // names the command that works, and exit 2.
+        if let mdkb::error::ErrorKind::Usage { message, run } = e.kind() {
+            let report = mdkb::cli::usage_errors::UsageReport {
+                message: message.clone(),
+                run: run.clone(),
+            };
+            eprintln!("{}", report.render(json));
+            std::process::exit(2);
+        }
+        if json {
             eprintln!("{}", serde_json::json!({"error": e.to_string()}));
             std::process::exit(1);
         }
@@ -324,9 +332,49 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
     // Every other command anchors to the nearest existing `.mdkb/` store, then
     // the git root, then CLAUDE_PROJECT_DIR, then cwd — so running mdkb from a
     // sub-directory finds the project's store instead of spawning a new one.
+    let root_selector = cli.root.take().map(|p| p.to_string_lossy().into_owned());
+    if root_selector.is_some()
+        && matches!(
+            cli.command,
+            Command::Init
+                | Command::Mcp { .. }
+                | Command::Daemon(_)
+                | Command::Repos(_)
+                | Command::Serve { .. }
+        )
+    {
+        return Err(mdkb::Error::other(
+            "--root does not apply to init, mcp, serve, daemon or repos: they work on no single repo. Run: mdkb search QUERY --root NAME",
+        ));
+    }
     let cwd = if matches!(cli.command, Command::Init) {
         mdkb::git::resolve_main_worktree(&raw_cwd)
-    } else if matches!(cli.command, Command::Mcp { .. }) {
+    } else if let (Some(raw), false) = (
+        root_selector.as_deref(),
+        matches!(
+            cli.command,
+            Command::Search { .. }
+                | Command::Mcp { .. }
+                | Command::Daemon(_)
+                | Command::Repos(_)
+                | Command::Serve { .. }
+                | Command::Hook(_)
+        ),
+    ) {
+        // Every command but the search ones works on exactly one repository.
+        single_root(raw).await?
+    } else if matches!(
+        cli.command,
+        Command::Mcp { .. }
+            | Command::Daemon(_)
+            | Command::Repos(_)
+            | Command::Serve { daemon: true, .. }
+            | Command::Serve { global: true, .. }
+    ) {
+        // `serve --daemon`, `serve --global`, `daemon *` and `repos *` anchor
+        // nothing either: they serve or list every repository, so the guard
+        // only killed them when an agent started in `~` (story 090-a611).
+        //
         // `mdkb mcp` anchors nothing: both run modes serve globally and take no
         // cwd at all — `run_global_stdio_server` and `mcp_proxy::run_proxy`
         // resolve a root per tool call. Holding it to the anchoring guard cost
@@ -363,7 +411,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // `--root` names the repos itself; the directory it runs from
             // anchors nothing, so a container of repositories is a fine place
             // to run it, as it is for the MCP `root` parameter.
-            None if matches!(cli.command, Command::Search { root: Some(_), .. }) => raw_cwd.clone(),
+            None if root_selector.is_some() => raw_cwd.clone(),
+            // `status` reports the daemon too, which needs no store: where none can
+            // be anchored it prints that half and says how to create the other.
+            None if matches!(cli.command, Command::Status { .. }) => raw_cwd.clone(),
             None => {
                 return Err(mdkb::Error::other(format!(
                     "refusing to anchor a store at {}: it holds git repositories (or is your \
@@ -406,10 +457,11 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 // explanation of why this is not retried here follows it.
                 return Err(mdkb::error::Error::other(format!(
                     "{e}. The daemon took this request and did not report back, so it may \
-                     still be writing — not running it here. Check `mdkb daemon status`; if \
+                     still be writing — not running it here. Check `mdkb status`; if \
                      no daemon is running, re-run with MDKB_NO_DAEMON=1."
                 )));
             }
+            Err(MutationFailure::Rejected(e)) => return Err(mdkb::Error::other(e)),
             Err(MutationFailure::Unstarted(e)) => {
                 tracing::info!("cli.mutate: daemon did not run this ({e}); writing in-process");
             }
@@ -464,12 +516,11 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         collection_updated_line(&name, &updated.path, &updated.pattern)
                     );
                 }
-                CollectionCommand::Remove { name } => {
-                    if handle_collection_remove(&ctx, &name)? {
-                        println!("Removed collection '{name}'");
-                    } else {
-                        println!("Collection '{name}' not found");
+                CollectionCommand::Rm { name } => {
+                    if !handle_collection_remove(&ctx, &name)? {
+                        return Err(mdkb::error::ErrorKind::CollectionNotFound { name }.into());
                     }
+                    println!("Removed collection '{name}'");
                 }
                 CollectionCommand::Rename { old_name, new_name } => {
                     handle_collection_rename(&ctx, &old_name, &new_name)?;
@@ -483,102 +534,52 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Search {
             query,
+            docs,
+            memory,
             limit,
             collection,
             include_superseded,
-            scope,
-            kind,
-            file,
             entry_type,
-            root,
-            ignore_case,
-            patterns,
-            regex,
-            path,
-            search_contract,
+            scope,
         } => {
-            let req = SearchRequest {
-                query: query.unwrap_or_default(),
-                limit,
-                collection,
-                include_superseded,
-                scope,
-                kind,
-                file,
-                entry_type,
-                ignore_case,
-                patterns,
-                regex,
-                path,
-                search_contract,
-            };
-            mdkb::core::search_contract::validate(mdkb::core::search_contract::Request {
-                scope: req.scope.as_deref(),
-                query: &req.query,
-                patterns: (!req.patterns.is_empty()).then_some(req.patterns.as_slice()),
-                path: req.path.as_deref(),
-                file: req.file.as_deref(),
-                regex: req.regex,
-                ignore_case: req.ignore_case,
-                contract: req.search_contract.as_deref(),
-            })?;
-            if let Some(raw_root) = root {
-                run_search_roots(&raw_root, req, cli.format).await?;
-            } else {
-                let ctx = open_reader(&cwd)?;
-                announce_no_collections(&ctx)?;
-                run_search(&cwd, &ctx, req, cli.format)?;
-            }
-        }
-        Command::Dup {
-            semantic,
-            threshold,
-            min_nodes,
-            file,
-            since,
-        } => {
-            // Read-only, and tolerant of a repository nobody has indexed: the
-            // report says so and exits 0. An audit that has nothing to audit is
-            // not a failure.
-            let ctx = open_reader(&cwd)?;
-            let report = run_dup(
-                &cwd,
-                Some(&ctx.conn),
-                &ctx.config_path,
-                &mdkb::core::dup::DupOverrides {
-                    semantic,
-                    threshold,
-                    min_nodes,
-                    file,
-                    since,
+            let req = search_request(
+                query,
+                SearchFlags {
+                    docs,
+                    memory,
+                    limit,
+                    collection,
+                    include_superseded,
+                    entry_type,
+                    scope,
                 },
+                "mdkb search --help",
             )?;
-            print!("{}", render_dup(&report, cli.format));
+            run_knowledge_search(&cwd, root_selector, req, cli.format).await?;
         }
-        Command::Coupling {
-            min_cochanges,
-            since,
-            git_ref,
+        Command::Dup(a) => {
+            return Err(mdkb::cli::retired(
+                "dup",
+                &mdkb::cli::consolidated_replacement("dup", &a.args),
+            ));
+        }
+        Command::Coupling(a) => {
+            return Err(mdkb::cli::retired(
+                "coupling",
+                &mdkb::cli::consolidated_replacement("coupling", &a.args),
+            ));
+        }
+        Command::Get {
+            id,
+            lines,
+            collection,
         } => {
-            // Read-only, and tolerant the same way `dup` is: a repository with
-            // no index, or no history to read, is reported and exits 0.
-            let report = mdkb::core::coupling::handle_coupling(
-                &cwd,
-                &mdkb::core::coupling::CouplingOverrides {
-                    min_cochanges,
-                    since,
-                    git_ref,
-                },
-            )?;
-            print!("{}", render_coupling(&report, cli.format));
-        }
-        Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
             let ctx = open_reader(&cwd)?;
 
             // Detect glob pattern (contains * or ?)
             if id.contains('*') || id.contains('?') {
-                let results = handle_mget(&ctx, &id, None)?;
+                let results = handle_mget(&ctx, &id, collection.as_deref())?;
                 format_mget_results(&results, cli.format);
             }
             // Detect comma-separated list (e.g., "42,43,44")
@@ -619,40 +620,61 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Mget {
-            pattern,
+        Command::Update {
+            files,
+            force,
+            code,
+            sessions,
+            reembed,
             collection,
+            sessions_path,
+            project_root,
         } => {
-            let ctx = open_reader(&cwd)?;
-            let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
-            format_mget_results(&results, cli.format);
-        }
-        Command::Update { files, force } => {
             let ctx = open_writer(&cwd)?;
             report_unreadable_config(&ctx.config_path);
-            let request = UpdateRequest { files, force };
-            let outcome = run_update_in_process(&ctx, &cwd, &request)?;
-            format_update_outcome(&outcome, cli.format)?;
-        }
-        Command::Embed { collection } => {
-            let ctx = open_writer(&cwd)?;
-            // This process exists to embed and then exit, which is the only
-            // place the drop is safe: it cannot be undone without privilege,
-            // so a long-lived process that did it would stay demoted. See
-            // `llm::lower_process_priority` and the layering test that keeps
-            // it out of the daemon.
-            let config = mdkb::config::Config::load_or_default(&ctx.config_path);
-            let nice = config.search.embed_nice;
-            if let Some(applied) = mdkb::llm::lower_process_priority(nice) {
-                eprintln!(
-                    "mdkb: embedding at nice {applied} — it takes every idle core and \
-                     yields the busy ones. Set search.embed_nice = 0 to disable."
-                );
+            if code {
+                let stats = if force {
+                    mdkb::cli::handlers::handle_code_reindex(&cwd, &[])?
+                } else {
+                    mdkb::cli::handlers::handle_code_index(&cwd, &[])?
+                };
+                format_code_index_stats(&stats, cli.format);
+            } else if sessions {
+                let sessions_base = match sessions_path {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => mdkb::daemon::config::home_dir()?.join(".claude/projects"),
+                };
+                let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
+                let result = handle_session_index(&ctx, &sessions_base, &root)?;
+                format_update_result(&result, cli.format);
+            } else if reembed || collection.is_some() {
+                // This process exists to embed and then exit, which is the only
+                // place the drop is safe: it cannot be undone without privilege,
+                // so a long-lived process that did it would stay demoted. See
+                // `llm::lower_process_priority` and the layering test that keeps
+                // it out of the daemon.
+                let config = mdkb::config::Config::load_or_default(&ctx.config_path);
+                let nice = config.search.embed_nice;
+                if let Some(applied) = mdkb::llm::lower_process_priority(nice) {
+                    eprintln!(
+                        "mdkb: embedding at nice {applied} — it takes every idle core and \
+                         yields the busy ones. Set search.embed_nice = 0 to disable."
+                    );
+                }
+                let result =
+                    mdkb::core::ops::handle_embed_explicit(&ctx, collection.as_deref(), reembed)?;
+                format_embed_result(&result, cli.format);
+            } else {
+                let request = UpdateRequest { files, force };
+                let outcome = run_update_in_process(&ctx, &cwd, &request)?;
+                format_update_outcome(&outcome, cli.format)?;
             }
-            let result = handle_embed(&ctx, collection.as_deref())?;
-            format_embed_result(&result, cli.format);
-            // After the embedding, so an offline machine still gets its vectors.
-            mdkb::core::ops::fetch_reranker_weights(&config.hooks)?;
+        }
+        Command::Embed(a) => {
+            return Err(mdkb::cli::retired(
+                "embed",
+                &mdkb::cli::consolidated_replacement("embed", &a.args),
+            ));
         }
         Command::Serve {
             http,
@@ -731,13 +753,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 McpRunMode::DaemonProxy { socket_override } => {
                     #[cfg(unix)]
                     {
-                        let socket_path = socket_override.unwrap_or_else(|| {
-                            mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
-                                .map(|c| c.socket_path())
-                                .unwrap_or_else(|_| {
-                                    mdkb::DaemonConfig::daemon_home().join("daemon.sock")
-                                })
-                        });
+                        let socket_path =
+                            socket_override.unwrap_or_else(mdkb::DaemonConfig::mcp_socket_path);
                         mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
                     }
                     // `resolve_mcp_run_mode` returns DaemonProxy only when
@@ -765,16 +782,44 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 );
             } else {
                 print!("{}", mdkb::cli::doctor::render(&findings));
+                if let Some(note) = &facts.distiller_note {
+                    println!("Prior distiller: {note}");
+                }
             }
             if mdkb::cli::doctor::has_errors(&findings) {
                 std::process::exit(1);
             }
         }
-        Command::Stats { no_color } => {
-            let ctx = open_reader(&cwd)?;
+        Command::Status { no_color } => {
+            let ctx = match open_reader(&cwd) {
+                Ok(ctx) => ctx,
+                Err(e) if !cwd.join(".mdkb/index.sqlite").exists() => {
+                    let daemon = mdkb::cli::daemon::DaemonSummary::with_repos().await;
+                    let hint = format!("no mdkb store here ({e})");
+                    if let mdkb::cli::OutputFormat::Json = cli.format {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "daemon": daemon,
+                                "error": hint,
+                                "run": "mdkb init",
+                            }))?
+                        );
+                    } else {
+                        print!(
+                            "{}",
+                            mdkb::cli::stats_render_report::render_daemon_only(&daemon)
+                        );
+                        println!("{hint}; run: mdkb init");
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             announce_no_collections(&ctx)?;
             report_unreadable_config(&ctx.config_path);
-            let report = mdkb::cli::stats_report::collect_report(&ctx)?;
+            let mut report = mdkb::cli::stats_report::collect_report(&ctx)?;
+            report.daemon = mdkb::cli::daemon::DaemonSummary::with_repos().await;
             if let mdkb::cli::OutputFormat::Json = cli.format {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
@@ -782,6 +827,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 let color = !no_color && std::io::stdout().is_terminal();
                 print!("{}", mdkb::cli::stats_render_report::render(&report, color));
             }
+        }
+        Command::Stats(a) => {
+            return Err(mdkb::cli::retired(
+                "stats",
+                &mdkb::cli::consolidated_replacement("stats", &a.args),
+            ));
         }
         Command::Compact {
             prune_sessions,
@@ -843,10 +894,11 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Metrics(cmd) => match cmd {
-            MetricsCommand::Status => {
-                let ctx = open_reader(&cwd)?;
-                let status = handle_metrics_status(&ctx, &cwd)?;
-                format_telemetry_status(&status, cli.format);
+            MetricsCommand::Status(a) => {
+                return Err(mdkb::cli::retired(
+                    "metrics status",
+                    &mdkb::cli::consolidated_replacement("metrics status", &a.args),
+                ));
             }
             MetricsCommand::Show { period } => {
                 let ctx = open_reader(&cwd)?;
@@ -976,6 +1028,29 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
         },
+        Command::Memory(MemoryCommand::Search {
+            query,
+            limit,
+            entry_type,
+        }) => {
+            // The same code path as `search --memory`.
+            let req = search_request(
+                query,
+                SearchFlags {
+                    docs: false,
+                    memory: true,
+                    limit,
+                    collection: None,
+                    include_superseded: false,
+                    entry_type,
+                    scope: None,
+                },
+                "mdkb memory search --help",
+            )?;
+            // A memory-only command: its JSON stays the bare array of entries.
+            let req = SearchRequest { bare: true, ..req };
+            run_knowledge_search(&cwd, root_selector, req, cli.format).await?;
+        }
         Command::Memory(cmd) => {
             let ctx = if matches!(
                 &cmd,
@@ -1072,14 +1147,19 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     // indistinguishable from a hit to any caller that scripts
                     // this command and reads only the status.
                     let entry = handle_memory_show(&ctx, &id)?.ok_or_else(|| {
-                        mdkb::Error::from(mdkb::error::ErrorKind::DocumentNotFound {
-                            id: id.clone(),
-                        })
+                        mdkb::Error::from(mdkb::error::ErrorKind::MemoryNotFound { id: id.clone() })
                     })?;
                     format_memory_entry(&entry, cli.format);
+                    if matches!(cli.format, mdkb::cli::OutputFormat::Text) {
+                        print_memory_edges(&ctx, &entry.id)?;
+                    }
                 }
-                MemoryCommand::Confirm { id, outcome } => {
-                    let result = handle_memory_confirm(&ctx, &id, &outcome)?;
+                MemoryCommand::Confirm {
+                    id,
+                    outcome,
+                    session,
+                } => {
+                    let result = handle_memory_confirm(&ctx, &id, &outcome, session.as_deref())?;
                     match cli.format {
                         mdkb::cli::OutputFormat::Json => {
                             println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1108,20 +1188,18 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         mdkb::cli::memory::format_proposals(&rows, cli.format)?
                     );
                 }
-                MemoryCommand::Search { query, limit } => {
-                    let entries = handle_memory_search(&ctx, &query, limit, None)?;
-                    format_memory_list(&entries, cli.format);
+                MemoryCommand::Search { .. } => {
+                    unreachable!("`memory search` is dispatched before the store opens")
                 }
                 MemoryCommand::Warmup { limit } => {
                     let index = handle_memory_warmup(&ctx, limit)?;
                     format_warmup_index(&index, cli.format);
                 }
                 MemoryCommand::Rm { id } => {
-                    if handle_memory_rm(&ctx, &id)? {
-                        println!("Deleted memory entry '{id}'");
-                    } else {
-                        println!("Memory entry '{id}' not found");
+                    if !handle_memory_rm(&ctx, &id)? {
+                        return Err(mdkb::error::ErrorKind::MemoryNotFound { id }.into());
                     }
+                    println!("Deleted memory entry '{id}'");
                 }
                 MemoryCommand::History { id } => {
                     let revisions = mdkb::store::memory::get_revisions(&ctx.conn, &id)?;
@@ -1175,9 +1253,31 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     print_memory_sync_warnings(&s);
                 }
                 MemoryCommand::Import {
-                    path,
+                    journal: Some(journal),
+                    dry_run,
+                    ..
+                } => {
+                    let jp = std::path::Path::new(&journal);
+                    if jp.is_dir() {
+                        let results = mdkb::cli::handlers::handle_journal_import_all(
+                            &ctx, jp, dry_run, true,
+                        )?;
+                        format_journal_import_all_results(&results, dry_run, cli.format);
+                    } else {
+                        let result = mdkb::cli::handlers::handle_journal_import(&ctx, jp, dry_run)?;
+                        format_journal_import_result(&result, dry_run, cli.format);
+                    }
+                }
+                MemoryCommand::Import { path: None, .. } => {
+                    return Err(mdkb::Error::other(
+                        "memory import needs PATH or --journal PATH. Run: mdkb memory import --journal .claude/journal",
+                    ));
+                }
+                MemoryCommand::Import {
+                    path: Some(path),
                     dry_run,
                     skip_duplicates,
+                    journal: None,
                 } => {
                     let p = std::path::Path::new(&path);
                     // A single .md file is a RESTORE, not a bulk import: it
@@ -1236,48 +1336,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Evolve(cmd) => {
-            let ctx = open_writer(&cwd)?;
-            match cmd {
-                EvolveCommand::Supersedes { new, old, reason } => {
-                    let id = handle_evolve_supersedes(&ctx, &new, &old, reason.as_deref())?;
-                    println!("Created evolution relationship #{id}: {new} supersedes {old}");
-                }
-                EvolveCommand::Updates {
-                    new,
-                    old,
-                    scope,
-                    reason,
-                } => {
-                    let id = handle_evolve_updates(
-                        &ctx,
-                        &new,
-                        &old,
-                        scope.as_deref(),
-                        reason.as_deref(),
-                    )?;
-                    println!("Created evolution relationship #{id}: {new} updates {old}");
-                }
-                EvolveCommand::Corrects { new, old, reason } => {
-                    let id = handle_evolve_corrects(&ctx, &new, &old, reason.as_deref())?;
-                    println!("Created evolution relationship #{id}: {new} corrects {old}");
-                }
-                EvolveCommand::Retracts { new, old, reason } => {
-                    let id = handle_evolve_retracts(&ctx, &new, &old, reason.as_deref())?;
-                    println!("Created evolution relationship #{id}: {new} retracts {old}");
-                }
-                EvolveCommand::Extends { new, old, reason } => {
-                    let id = handle_evolve_extends(&ctx, &new, &old, reason.as_deref())?;
-                    println!("Created evolution relationship #{id}: {new} extends {old}");
-                }
-            }
-        }
-        Command::History { path } => {
+        Command::Evolve(EvolveCommand::History { path }) => {
             let ctx = open_reader(&cwd)?;
             let history = handle_history(&ctx, &path)?;
             format_evolution_history(&history, cli.format);
         }
-        Command::Current { path } => {
+        Command::Evolve(EvolveCommand::Current { path }) => {
             let ctx = open_reader(&cwd)?;
             if let Some(doc) = handle_current(&ctx, &path)? {
                 format_current_document(&doc, cli.format);
@@ -1285,20 +1349,127 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 println!("No current version found for '{path}'");
             }
         }
-        Command::SupersededBy { path } => {
+        Command::Evolve(EvolveCommand::SupersededBy { path }) => {
             let ctx = open_reader(&cwd)?;
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
         }
-        Command::Graph(cmd) => {
+        Command::Evolve(
+            EvolveCommand::Supersedes(a)
+            | EvolveCommand::Updates(a)
+            | EvolveCommand::Corrects(a)
+            | EvolveCommand::Retracts(a)
+            | EvolveCommand::Extends(a),
+        ) => {
+            // The verb is the first token of the original line; clap consumed it,
+            // so recover it from the parsed variant name via the raw argv.
+            let verb = std::env::args()
+                .skip_while(|x| x != "evolve")
+                .nth(1)
+                .unwrap_or_default();
+            let old = format!("evolve {verb}");
+            return Err(mdkb::cli::retired(
+                &old,
+                &mdkb::cli::consolidated_replacement(&old, &a.args),
+            ));
+        }
+        Command::Evolve(cmd) => {
+            let ctx = open_writer(&cwd)?;
+            match cmd {
+                EvolveCommand::Link {
+                    new,
+                    relation,
+                    old,
+                    scope,
+                    reason,
+                } => {
+                    if scope.is_some() && relation != "updates" {
+                        return Err(mdkb::Error::other(
+                            "--scope applies to `updates` only. Run: mdkb evolve link NEW updates OLD --scope SECTION",
+                        ));
+                    }
+                    let reason = reason.as_deref();
+                    let id = match relation.as_str() {
+                        "supersedes" => handle_evolve_supersedes(&ctx, &new, &old, reason)?,
+                        "updates" => {
+                            handle_evolve_updates(&ctx, &new, &old, scope.as_deref(), reason)?
+                        }
+                        "corrects" => handle_evolve_corrects(&ctx, &new, &old, reason)?,
+                        "retracts" => handle_evolve_retracts(&ctx, &new, &old, reason)?,
+                        _ => handle_evolve_extends(&ctx, &new, &old, reason)?,
+                    };
+                    println!("Created evolution relationship #{id}: {new} {relation} {old}");
+                }
+                EvolveCommand::Unlink { id } => {
+                    mdkb::core::graph::handle_evolve_remove(&ctx, id)?;
+                    println!("Removed evolution relationship #{id}");
+                }
+                EvolveCommand::Supersedes(_)
+                | EvolveCommand::Updates(_)
+                | EvolveCommand::Corrects(_)
+                | EvolveCommand::Retracts(_)
+                | EvolveCommand::Extends(_) => unreachable!("handled below"),
+                EvolveCommand::History { .. }
+                | EvolveCommand::Current { .. }
+                | EvolveCommand::SupersededBy { .. } => {
+                    unreachable!("evolve reads are dispatched above")
+                }
+            }
+        }
+        Command::Graph {
+            cmd:
+                GraphCommand::Coupling {
+                    min_cochanges,
+                    since,
+                    git_ref,
+                },
+        } => {
+            use mdkb::core::coupling_docs::{handle_doc_coupling, render_csv, render_json};
+            let overrides = mdkb::core::coupling::CouplingOverrides {
+                min_cochanges,
+                since,
+                git_ref,
+            };
+            let report = handle_doc_coupling(&cwd, &overrides)?;
+            let text = match cli.format {
+                _ if !report.indexed => report.markdown.clone(),
+                OutputFormat::Json => render_json(&report.findings),
+                OutputFormat::Csv => render_csv(&report.findings),
+                OutputFormat::Text | OutputFormat::Markdown => report.markdown.clone(),
+            };
+            print!("{text}");
+        }
+        Command::Graph { cmd } => {
             let ctx = open_reader(&cwd)?;
             announce_no_collections(&ctx)?;
             match cmd {
-                GraphCommand::Links { entity, relation } => {
+                GraphCommand::Links {
+                    entity,
+                    relation,
+                    scope,
+                } if scope == "memory" => {
+                    let rel = parse_memory_relation(relation.as_deref())?;
+                    let edges = mdkb::store::memory_graph::outgoing(&ctx.conn, &entity, rel)?;
+                    format_memory_edges(&edges, cli.format);
+                }
+                GraphCommand::Backlinks {
+                    entity,
+                    relation,
+                    scope,
+                } if scope == "memory" => {
+                    let rel = parse_memory_relation(relation.as_deref())?;
+                    let edges = mdkb::store::memory_graph::incoming(&ctx.conn, &entity, rel)?;
+                    format_memory_edges(&edges, cli.format);
+                }
+                GraphCommand::Links {
+                    entity, relation, ..
+                } => {
                     let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;
                     format_graph_edges(&edges, cli.format);
                 }
-                GraphCommand::Backlinks { entity, relation } => {
+                GraphCommand::Backlinks {
+                    entity, relation, ..
+                } => {
                     let edges = handle_graph_backlinks(&ctx, &entity, relation.as_deref())?;
                     format_graph_edges(&edges, cli.format);
                 }
@@ -1319,232 +1490,46 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     let dangling = handle_graph_dangling(&ctx, collection.as_deref())?;
                     format_graph_dangling(&dangling, cli.format);
                 }
+                GraphCommand::Coupling { .. } => unreachable!("dispatched above"),
                 GraphCommand::Hubs { relation, limit } => {
                     let hubs = handle_graph_hubs(&ctx, relation.as_deref(), limit)?;
                     format_graph_hubs(&hubs, cli.format);
                 }
                 GraphCommand::Relations { apply } => {
                     let found = handle_graph_relations(&ctx)?;
-                    let mode = mdkb::config::Config::load_or_default(&ctx.config_path)
-                        .graph
-                        .relations;
+                    let graph_config =
+                        mdkb::config::Config::load_or_default(&ctx.config_path).graph;
+                    let mode = graph_config.relations;
                     let applied = if apply {
                         apply_relations_if_useful(&ctx, mode, &found)?
                     } else {
                         None
                     };
                     format_graph_relations(&found, mode, applied.as_ref(), cli.format);
+                    if matches!(cli.format, OutputFormat::Text | OutputFormat::Markdown) {
+                        // `Detected` is the measurement; extraction is the
+                        // allowlist. Without this line `themes ... no` read as
+                        // "themes is ignored" while its edges were indexed.
+                        println!(
+                            "Extracted as edges (graph.frontmatter_relations): {}",
+                            graph_config.frontmatter_relations.join(", ")
+                        );
+                    }
                 }
             }
         }
-        Command::Experiment(cmd) => {
-            let ctx = if matches!(
-                &cmd,
-                ExperimentCommand::Status { .. } | ExperimentCommand::List { .. }
-            ) {
-                open_reader(&cwd)?
-            } else {
-                open_writer(&cwd)?
-            };
-            match cmd {
-                ExperimentCommand::Create {
-                    name,
-                    config_a,
-                    config_b,
-                    description,
-                    split,
-                    min_samples,
-                } => {
-                    let result = handle_experiment_create(
-                        &ctx,
-                        &name,
-                        description.as_deref(),
-                        &config_a,
-                        &config_b,
-                        split,
-                        min_samples,
-                    )?;
-                    println!("Created experiment '{}' (ID: {})", result.name, result.id);
-                }
-                ExperimentCommand::Status { name } => {
-                    if let Some(status) = handle_experiment_status(&ctx, &name)? {
-                        format_experiment_status(&status, cli.format);
-                    } else {
-                        println!("Experiment '{name}' not found");
-                    }
-                }
-                ExperimentCommand::End { name, winner } => {
-                    let actual_winner = handle_experiment_end(&ctx, &name, winner.as_deref())?;
-                    if let Some(w) = actual_winner {
-                        println!("Experiment '{name}' ended with winner: {w}");
-                    } else {
-                        println!("Experiment '{name}' ended with no significant winner");
-                    }
-                }
-                ExperimentCommand::Cancel { name } => {
-                    handle_experiment_cancel(&ctx, &name)?;
-                    println!("Experiment '{name}' cancelled");
-                }
-                ExperimentCommand::List { running } => {
-                    let experiments = handle_experiment_list(&ctx, running)?;
-                    format_experiment_list(&experiments, cli.format);
-                }
-            }
-        }
-        Command::Journal(cmd) => {
-            let ctx = open_writer(&cwd)?;
-            match cmd {
-                JournalCommand::Import { path, dry_run } => {
-                    let result = mdkb::cli::handlers::handle_journal_import(
-                        &ctx,
-                        std::path::Path::new(&path),
-                        dry_run,
-                    )?;
-                    format_journal_import_result(&result, dry_run, cli.format);
-                }
-                JournalCommand::ImportAll {
-                    dir,
-                    dry_run,
-                    skip_existing,
-                } => {
-                    let journal_dir = dir.unwrap_or_else(|| ".claude/journal".to_string());
-                    let results = mdkb::cli::handlers::handle_journal_import_all(
-                        &ctx,
-                        std::path::Path::new(&journal_dir),
-                        dry_run,
-                        skip_existing,
-                    )?;
-                    format_journal_import_all_results(&results, dry_run, cli.format);
-                }
-            }
+        Command::Journal(a) => {
+            return Err(mdkb::cli::retired(
+                "journal",
+                &mdkb::cli::consolidated_replacement("journal", &a.args),
+            ));
         }
         Command::Surface => {
             print!("{}", mdkb::core::surface::render());
             return Ok(());
         }
         Command::Cheatsheet => {
-            print!(
-                "\
-# Search
-mdkb search <query>                                    # docs + memory + indexed literals (default)
-mdkb search <query> --scope memory                     # memory only
-mdkb search <query> --scope memory --entry-type TYPE    # filter by type
-mdkb search <query> --scope docs                        # documents only
-mdkb search <query> --scope symbols                     # symbol definitions (fuzzy)
-mdkb search <query> --scope symbols --file hook         # path substring, not a glob
-mdkb search <query> --scope code                        # semantic code search
-mdkb search 'Fork from here' --scope text               # exact AST literal/JSX/i18n value, not grep
-mdkb search 'fork from here' --scope text -i             # Unicode case-insensitive literal
-mdkb search <query> --scope text --file src/             # narrow by path substring; index age reported
-mdkb search <query> -c <collection>                     # a collection is -c, NOT --scope
-mdkb search <query> --root NAME                         # another repo: same selector as the MCP `root` below (--root '*' = all)
-mdkb get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
-mdkb get <id> --lines 10:50                             # line range
-mdkb mget <pattern>                                     # several documents at once
-
-# Memory (--entry-type: topic, problem, decision, reminder, prior)
-mdkb memory add <id> --title T --content C              # create (default: topic)
-mdkb memory add <id> --title T --content C --source-type official_docs  # provenance/trust
-mdkb memory add <id> --title T --content C --entry-type prior --tags t1,t2
-mdkb memory add <id> --title T --content C --entry-type reminder --due-in 3600
-mdkb memory confirm <id> --outcome confirmed            # raise confidence (or refuted)
-mdkb memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
-mdkb memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
-mdkb memory rm <id>                                     # delete
-mdkb memory list                                        # list active entries
-mdkb memory show <id>                                   # one entry in full
-mdkb memory search <query>                              # memory only, same as search --scope memory
-mdkb memory warmup                                      # compact index to load at session start
-mdkb memory history <id>                                # revisions, including versions a conflict superseded
-mdkb memory curate-priors <cluster-id> <cluster-id>...   # merge reviewed prior clusters
-
-# Memory projection (entries live in the database; .mdkb/memory/entries/*.md is
-# the git-tracked copy, and the only copy that survives losing the database)
-mdkb memory export                                      # write missing entries to disk; add --overwrite to refresh all
-mdkb memory sync                                        # reconcile database and disk both ways
-mdkb memory import <path>                               # load a JSON file or a folder of markdown
-
-# Code intelligence
-mdkb code callers <symbol>                              # who calls this?
-mdkb code calls <symbol>                                # what does this call?
-mdkb code impact <symbol>                               # transitive dependency graph
-mdkb code search <query>                                # fuzzy symbol search
-mdkb code find <name>                                   # exact symbol lookup; --kind and --file narrow it
-mdkb code info                                          # code index counts
-
-# Audits (both read the code index)
-mdkb dup                                                # duplication sweep; structural pass only, no model
-mdkb dup --semantic                                     # add the embedding pass: minutes, not seconds ([code.duplication] semantic = true makes it standing)
-mdkb dup --since HEAD                                   # review mode: only clusters the change touched
-mdkb coupling                                           # files that change together without referencing each other
-
-# Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
-mdkb graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
-mdkb graph backlinks <entity>                           # incoming edges
-mdkb graph neighbors <entity> --depth 2                 # adjacent entities (undirected), each with 'via'
-mdkb graph path <a> <b>                                 # shortest path between two entities
-mdkb graph dangling [-c <collection>]                   # refs resolving to no doc (full scan; explicit only)
-mdkb graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
-mdkb graph relations [--apply]                          # keys whose values name real docs; --apply writes them (no-op in auto mode)
-
-# Collections
-mdkb collection list                                    # name, path, pattern, doc count per collection
-mdkb collection add <name> <path> -p '**/*.md'          # register a collection
-mdkb collection update <name> --path <path> -p '**/*.md' # change path/pattern without dropping matching embeddings
-
-# Developer feedback (local; prompt text is never stored)
-mdkb setup developer                                    # enable private per-repository recall telemetry
-mdkb metrics status                                     # activation, retention, key, stored event count
-mdkb metrics quality --period 7                         # zero results, repeated searches, score bands
-mdkb metrics latency --period 7                         # recall count and latency
-mdkb metrics purge --yes                                # delete all stored query telemetry
-
-# Maintenance
-mdkb update                                             # reindex all (auto-embeds docs + backfills memory)
-mdkb embed --collection claude_sessions                # embed a specific collection (sessions excluded by default)
-mdkb stats                                              # index health, hooks, mining, sessions
-mdkb compact                                            # vacuum both databases
-mdkb compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
-mdkb memory prune --days 90 --dry-run                   # preview: expired entries + reminders/priors/handoffs unread for 90d
-mdkb memory audit                                       # entries worth re-reading (dead refs, drifted source, duplicates); decides nothing
-
-# Daemon (the daemon owns every write; the CLI routes mutations to it)
-mdkb daemon status                                      # is it running, and against which store
-mdkb daemon restart                                     # after upgrading the binary
-mdkb repos list                                         # every known repo: counts, freshness, health (MCP: `repos`)
-mdkb repos refresh --only outdated                      # migrate every store older than this binary, each after a verified backup copy
-MDKB_NO_DAEMON=1 mdkb <cmd>                             # run in-process instead, for debugging
-MDKB_NAMESPACE=<name> mdkb <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked
-
-# Naming
-mdkb surface                                            # each MCP tool next to its CLI equivalent
-mdkb schema [COMMAND]                                   # the CLI as JSON, for machine callers
-
-# Repo selector (the MCP `root` parameter and CLI `--root`)
-(omitted)                                               # the declared workspace, and every store nested under it
-root=\"/abs/path\"                                        # nearest existing store or known repo containing this path
-root=\".\"                                                # relative to the CLI cwd or the first declared MCP workspace
-root=\"./dir\"                                          # explicit path; bare dir stays a repo name even if ./dir exists
-root=\"name\"                                             # one repo by name, the last component of a known root
-root=\"parent/name\"                                     # the same, by trailing path components: how a name several repos share is told apart
-root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
-root=\"*\"                                                # every known repo in the caller's scope, plus repos with no scope; the footer counts the rest (Excluded by scope: N)
-root=\"*:all\"                                            # every known repo, scopes mixed, and the claude_sessions collections `*` leaves out
-root=\"scope:home\"                                       # the known repos whose scope is home
-# A caller with no scope (no MCP roots, or a directory under no prefix) is not filtered: `*` returns every scope's repos.
-# Scope: `[[scopes]] prefix = \"~/Gits/home\"` / `scope = \"home\"` in daemon.toml, or `\"scope\"` on a repos.json entry (wins over the prefix).
-# Only `search` fans out; every other tool needs a selector naming one repo —
-# with `root` omitted that is the declared workspace itself, when it is a store.
-# A comma always separates repos, so a path containing one is refused, not split.
-
-# A store carries a schema version. When the STORE is newer than the binary,
-# every command refuses rather than touch it. When the store is OLDER, a read
-# command migrates it and says so on stderr — that migration also rewrites
-# memory entries and prior clusters, so back the store up first if it matters.
-# `root=\"*\"` does not migrate: it names the stores it skipped, and `mdkb repos refresh
-# --only outdated` migrates them all, each after a verified backup copy.
-"
-            );
+            print!("{}", mdkb::cli::cheatsheet::render());
             if let Some(exe) = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from))
@@ -1558,9 +1543,17 @@ root=\"scope:home\"                                       # the known repos whos
             use clap::CommandFactory;
             let root = Cli::command();
             let target = match command {
-                Some(ref name) => root
-                    .find_subcommand(name)
-                    .ok_or_else(|| mdkb::Error::other(format!("Unknown command: {name}")))?,
+                Some(ref name) => root.find_subcommand(name).ok_or_else(|| {
+                    let names: Vec<&str> = root
+                        .get_subcommands()
+                        .filter(|s| !s.is_hide_set())
+                        .map(|s| s.get_name())
+                        .collect();
+                    mdkb::Error::usage(
+                        format!("unknown command '{name}'; commands: {}", names.join(", ")),
+                        "mdkb --help",
+                    )
+                })?,
                 None => &root,
             };
             println!(
@@ -1569,39 +1562,26 @@ root=\"scope:home\"                                       # the known repos whos
             );
         }
         Command::Code(cmd) => match cmd {
-            CodeCommand::Init => {
-                mdkb::cli::handlers::handle_code_init(&cwd)?;
-                println!("Initialized code index at .mdkb/code.sqlite");
+            CodeCommand::Init(a) => {
+                return Err(mdkb::cli::retired(
+                    "code init",
+                    &mdkb::cli::consolidated_replacement("code init", &a.args),
+                ));
             }
-            CodeCommand::Index { paths, force } => {
-                let stats = if force {
-                    mdkb::cli::handlers::handle_code_reindex(&cwd, &paths)?
-                } else {
-                    mdkb::cli::handlers::handle_code_index(&cwd, &paths)?
-                };
-                format_code_index_stats(&stats, cli.format);
+            CodeCommand::Index(a) => {
+                return Err(mdkb::cli::retired(
+                    "code index",
+                    &mdkb::cli::consolidated_replacement("code index", &a.args),
+                ));
             }
-            CodeCommand::Search { query, limit, kind } => {
-                let found =
-                    mdkb::cli::handlers::handle_code_search(&cwd, &query, limit, kind.as_deref())?;
-                format_code_symbols(&found.symbols, cli.format);
-                report_find_truncation(&found);
+            CodeCommand::Search(args) => {
+                run_code_search(args, false, &cwd, cli.format).await?;
             }
-            CodeCommand::Find {
-                name,
-                kind,
-                file,
-                limit,
-            } => {
-                let found = mdkb::cli::handlers::handle_code_find(
-                    &cwd,
-                    &name,
-                    kind.as_deref(),
-                    file.as_deref(),
-                    limit,
-                )?;
-                format_code_symbols(&found.symbols, cli.format);
-                report_find_truncation(&found);
+            CodeCommand::Find(args) => {
+                run_code_search(args, true, &cwd, cli.format).await?;
+            }
+            CodeCommand::Grep(args) => {
+                run_code_grep(args, &cwd, cli.format).await?;
             }
             CodeCommand::Calls { name } => {
                 let (source, callees, unplaced) =
@@ -1619,9 +1599,51 @@ root=\"scope:home\"                                       # the known repos whos
                 let (source, report) = mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
                 format_code_impact(&source, &report, cli.format);
             }
-            CodeCommand::Info => {
-                let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
-                format_code_info(&info, cli.format);
+            CodeCommand::Info(a) => {
+                return Err(mdkb::cli::retired(
+                    "code info",
+                    &mdkb::cli::consolidated_replacement("code info", &a.args),
+                ));
+            }
+            CodeCommand::Dup {
+                semantic,
+                threshold,
+                min_nodes,
+                file,
+                since,
+            } => {
+                // Read-only, and tolerant of a repository nobody has indexed: the
+                // report says so and exits 0. An audit that has nothing to audit is
+                // not a failure.
+                let ctx = open_reader(&cwd)?;
+                let report = run_dup(
+                    &cwd,
+                    Some(&ctx.conn),
+                    &ctx.config_path,
+                    &mdkb::core::dup::DupOverrides {
+                        semantic,
+                        threshold,
+                        min_nodes,
+                        file,
+                        since,
+                    },
+                )?;
+                print!("{}", render_dup(&report, cli.format));
+            }
+            CodeCommand::Coupling {
+                min_cochanges,
+                since,
+                git_ref,
+            } => {
+                // Read-only, and tolerant the same way `dup` is: a repository with
+                // no index, or no history to read, is reported and exits 0.
+                let overrides = mdkb::core::coupling::CouplingOverrides {
+                    min_cochanges,
+                    since,
+                    git_ref,
+                };
+                let report = mdkb::core::coupling::handle_coupling(&cwd, &overrides)?;
+                print!("{}", render_coupling(&report, cli.format));
             }
             CodeCommand::Parse { file } => {
                 let symbols = mdkb::cli::handlers::handle_code_parse(std::path::Path::new(&file))?;
@@ -1770,86 +1792,35 @@ root=\"scope:home\"                                       # the known repos whos
                     }
                 }
             },
-            SetupCommand::Check => {
-                use mdkb::cli::setup::DistillerCheck;
-
-                let hooks = mdkb::cli::setup::check_hooks(&cwd)?;
-                println!("Claude hooks: user {}", hooks.user_path.display());
-                println!("              local {}", hooks.local_path.display());
-                if hooks.drift.is_clean() {
-                    println!("  OK — every lifecycle event is registered exactly once");
-                } else {
-                    if !hooks.drift.missing.is_empty() {
-                        eprintln!(
-                            "  MISSING: {} — these events never fire; run: mdkb setup hooks claude",
-                            hooks.drift.missing.join(", ")
-                        );
-                    }
-                    if !hooks.drift.duplicated.is_empty() {
-                        eprintln!(
-                            "  DUPLICATED: {} — these events fire twice per turn",
-                            hooks.drift.duplicated.join(", ")
-                        );
-                    }
-                }
-
-                let distiller_failure = match mdkb::cli::setup::check_distiller(&cwd) {
-                    DistillerCheck::NotConfigured(reason) => {
-                        println!("Prior distiller: not configured ({reason})");
-                        None
-                    }
-                    DistillerCheck::Pass { program, lesson } => {
-                        println!("Prior distiller: OK ({program})");
-                        println!("  distilled: {lesson}");
-                        None
-                    }
-                    DistillerCheck::Fail { program, detail } => {
-                        eprintln!("Prior distiller: FAILED ({program})");
-                        eprintln!("  {detail}");
-                        Some(format!("{program}: {detail}"))
-                    }
-                };
-
-                // The doctor registry is the one place that decides what counts
-                // as an error; this command reuses that judgment instead of a
-                // second, parallel notion of "failed" so the two never drift
-                // apart. Non-zero exit: this command exists to be run from a
-                // script or a setup checklist, and a check that reports failure
-                // on stdout while exiting 0 is a check nobody notices.
-                let facts = mdkb::domain::doctor::Facts {
-                    hooks_missing: hooks.drift.missing,
-                    hooks_duplicated: hooks.drift.duplicated,
-                    distiller_failure,
-                    ..mdkb::domain::doctor::Facts::default()
-                };
-                if mdkb::cli::doctor::has_errors(&mdkb::domain::doctor::findings(&facts)) {
-                    std::process::exit(1);
-                }
+            SetupCommand::Check(a) => {
+                return Err(mdkb::cli::retired(
+                    "setup check",
+                    &mdkb::cli::consolidated_replacement("setup check", &a.args),
+                ));
             }
         },
-        Command::Session(cmd) => match cmd {
-            SessionCommand::Index {
-                sessions_path,
-                project_root,
-            } => {
-                let ctx = open_writer(&cwd)?;
-                let sessions_base = match sessions_path {
-                    Some(p) => std::path::PathBuf::from(p),
-                    None => mdkb::daemon::config::home_dir()?.join(".claude/projects"),
-                };
-                let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
-                let result = handle_session_index(&ctx, &sessions_base, &root)?;
-                format_update_result(&result, cli.format);
-            }
-        },
+        Command::Session(a) => {
+            return Err(mdkb::cli::retired(
+                "session",
+                &mdkb::cli::consolidated_replacement("session", &a.args),
+            ));
+        }
         Command::Daemon(cmd) => match cmd {
-            DaemonCommand::Status => daemon_cli::handle_status().await?,
+            DaemonCommand::Status(a) => {
+                return Err(mdkb::cli::retired(
+                    "daemon status",
+                    &mdkb::cli::consolidated_replacement("daemon status", &a.args),
+                ));
+            }
             DaemonCommand::Stop => daemon_cli::handle_stop().await?,
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
         Command::Repos(cmd) => match cmd {
             ReposCommand::List => mdkb::cli::repos::handle_list(cli.format).await?,
             ReposCommand::Refresh { only } => mdkb::cli::repos::handle_refresh(only)?,
+            ReposCommand::Prune { paths, dry_run } => {
+                mdkb::cli::repos::handle_prune(paths, dry_run, cli.format).await?
+            }
         },
         Command::Hook(hook_cmd) => match hook_cmd {
             HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,
@@ -1883,8 +1854,8 @@ root=\"scope:home\"                                       # the known repos whos
             HookCommand::MemoryConfirm { id, outcome, root } => {
                 hook_client::call_memory_confirm(id, outcome, root).await?;
             }
-            HookCommand::Status { root } => {
-                hook_client::call_status(root).await?;
+            HookCommand::Status(_) => {
+                return Err(mdkb::cli::retired("hook status", "mdkb doctor"));
             }
         },
     }
@@ -2018,6 +1989,14 @@ async fn run_global_stdio_server(mode_note: &str) -> Result<()> {
     Ok(())
 }
 
+/// Which result groups a `search` returns.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Groups {
+    Both,
+    Docs,
+    Memory,
+}
+
 /// What `mdkb search` was asked, minus where: the same request runs against
 /// one store, or against each store a `--root` names.
 #[derive(Clone)]
@@ -2026,281 +2005,206 @@ struct SearchRequest {
     limit: usize,
     collection: Option<String>,
     include_superseded: bool,
-    scope: Option<String>,
-    kind: Option<String>,
-    file: Option<String>,
+    groups: Groups,
     entry_type: Option<String>,
-    ignore_case: bool,
-    patterns: Vec<String>,
-    regex: bool,
-    path: Option<String>,
-    search_contract: Option<String>,
+    /// The MCP scope name, from the hidden `--scope`. `None` is the plain search.
+    scope: Option<String>,
+    /// Print the `code search` hint on stderr (off for the sessions pass).
+    hint: bool,
+    /// Print a memory-only JSON result as one bare array (`memory search`).
+    bare: bool,
 }
 
-fn run_search(
-    cwd: &Path,
-    ctx: &Context,
-    req: SearchRequest,
-    format: OutputFormat,
-) -> mdkb::error::Result<()> {
-    let SearchRequest {
+/// The flags of `search` and `memory search`, before they become a request.
+struct SearchFlags {
+    docs: bool,
+    memory: bool,
+    limit: usize,
+    collection: Option<String>,
+    include_superseded: bool,
+    entry_type: Option<String>,
+    scope: Option<String>,
+}
+
+/// Build the request. The one place a search query is validated: an empty
+/// query is a usage error naming `help_run`.
+fn search_request(
+    words: Vec<String>,
+    flags: SearchFlags,
+    help_run: &str,
+) -> mdkb::error::Result<SearchRequest> {
+    let query = words.join(" ");
+    // Duplication and coupling are sweeps: what narrows them is a path prefix,
+    // so an empty query is their ordinary case.
+    let sweep = matches!(flags.scope.as_deref(), Some("duplicates" | "coupling"));
+    if query.trim().is_empty() && !sweep {
+        return Err(mdkb::Error::usage("the search query is empty", help_run));
+    }
+    let groups = if flags.docs {
+        Groups::Docs
+    } else if flags.memory || flags.entry_type.is_some() {
+        Groups::Memory
+    } else {
+        Groups::Both
+    };
+    Ok(SearchRequest {
         query,
-        limit,
-        collection,
-        include_superseded,
-        scope,
-        kind,
-        file,
-        entry_type,
-        ignore_case,
-        patterns,
-        regex,
-        path,
-        search_contract,
-    } = req;
-    let new_scope = matches!(
-        scope.as_deref(),
-        Some("source" | "literals" | "semantic-code" | "knowledge")
-    );
-    if scope.as_deref() == Some("source") && file.is_some() {
-        return Err(mdkb::Error::other("source uses --path, not legacy --file"));
+        limit: flags.limit,
+        collection: flags.collection,
+        include_superseded: flags.include_superseded,
+        groups,
+        entry_type: flags.entry_type,
+        scope: flags.scope,
+        hint: true,
+        bare: false,
+    })
+}
+
+/// Every MCP scope name the hidden `--scope` accepts.
+const SCOPE_NAMES: &str = "docs, memory, knowledge, source, literals, symbols, semantic-code, code, text, duplicates, coupling";
+
+/// Where an MCP scope name goes on the CLI.
+enum ScopeRoute {
+    /// `code grep`, or `code grep --literals`.
+    Grep {
+        literals: bool,
+    },
+    /// `code search`.
+    Symbols,
+    /// `code search --semantic`.
+    Semantic,
+    /// The indexed literal table, as `text` and `strings` always meant.
+    Text,
+    /// The pre-091 `knowledge` envelope `{scope, hits, ...}` that MCP and the
+    /// Wiz bridge read: one shared limit, docs first.
+    Knowledge,
+    /// `search`, with these groups. `bare` keeps the one-array JSON that
+    /// `--scope docs` and `--scope memory` printed, which Wiz parses.
+    Groups {
+        groups: Groups,
+        bare: bool,
+    },
+    Duplicates,
+    Coupling,
+}
+
+fn scope_route(scope: &str, query: &str) -> mdkb::error::Result<ScopeRoute> {
+    Ok(match scope {
+        "source" => ScopeRoute::Grep { literals: false },
+        "literals" => ScopeRoute::Grep { literals: true },
+        "symbols" => ScopeRoute::Symbols,
+        "semantic-code" | "code" => ScopeRoute::Semantic,
+        "text" | "strings" => ScopeRoute::Text,
+        "docs" => ScopeRoute::Groups {
+            groups: Groups::Docs,
+            bare: true,
+        },
+        "memory" => ScopeRoute::Groups {
+            groups: Groups::Memory,
+            bare: true,
+        },
+        "knowledge" => ScopeRoute::Knowledge,
+        "duplicates" => ScopeRoute::Duplicates,
+        "coupling" => ScopeRoute::Coupling,
+        other => {
+            return Err(mdkb::Error::usage(
+                format!("unknown --scope '{other}'; valid: {SCOPE_NAMES}"),
+                mdkb::cli::usage_errors::command_line(&["search", query]),
+            ));
+        }
+    })
+}
+
+/// True when `query` looks like a code identifier: `snake_case`, `CamelCase`,
+/// `a::b`, `a.b(`.
+fn looks_like_identifier(query: &str) -> bool {
+    let q = query.trim();
+    if q.is_empty() || q.chars().any(char::is_whitespace) {
+        return false;
     }
-    if path.is_some() && !matches!(scope.as_deref(), Some("source" | "literals" | "symbols")) {
-        return Err(mdkb::Error::other(
-            "--path is available only for source, literals, and symbols",
-        ));
-    }
-    if file.is_some() && path.is_some() {
-        return Err(mdkb::Error::other(
-            "choose --path or legacy --file, not both",
-        ));
-    }
-    if regex && scope.as_deref() != Some("source") {
-        return Err(mdkb::Error::other(
-            "--regex is available only for --scope source",
-        ));
-    }
-    if !patterns.is_empty()
-        && (!query.is_empty() || !matches!(scope.as_deref(), Some("source" | "literals")))
+    if !q
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | ':' | '.' | '(' | ')' | '<' | '>'))
     {
-        return Err(mdkb::Error::other(
-            "-e requires source/literals and cannot be combined with QUERY",
-        ));
+        return false;
     }
-    if new_scope && query.is_empty() && patterns.is_empty() {
-        return Err(mdkb::Error::other(
-            "canonical search needs QUERY or repeated -e patterns",
-        ));
+    let camel = q
+        .chars()
+        .zip(q.chars().skip(1))
+        .any(|(a, b)| a.is_ascii_lowercase() && b.is_ascii_uppercase());
+    q.contains('_') || q.contains("::") || q.contains('(') || q.contains('.') || camel
+}
+
+/// The one-line stderr hint toward `code search`, when the query probably names
+/// code: nothing was found, or it is shaped like an identifier.
+fn code_search_hint(query: &str, found: usize) -> Option<String> {
+    let identifier = looks_like_identifier(query);
+    if found > 0 && !identifier {
+        return None;
     }
-    if search_contract.is_some() && !matches!(format, OutputFormat::Json) {
-        return Err(mdkb::Error::other(
-            "--search-contract v2 requires --format json",
-        ));
+    let run = mdkb::cli::usage_errors::command_line(&["code", "search", query]);
+    Some(if found == 0 {
+        format!("no docs/memory hits; for code symbols run: {run}")
+    } else {
+        format!("the query looks like a symbol name; for code symbols run: {run}")
+    })
+}
+
+/// Search the groups a request names and print them. Returns how many hits
+/// each group held. `bare` prints one array for a single group, as the old
+/// `--scope docs|memory` did.
+fn run_groups(
+    ctx: &Context,
+    req: &SearchRequest,
+    groups: Groups,
+    bare: bool,
+    format: OutputFormat,
+) -> mdkb::error::Result<usize> {
+    let documents = if groups == Groups::Memory {
+        Vec::new()
+    } else {
+        handle_hybrid_search(
+            ctx,
+            &req.query,
+            req.limit,
+            req.collection.as_deref(),
+            req.include_superseded,
+        )?
+    };
+    let entries = if groups == Groups::Docs {
+        Vec::new()
+    } else {
+        handle_memory_search(ctx, &req.query, req.limit, req.entry_type.as_deref())?
+    };
+    let found = documents.len() + entries.len();
+    if bare && groups != Groups::Both {
+        if groups == Groups::Docs {
+            format_search_results(&documents, format);
+        } else {
+            format_memory_list(&entries, format);
+        }
+        return Ok(found);
     }
-    match scope.as_deref() {
-        Some("source") => {
-            let alternatives = if patterns.is_empty() {
-                vec![query.clone()]
-            } else {
-                patterns
-            };
-            let result = mdkb::core::source_search::search(
-                cwd,
-                mdkb::core::source_search::SourceRequest {
-                    patterns: &alternatives,
-                    path: path.as_deref(),
-                    regex,
-                    ignore_case,
-                    limit,
-                },
-            )?;
-            if matches!(format, OutputFormat::Json) {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                for hit in &result.hits {
-                    println!("{}:{}:{}: {}", hit.file, hit.line, hit.column, hit.content);
-                }
-                println!(
-                    "{} source-line hits; coverage: {} ({} files scanned, {} bytes); truncated: {}",
-                    result.hits.len(),
-                    result.status,
-                    result.coverage.files_scanned,
-                    result.coverage.bytes_scanned,
-                    result.truncated
-                );
-                for failure in &result.coverage.failed_files {
-                    eprintln!("source scan partial: {failure}");
-                }
-            }
-        }
-        Some("literals") => {
-            let alternatives = if patterns.is_empty() {
-                vec![query.clone()]
-            } else {
-                patterns
-            };
-            let result = mdkb::core::text_search::search_canonical(
-                cwd,
-                &alternatives,
-                ignore_case,
-                path.as_deref(),
-                limit,
-            )?;
-            if matches!(format, OutputFormat::Json) {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                for hit in &result.hits {
-                    println!(
-                        "{}:{}:{}: {}",
-                        hit.location.file,
-                        hit.location.line,
-                        hit.location.column,
-                        hit.location.content.replace(['\n', '\r'], " ")
-                    );
-                }
-                println!(
-                    "{} indexed literal hits; coverage: {}; freshness: {}; truncated: {}",
-                    result.hits.len(),
-                    result.status,
-                    result.freshness.state,
-                    result.truncated
-                );
-                for stale in &result.coverage.stale_files {
-                    eprintln!("literal index not current: {stale}");
-                }
-            }
-        }
-        Some("text" | "strings") => {
-            let result =
-                mdkb::core::text_search::search(cwd, &query, ignore_case, file.as_deref(), limit)?
-                    .ok_or_else(|| {
-                        mdkb::Error::other(
-                            "Literal index not available; run `mdkb code index` first",
-                        )
-                    })?;
-            format_text_results(&result, format);
-        }
-        Some("docs") => {
-            let results = handle_hybrid_search(
-                ctx,
-                &query,
-                if search_contract.is_some() {
-                    limit.saturating_add(1)
-                } else {
-                    limit
-                },
-                collection.as_deref(),
-                include_superseded,
-            )?;
-            if search_contract.as_deref() == Some("v2") {
-                print_indexed_search_envelope("docs", "document", &results, limit, results.len())?;
-            } else {
-                format_search_results(&results, format);
-            }
-        }
-        Some("memory") => {
-            let entries = handle_memory_search(
-                ctx,
-                &query,
-                if search_contract.is_some() {
-                    limit.saturating_add(1)
-                } else {
-                    limit
-                },
-                entry_type.as_deref(),
-            )?;
-            if search_contract.as_deref() == Some("v2") {
-                print_indexed_search_envelope(
-                    "memory",
-                    "memory_entry",
-                    &entries,
-                    limit,
-                    entries.len(),
-                )?;
-            } else {
-                format_memory_list(&entries, format);
-            }
-        }
-        Some("knowledge") => {
-            let documents = handle_hybrid_search(
-                ctx,
-                &query,
-                limit.saturating_add(1),
-                collection.as_deref(),
-                include_superseded,
-            )?;
-            let memories =
-                handle_memory_search(ctx, &query, limit.saturating_add(1), entry_type.as_deref())?;
-            let truncated = documents.len().saturating_add(memories.len()) > limit;
-            let doc_count = documents.len().min(limit);
-            let mem_count = memories.len().min(limit.saturating_sub(doc_count));
-            if matches!(format, OutputFormat::Json) {
-                let hits: Vec<_> = documents
-                    .iter()
-                    .take(doc_count)
-                    .map(|doc| serde_json::json!({"corpus": "docs", "value": doc}))
-                    .chain(
-                        memories
-                            .iter()
-                            .take(mem_count)
-                            .map(|entry| serde_json::json!({"corpus": "memory", "value": entry})),
-                    )
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "scope": "knowledge", "unit": "knowledge_result", "status": "partial",
-                        "coverage": {"reason": "indexed corpus freshness not verified"},
-                        "freshness": {"state": "unknown"}, "hits": hits, "truncated": truncated
-                    }))?
-                );
-            } else {
-                format_search_results(&documents[..doc_count], format);
-                format_memory_list(&memories[..mem_count], format);
-                println!(
-                    "Knowledge corpus: indexed docs + memory; freshness unknown; truncated: {truncated}"
-                );
-            }
-        }
-        None => {
-            let literals = if collection.is_none() {
-                mdkb::core::text_search::search(cwd, &query, ignore_case, file.as_deref(), limit)?
-            } else {
-                None
-            };
-            // Default: search docs + memory + indexed literals
-            let results = handle_hybrid_search(
-                ctx,
-                &query,
-                limit,
-                collection.as_deref(),
-                include_superseded,
-            )?;
-            // `--entry-type` narrows the memory half here too: the flag
-            // describes the memory corpus, not the scope it was asked
-            // for, and it used to be dropped silently without `--scope`.
-            let entries = handle_memory_search(ctx, &query, limit, entry_type.as_deref())?;
-            // One JSON document, not two arrays under markdown headings:
-            // a consumer parsing stdout must never see anything else.
-            if matches!(format, OutputFormat::Json) {
-                let out = serde_json::json!({
-                    "documents": results,
-                    "memory": entries,
-                    "text": literals,
-                });
-                println!("{}", serde_json::to_string_pretty(&out)?);
-                return Ok(());
-            }
-            // The headings label two sections for a human reader. CSV is
-            // read by a program: a markdown heading in that stream is
-            // noise, and the two tables stay told apart by their header
-            // rows.
+    // One JSON document with both keys, whatever was searched: a group that was
+    // not searched is an empty list, so a parser never meets a missing key.
+    if matches!(format, OutputFormat::Json) {
+        let out = serde_json::json!({"documents": documents, "memory": entries});
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(found);
+    }
+    match groups {
+        Groups::Docs => format_search_results(&documents, format),
+        Groups::Memory => format_memory_list(&entries, format),
+        Groups::Both => {
+            // The headings label two sections for a human reader. CSV is read
+            // by a program: a markdown heading in that stream is noise, and the
+            // two tables stay told apart by their header rows.
             let headings = !matches!(format, OutputFormat::Csv);
-            if !results.is_empty() {
+            if !documents.is_empty() {
                 if headings {
                     println!("## Documents\n");
                 }
-                format_search_results(&results, format);
+                format_search_results(&documents, format);
             }
             if !entries.is_empty() {
                 if headings {
@@ -2310,104 +2214,441 @@ fn run_search(
                 }
                 format_memory_list(&entries, format);
             }
-            if let Some(result) = &literals {
-                if !result.hits.is_empty() {
-                    if headings {
-                        println!("## Source literals\n");
-                    }
-                    format_text_results(result, format);
-                }
-            }
-            if results.is_empty()
-                && entries.is_empty()
-                && literals
-                    .as_ref()
-                    .is_none_or(|result| result.hits.is_empty())
-            {
+            if found == 0 {
                 println!("No results found.");
                 if mdkb::store::search::index_is_empty(&ctx.conn)? {
                     println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
                 }
             }
         }
-        Some("code" | "semantic-code") => {
-            let scored = mdkb::cli::handlers::handle_semantic_code_search(
-                cwd,
-                &ctx.config_path,
-                &query,
-                kind.as_deref(),
-                limit,
-            )?;
-            if scope.as_deref() == Some("semantic-code") && matches!(format, OutputFormat::Json) {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "scope": "semantic-code", "unit": "symbol", "status": "partial",
-                        "coverage": {"reason": "semantic ranking is not exhaustive"},
-                        "freshness": {"state": "unknown"}, "truncated": scored.len() == limit,
-                        "hits": scored.iter().map(|(symbol, score)| serde_json::json!({"symbol": symbol, "score": score})).collect::<Vec<_>>()
-                    }))?
-                );
-            } else {
-                format_scored_symbols(&scored, format);
+    }
+    Ok(found)
+}
+
+fn run_search(
+    cwd: &Path,
+    ctx: &Context,
+    req: SearchRequest,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let Some(scope) = req.scope.as_deref() else {
+        let found = run_groups(ctx, &req, req.groups, req.bare, format)?;
+        if req.hint {
+            if let Some(hint) = code_search_hint(&req.query, found) {
+                eprintln!("{hint}");
             }
         }
-        Some("symbols") => {
-            let found = mdkb::cli::handlers::handle_symbol_search(
-                cwd,
-                &query,
-                kind.as_deref(),
-                file.as_deref(),
-                limit,
-            )?;
-            if search_contract.as_deref() == Some("v2") {
-                print_indexed_search_envelope(
-                    "symbols",
-                    "symbol",
-                    &found.symbols,
-                    limit,
-                    found.total,
-                )?;
-            } else {
-                format_code_symbols(&found.symbols, format);
-                report_find_truncation(&found);
-            }
+        return Ok(());
+    };
+    let query = req.query.clone();
+    let alternatives = [query.clone()];
+    match scope_route(scope, &query)? {
+        ScopeRoute::Grep { literals: false } => {
+            run_source_grep(cwd, &alternatives, None, false, false, req.limit, format)
         }
-        Some("duplicates") => {
-            // The query is not a query here: duplication is a sweep,
-            // and what narrows it is `--file`, not words. An empty
-            // query is therefore the ordinary case, not a mistake.
+        ScopeRoute::Grep { literals: true } => {
+            run_literal_grep(cwd, &alternatives, false, None, req.limit, format)
+        }
+        ScopeRoute::Symbols => run_symbol_search(cwd, &query, None, None, req.limit, false, format),
+        ScopeRoute::Semantic => {
+            run_semantic_search(cwd, &ctx.config_path, &query, None, req.limit, format)
+        }
+        ScopeRoute::Text => {
+            let result = mdkb::core::text_search::search(cwd, &query, false, None, req.limit)?
+                .ok_or_else(|| {
+                    mdkb::Error::other(
+                        "Literal index not available; run `mdkb update --code` first",
+                    )
+                })?;
+            format_text_results(&result, format);
+            Ok(())
+        }
+        ScopeRoute::Groups { groups, bare } => {
+            run_groups(ctx, &req, groups, bare, format).map(|_| ())
+        }
+        ScopeRoute::Knowledge => run_legacy_knowledge(ctx, &req, format),
+        ScopeRoute::Duplicates => {
+            // The query is not a query here: duplication is a sweep, and what
+            // narrows it is a path prefix, so the query is read as one.
             let report = run_dup(
                 cwd,
                 Some(&ctx.conn),
                 &ctx.config_path,
                 &mdkb::core::dup::DupOverrides {
-                    file: file
-                        .clone()
-                        .or_else(|| (!query.is_empty()).then(|| query.clone())),
+                    file: (!query.trim().is_empty()).then_some(query),
                     ..Default::default()
                 },
             )?;
             print!("{}", report.markdown);
+            Ok(())
         }
-        Some("coupling") => {
-            // Same shape as `duplicates` above: a sweep, not a query,
-            // so there is nothing to pass the query text to.
+        ScopeRoute::Coupling => {
             let report = mdkb::core::coupling::handle_coupling(
                 cwd,
                 &mdkb::core::coupling::CouplingOverrides::default(),
             )?;
             print!("{}", report.markdown);
+            Ok(())
         }
-        Some(invalid) => {
-            eprintln!(
-                "Invalid scope: '{}'. Valid values: docs, memory, code, symbols, text, duplicates, coupling. Omit for docs+memory.",
-                invalid
-            );
-            std::process::exit(1);
+    }
+}
+
+/// `--scope knowledge`, as it was before story 091: one shared limit with the
+/// documents first, and the `{scope, unit, hits, ...}` envelope. Kept for MCP
+/// and Wiz callers that read that shape.
+fn run_legacy_knowledge(
+    ctx: &Context,
+    req: &SearchRequest,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let limit = req.limit;
+    let documents = handle_hybrid_search(
+        ctx,
+        &req.query,
+        limit.saturating_add(1),
+        req.collection.as_deref(),
+        req.include_superseded,
+    )?;
+    let memories = handle_memory_search(
+        ctx,
+        &req.query,
+        limit.saturating_add(1),
+        req.entry_type.as_deref(),
+    )?;
+    let (doc_count, mem_count, truncated) =
+        mdkb::core::search_contract::knowledge_counts(documents.len(), memories.len(), limit);
+    if matches!(format, OutputFormat::Json) {
+        let hits: Vec<_> = documents
+            .iter()
+            .take(doc_count)
+            .map(|doc| serde_json::json!({"corpus": "docs", "value": doc}))
+            .chain(
+                memories
+                    .iter()
+                    .take(mem_count)
+                    .map(|entry| serde_json::json!({"corpus": "memory", "value": entry})),
+            )
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "scope": "knowledge", "unit": "knowledge_result", "status": "partial",
+                "coverage": {"reason": "indexed corpus freshness not verified"},
+                "freshness": {"state": "unknown"}, "hits": hits, "truncated": truncated
+            }))?
+        );
+    } else {
+        format_search_results(&documents[..doc_count], format);
+        format_memory_list(&memories[..mem_count], format);
+        println!(
+            "Knowledge corpus: indexed docs + memory; freshness unknown; truncated: {truncated}"
+        );
+    }
+    Ok(())
+}
+
+/// Live source lines: `code grep`.
+fn run_source_grep(
+    cwd: &Path,
+    alternatives: &[String],
+    path: Option<&str>,
+    regex: bool,
+    ignore_case: bool,
+    limit: usize,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let result = mdkb::core::source_search::search(
+        cwd,
+        mdkb::core::source_search::SourceRequest {
+            patterns: alternatives,
+            path,
+            regex,
+            ignore_case,
+            limit,
+        },
+    )?;
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        for hit in &result.hits {
+            println!("{}:{}:{}: {}", hit.file, hit.line, hit.column, hit.content);
+        }
+        println!(
+            "{} source-line hits; coverage: {} ({} files scanned, {} bytes); truncated: {}",
+            result.hits.len(),
+            result.status,
+            result.coverage.files_scanned,
+            result.coverage.bytes_scanned,
+            result.truncated
+        );
+        for failure in &result.coverage.failed_files {
+            eprintln!("source scan partial: {failure}");
         }
     }
     Ok(())
+}
+
+/// Indexed AST literal values: `code grep --literals`.
+fn run_literal_grep(
+    cwd: &Path,
+    alternatives: &[String],
+    ignore_case: bool,
+    path: Option<&str>,
+    limit: usize,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let result =
+        mdkb::core::text_search::search_canonical(cwd, alternatives, ignore_case, path, limit)?;
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        for hit in &result.hits {
+            println!(
+                "{}:{}:{}: {}",
+                hit.location.file,
+                hit.location.line,
+                hit.location.column,
+                hit.location.content.replace(['\n', '\r'], " ")
+            );
+        }
+        println!(
+            "{} indexed literal hits; coverage: {}; freshness: {}; truncated: {}",
+            result.hits.len(),
+            result.status,
+            result.freshness.state,
+            result.truncated
+        );
+        for stale in &result.coverage.stale_files {
+            eprintln!("literal index not current: {stale}");
+        }
+    }
+    Ok(())
+}
+
+/// Symbols by name: `code search`, and `code find` with `exact`.
+fn run_symbol_search(
+    cwd: &Path,
+    query: &str,
+    kind: Option<&str>,
+    path: Option<&str>,
+    limit: usize,
+    exact: bool,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let found = mdkb::cli::handlers::handle_symbol_lookup(cwd, query, kind, path, limit, exact)?;
+    format_code_symbols(&found.symbols, format);
+    report_find_truncation(&found);
+    Ok(())
+}
+
+/// Symbols by meaning: `code search --semantic`.
+fn run_semantic_search(
+    cwd: &Path,
+    config_path: &Path,
+    query: &str,
+    kind: Option<&str>,
+    limit: usize,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let scored =
+        mdkb::cli::handlers::handle_semantic_code_search(cwd, config_path, query, kind, limit)?;
+    format_scored_symbols(&scored, format);
+    Ok(())
+}
+
+/// `code search` and its hidden alias `code find` (`force_exact`).
+async fn run_code_search(
+    args: mdkb::cli::CodeSearchArgs,
+    force_exact: bool,
+    cwd: &Path,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let query = args.name.join(" ");
+    let exact = force_exact || args.exact;
+    if let Some(file) = args.file.as_deref() {
+        // `--file` matched a substring and `--path` matches a prefix, so the
+        // value only carries over when it already is one.
+        let prefix = file.contains('/').then_some(file);
+        let mut tokens: Vec<String> = ["code", "search", query.as_str()]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if exact {
+            tokens.push("--exact".into());
+        }
+        if let Some(kind) = &args.kind {
+            tokens.extend(["-k".into(), kind.clone()]);
+        }
+        if let Some(prefix) = prefix {
+            tokens.extend(["--path".into(), prefix.to_string()]);
+        }
+        let message = if prefix.is_some() {
+            "--file was replaced by --path, a path prefix".to_string()
+        } else {
+            format!(
+                "--file was replaced by --path, which takes a path prefix such as src/cli; '{file}' is not one"
+            )
+        };
+        return Err(mdkb::Error::usage(
+            message,
+            mdkb::cli::usage_errors::command_line(&tokens),
+        ));
+    }
+    let repo = cwd.to_path_buf();
+    if args.semantic {
+        let config_path = repo.join(".mdkb").join("config.toml");
+        return run_semantic_search(
+            &repo,
+            &config_path,
+            &query,
+            args.kind.as_deref(),
+            args.limit,
+            format,
+        );
+    }
+    run_symbol_search(
+        &repo,
+        &query,
+        args.kind.as_deref(),
+        args.path.as_deref(),
+        args.limit,
+        exact,
+        format,
+    )
+}
+
+/// `code grep`.
+async fn run_code_grep(
+    args: mdkb::cli::CodeGrepArgs,
+    cwd: &Path,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    let mut alternatives = Vec::new();
+    if !args.pattern.is_empty() {
+        alternatives.push(args.pattern.join(" "));
+    }
+    alternatives.extend(args.patterns.iter().cloned());
+    if alternatives.len() > 64 || alternatives.iter().any(|p| p.trim().is_empty()) {
+        return Err(mdkb::Error::usage(
+            "code grep needs 1 to 64 non-empty patterns",
+            "mdkb code grep --help",
+        ));
+    }
+    let repo = cwd.to_path_buf();
+    if args.literals {
+        run_literal_grep(
+            &repo,
+            &alternatives,
+            args.ignore_case,
+            args.path.as_deref(),
+            args.limit,
+            format,
+        )
+    } else {
+        run_source_grep(
+            &repo,
+            &alternatives,
+            args.path.as_deref(),
+            args.regex,
+            args.ignore_case,
+            args.limit,
+            format,
+        )
+    }
+}
+
+/// `search` and `memory search`: this repository, or each one `--root` names.
+async fn run_knowledge_search(
+    cwd: &Path,
+    root: Option<String>,
+    req: SearchRequest,
+    format: OutputFormat,
+) -> mdkb::error::Result<()> {
+    if let Some(raw_root) = root {
+        run_search_roots(&raw_root, req, format).await
+    } else {
+        let ctx = open_reader(cwd)?;
+        announce_no_collections(&ctx)?;
+        if let Some(name) = req.collection.as_deref() {
+            require_collection(&ctx, name)?;
+        }
+        run_search(cwd, &ctx, req, format)
+    }
+}
+
+/// Resolve a `--root` selector that must name exactly one repository.
+async fn single_root(raw: &str) -> mdkb::error::Result<std::path::PathBuf> {
+    let scoped = mdkb::cli::repos::resolve_roots(raw).await?;
+    match scoped.roots.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(mdkb::Error::usage(
+            format!("--root {raw} selects no known repository"),
+            "mdkb repos list",
+        )),
+        many => Err(mdkb::Error::usage(
+            format!(
+                "--root {raw} selects {} repositories; only search fans out. Name one",
+                many.len()
+            ),
+            "mdkb repos list",
+        )),
+    }
+}
+
+fn parse_memory_relation(
+    relation: Option<&str>,
+) -> mdkb::error::Result<Option<mdkb::store::memory_graph::MemoryRelation>> {
+    relation
+        .map(|r| r.parse().map_err(mdkb::Error::other))
+        .transpose()
+}
+
+fn format_memory_edges(edges: &[mdkb::store::memory_graph::MemoryEdge], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(edges).unwrap()),
+        OutputFormat::Csv => {
+            println!("source,relation,target,target_kind");
+            for e in edges {
+                println!(
+                    "{},{},{},{}",
+                    e.source_id, e.relation, e.target_ref, e.target_kind
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if edges.is_empty() {
+                println!("No edges found.");
+            }
+            for e in edges {
+                println!(
+                    "  {} --{}--> {} ({})",
+                    e.source_id, e.relation, e.target_ref, e.target_kind
+                );
+            }
+        }
+    }
+}
+
+/// The `search` command line for one repository, for an error to suggest.
+fn search_run_line(req: &SearchRequest, root: &str, format: OutputFormat) -> String {
+    let mut tokens: Vec<String> = vec!["search".into(), req.query.clone()];
+    match req.groups {
+        Groups::Docs => tokens.push("--docs".into()),
+        Groups::Memory => tokens.push("--memory".into()),
+        Groups::Both => {}
+    }
+    if let Some(name) = &req.collection {
+        tokens.extend(["-c".into(), name.clone()]);
+    }
+    if let Some(entry_type) = &req.entry_type {
+        tokens.extend(["--entry-type".into(), entry_type.clone()]);
+    }
+    tokens.extend(["--limit".into(), req.limit.to_string()]);
+    tokens.extend(["--root".into(), root.to_string()]);
+    if matches!(format, OutputFormat::Json) {
+        tokens.extend(["--format".into(), "json".into()]);
+    }
+    mdkb::cli::usage_errors::command_line(&tokens)
 }
 
 /// `mdkb search --root`: the request against every store the selector names,
@@ -2431,143 +2672,50 @@ async fn run_search_roots(
     // human formats can carry.
     let sessions_pass = include_sessions
         && req.collection.is_none()
+        && req.groups != Groups::Memory
         && matches!(req.scope.as_deref(), None | Some("docs"));
+    let first = roots
+        .first()
+        .map_or_else(|| raw_root.to_string(), |p| p.display().to_string());
     if sessions_pass && !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-        return Err(mdkb::Error::other(format!(
-            "--root {raw_root} includes claude_sessions as a second table; use --format text or markdown."
-        )));
+        return Err(mdkb::Error::usage(
+            format!(
+                "--root {raw_root} includes claude_sessions as a second table, which only text and markdown carry"
+            ),
+            search_run_line(&req, &first, OutputFormat::Text),
+        ));
     }
     let several = roots.len() > 1;
-    if several && req.scope.as_deref() == Some("literals") {
-        if matches!(format, OutputFormat::Csv) {
-            return Err(mdkb::Error::other(
-                "multi-root literals support --format json, text, or markdown, not csv",
-            ));
-        }
-        let alternatives = if req.patterns.is_empty() {
-            vec![req.query.clone()]
-        } else {
-            req.patterns.clone()
-        };
-        let outcomes = roots
-            .iter()
-            .map(|root| {
-                let result = open_reader(root)
-                    .and_then(|_| {
-                        mdkb::core::text_search::search_canonical(
-                            root,
-                            &alternatives,
-                            req.ignore_case,
-                            req.path.as_deref(),
-                            req.limit,
-                        )
-                    })
-                    .map_err(|error| error.to_string());
-                (root.clone(), result)
-            })
-            .collect();
-        let result =
-            mdkb::core::text_search::aggregate_canonical_roots(outcomes, excluded, req.limit);
-        if matches!(format, OutputFormat::Json) {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            for hit in result["hits"].as_array().into_iter().flatten() {
-                println!(
-                    "{}:{}:{}:{}: {}",
-                    hit["repo"].as_str().unwrap_or("?"),
-                    hit["file"].as_str().unwrap_or("?"),
-                    hit["line"],
-                    hit["column"],
-                    hit["content"]
-                        .as_str()
-                        .unwrap_or("?")
-                        .replace(['\n', '\r'], " ")
-                );
-            }
-            println!(
-                "Literal corpus: {} (freshness {}); truncated: {}",
-                result["status"].as_str().unwrap_or("unknown"),
-                result["freshness"]["state"].as_str().unwrap_or("unknown"),
-                result["truncated"].as_bool().unwrap_or(false)
-            );
-            for root in result["coverage"]["roots"].as_array().into_iter().flatten() {
-                println!(
-                    "{}: {}",
-                    root["root"].as_str().unwrap_or("?"),
-                    root["status"].as_str().unwrap_or("unavailable")
-                );
-            }
-        }
-        return Ok(());
-    }
-    if several
-        && (req.scope.as_deref() == Some("knowledge")
-            || (req.search_contract.as_deref() == Some("v2")
-                && matches!(req.scope.as_deref(), Some("docs" | "memory"))))
-    {
-        if matches!(format, OutputFormat::Csv) {
-            return Err(mdkb::Error::other(
-                "canonical multi-root indexed search does not support csv",
-            ));
-        }
-        if req.search_contract.is_some() && !matches!(format, OutputFormat::Json) {
-            return Err(mdkb::Error::other(
-                "--search-contract v2 requires --format json",
-            ));
-        }
-        let result = mdkb::core::search_contract::search_indexed_roots(
-            &roots,
-            excluded,
-            req.scope.as_deref().unwrap_or_default(),
-            &req.query,
-            req.limit,
-            req.collection.as_deref(),
-            req.include_superseded,
-            req.entry_type.as_deref(),
-            None,
-            |root| open_reader(root).map_err(|error| error.to_string()),
-        );
-        if matches!(format, OutputFormat::Json) {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            for hit in result["hits"].as_array().into_iter().flatten() {
-                println!("{}: {}", hit["repo"].as_str().unwrap_or("?"), hit["value"]);
-            }
-            println!(
-                "{} corpus: {}; freshness: unknown; truncated: {}",
-                req.scope.as_deref().unwrap_or_default(),
-                result["status"].as_str().unwrap_or("unavailable"),
-                result["truncated"].as_bool().unwrap_or(false)
-            );
-            for root in result["coverage"]["roots"].as_array().into_iter().flatten() {
-                println!(
-                    "{}: {}",
-                    root["root"].as_str().unwrap_or("?"),
-                    root["status"].as_str().unwrap_or("unavailable")
-                );
-            }
-        }
-        return Ok(());
-    }
     if several {
         let single_store_scope = req.scope.as_deref().is_some_and(|s| {
             matches!(s, "coupling" | "source" | "semantic-code")
                 || SearchScope::try_from(s).is_ok_and(|scope| !scope.fans_out())
         });
         if single_store_scope {
-            return Err(mdkb::Error::other(format!(
-                "--root {raw_root} names {} repos, and --scope {} cannot span repos. Name one \
-                 repo, or search docs and memory.",
-                roots.len(),
-                req.scope.as_deref().unwrap_or_default()
-            )));
+            return Err(mdkb::Error::usage(
+                format!(
+                    "--root {raw_root} names {} repos, and --scope {} cannot span repos",
+                    roots.len(),
+                    req.scope.as_deref().unwrap_or_default()
+                ),
+                search_run_line(
+                    &SearchRequest {
+                        scope: None,
+                        ..req.clone()
+                    },
+                    &first,
+                    format,
+                ),
+            ));
         }
         if !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-            return Err(mdkb::Error::other(format!(
-                "--root {raw_root} names {} repos; --format json and csv print one repo. \
-                 Name one repo.",
-                roots.len()
-            )));
+            return Err(mdkb::Error::usage(
+                format!(
+                    "--root {raw_root} names {} repos; --format json and csv print one repo",
+                    roots.len()
+                ),
+                search_run_line(&req, &first, format),
+            ));
         }
     }
     for root in &roots {
@@ -2580,7 +2728,8 @@ async fn run_search_roots(
         if sessions_pass {
             let sessions = SearchRequest {
                 collection: Some(mdkb::domain::COLLECTION_CLAUDE_SESSIONS.to_string()),
-                scope: Some("docs".to_string()),
+                groups: Groups::Docs,
+                hint: false,
                 ..req.clone()
             };
             run_search(root, &ctx, sessions, format)?;
@@ -2589,26 +2738,6 @@ async fn run_search_roots(
     if excluded > 0 {
         eprintln!("Excluded by scope: {excluded} (--root '*:all' mixes scopes)");
     }
-    Ok(())
-}
-
-fn print_indexed_search_envelope<T: serde::Serialize>(
-    scope: &str,
-    unit: &str,
-    hits: &[T],
-    limit: usize,
-    matched_count: usize,
-) -> mdkb::error::Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&mdkb::core::search_contract::indexed_envelope(
-            scope,
-            unit,
-            hits,
-            limit,
-            matched_count
-        ))?
-    );
     Ok(())
 }
 
@@ -2685,10 +2814,14 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
             } else {
                 for r in results {
                     let title = r.title.as_deref().unwrap_or("(untitled)");
-                    println!(
-                        "[{}] {}:{} - {} (score: {:.2})",
-                        r.id, r.collection, r.path, title, r.score
-                    );
+                    if let Some(source) = mdkb::store::external::source(&r.collection) {
+                        println!("[{}] {} - {} (score: {:.2})", r.id, source, title, r.score);
+                    } else {
+                        println!(
+                            "[{}] {}:{} - {} (score: {:.2})",
+                            r.id, r.collection, r.path, title, r.score
+                        );
+                    }
                 }
             }
         }
@@ -2863,7 +2996,7 @@ fn print_routed_result(
     match (command, result) {
         (Command::Update { .. }, R::Update { outcome }) => format_update_outcome(outcome, format)?,
         (
-            Command::Embed { .. },
+            Command::Update { .. },
             R::Embed {
                 generated,
                 skipped,
@@ -2877,6 +3010,12 @@ fn print_routed_result(
             },
             format,
         ),
+        (Command::Update { .. }, R::CodeIndexed { stats }) => {
+            format_code_index_stats(stats, format);
+        }
+        (Command::Update { .. }, R::SessionIndexed { outcome }) => {
+            format_update_result(outcome, format);
+        }
         (
             Command::Compact { export, .. },
             R::Compact {
@@ -2907,15 +3046,13 @@ fn print_routed_result(
         (Command::Collection(CollectionCommand::Add { name, .. }), R::CollectionAdded) => {
             println!("Added collection '{name}'");
         }
-        (
-            Command::Collection(CollectionCommand::Remove { name }),
-            R::CollectionRemoved { removed },
-        ) => {
-            if *removed {
-                println!("Removed collection '{name}'");
-            } else {
-                println!("Collection '{name}' not found");
+        (Command::Collection(CollectionCommand::Rm { name }), R::CollectionRemoved { removed }) => {
+            if !*removed {
+                return Err(
+                    mdkb::error::ErrorKind::CollectionNotFound { name: name.clone() }.into(),
+                );
             }
+            println!("Removed collection '{name}'");
         }
         (
             Command::Collection(CollectionCommand::Rename { old_name, new_name }),
@@ -2948,11 +3085,10 @@ fn print_routed_result(
             R::MemoryLinked,
         ) => println!("Linked {id} --{relation}--> {target}"),
         (Command::Memory(MemoryCommand::Rm { id }), R::MemoryRemoved { deleted }) => {
-            if *deleted {
-                println!("Deleted memory entry '{id}'");
-            } else {
-                println!("Memory entry '{id}' not found");
+            if !*deleted {
+                return Err(mdkb::error::ErrorKind::MemoryNotFound { id: id.clone() }.into());
             }
+            println!("Deleted memory entry '{id}'");
         }
         (Command::Metrics(MetricsCommand::Purge { .. }), R::MetricsPurged { deleted }) => {
             println!("Deleted {deleted} query telemetry event(s)");
@@ -2970,7 +3106,11 @@ fn print_routed_result(
             print_memory_sync_warnings(summary);
         }
         (
-            Command::Memory(MemoryCommand::Import { path, dry_run, .. }),
+            Command::Memory(MemoryCommand::Import {
+                path: Some(path),
+                dry_run,
+                ..
+            }),
             R::MemoryImported { outcome },
         ) => match outcome {
             MemoryImportOutcome::RestoreDryRun => println!("Dry run: would restore {path}"),
@@ -3006,54 +3146,25 @@ fn print_routed_result(
             Command::Memory(MemoryCommand::Condense { dry_run, .. }),
             R::MemoryCondensed { outcome },
         ) => format_condense_result(outcome, *dry_run, format),
-        (Command::Evolve(cmd), R::EvolutionCreated { id }) => match cmd {
-            EvolveCommand::Supersedes { new, old, .. } => {
-                println!("Created evolution relationship #{id}: {new} supersedes {old}");
-            }
-            EvolveCommand::Updates { new, old, .. } => {
-                println!("Created evolution relationship #{id}: {new} updates {old}");
-            }
-            EvolveCommand::Corrects { new, old, .. } => {
-                println!("Created evolution relationship #{id}: {new} corrects {old}");
-            }
-            EvolveCommand::Retracts { new, old, .. } => {
-                println!("Created evolution relationship #{id}: {new} retracts {old}");
-            }
-            EvolveCommand::Extends { new, old, .. } => {
-                println!("Created evolution relationship #{id}: {new} extends {old}");
-            }
-        },
         (
-            Command::Experiment(ExperimentCommand::Create { .. }),
-            R::ExperimentCreated { id, name },
-        ) => println!("Created experiment '{name}' (ID: {id})"),
-        (
-            Command::Experiment(ExperimentCommand::End { name, .. }),
-            R::ExperimentEnded { winner },
-        ) => match winner {
-            Some(winner) => println!("Experiment '{name}' ended with winner: {winner}"),
-            None => println!("Experiment '{name}' ended with no significant winner"),
-        },
-        (Command::Experiment(ExperimentCommand::Cancel { name }), R::ExperimentCancelled) => {
-            println!("Experiment '{name}' cancelled");
+            Command::Evolve(EvolveCommand::Link {
+                new, relation, old, ..
+            }),
+            R::EvolutionCreated { id },
+        ) => {
+            println!("Created evolution relationship #{id}: {new} {relation} {old}");
+        }
+        (Command::Evolve(_), R::EvolutionRemoved { id }) => {
+            println!("Removed evolution relationship #{id}");
         }
         (
-            Command::Journal(JournalCommand::Import { dry_run, .. }),
+            Command::Memory(MemoryCommand::Import { dry_run, .. }),
             R::JournalImported { outcome },
         ) => format_journal_import_result(outcome, *dry_run, format),
         (
-            Command::Journal(JournalCommand::ImportAll { dry_run, .. }),
+            Command::Memory(MemoryCommand::Import { dry_run, .. }),
             R::JournalsImported { outcomes },
         ) => format_journal_import_all_results(outcomes, *dry_run, format),
-        (Command::Code(CodeCommand::Init), R::CodeInitialized) => {
-            println!("Initialized code index at .mdkb/code.sqlite");
-        }
-        (Command::Code(CodeCommand::Index { .. }), R::CodeIndexed { stats }) => {
-            format_code_index_stats(stats, format);
-        }
-        (Command::Session(SessionCommand::Index { .. }), R::SessionIndexed { outcome }) => {
-            format_update_result(outcome, format);
-        }
         _ => {
             return Err(mdkb::Error::other(
                 "cli.mutate returned a result for a different command",
@@ -3115,7 +3226,7 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                     "⚠ Collection `{name}` was registered on a previous run and is GONE — \
                      its documents are not indexed. Restore with \
                      `mdkb collection add {name} <path> && mdkb update`, and check \
-                     `mdkb stats` for a quarantine."
+                     `mdkb status` for a quarantine."
                 );
             }
             if result.no_collections_registered {
@@ -3386,6 +3497,17 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
                         .join(" ")
                 );
             }
+            println!("Status: {}", entry.status);
+            if let Some(ref by) = entry.superseded_by {
+                println!("Superseded by: {by}");
+            }
+            println!(
+                "Confidence: {:.2} ({}; {} confirmation(s), {} correction(s))",
+                entry.confidence(),
+                entry.source_type,
+                entry.confirmations,
+                entry.corrections
+            );
             println!("Access count: {}", entry.access_count);
             if let Some(ref path) = entry.source_path {
                 println!("Source: {path}");
@@ -3393,6 +3515,26 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
             println!("\n{}", entry.content);
         }
     }
+}
+
+/// The typed edges of one memory entry, both directions, for `memory show`.
+fn print_memory_edges(ctx: &Context, id: &str) -> mdkb::error::Result<()> {
+    let out = mdkb::store::memory_graph::outgoing(&ctx.conn, id, None)?;
+    let inc = mdkb::store::memory_graph::incoming(&ctx.conn, id, None)?;
+    if out.is_empty() && inc.is_empty() {
+        return Ok(());
+    }
+    println!("\nEdges:");
+    for e in &out {
+        println!(
+            "  {id} --{}--> {} ({})",
+            e.relation, e.target_ref, e.target_kind
+        );
+    }
+    for e in &inc {
+        println!("  {} --{}--> {id}", e.source_id, e.relation);
+    }
+    Ok(())
 }
 
 fn format_memory_list(entries: &[MemoryEntry], format: OutputFormat) {
@@ -3441,8 +3583,13 @@ fn format_memory_list(entries: &[MemoryEntry], format: OutputFormat) {
                         .map(|t| format!("#{t}"))
                         .collect::<Vec<_>>()
                         .join(" ");
+                    let status = if e.status == mdkb::store::memory::EntryStatus::Active {
+                        String::new()
+                    } else {
+                        format!(" [{}]", e.status)
+                    };
                     println!(
-                        "[{}] {} ({}) {} - {} accesses",
+                        "[{}] {} ({}){status} {} - {} accesses",
                         e.id, e.title, e.entry_type, tags, e.access_count
                     );
                 }
@@ -3537,6 +3684,9 @@ fn audit_signal_line(signal: &mdkb::core::memory_audit::AuditSignal) -> String {
     use mdkb::core::memory_audit::AuditSignal as S;
     match signal {
         S::DeadCodeReference { reference } => format!("cites {reference}, which is gone"),
+        S::DeadSymbolReference { symbol } => {
+            format!("cites `{symbol}`, which the code no longer defines or mentions")
+        }
         S::SourceChangedSince { path, changed_at } => {
             format!(
                 "{path} changed on {} since this was written",
@@ -3645,10 +3795,13 @@ fn audit_gaps_text(outcome: &mdkb::core::memory_audit::AuditOutcome) -> String {
             let _ = writeln!(out, "  {} [{}] {}", c.id, c.entry_type, c.title);
         }
     }
+    if let Some(why) = &outcome.symbol_check_skipped {
+        let _ = writeln!(out, "\nCited-symbol check skipped: {why}.");
+    }
     if !outcome.near_duplicate_checked {
         let _ = writeln!(
             out,
-            "\nNear-duplicate check skipped: no entry has an embedding yet (run `mdkb embed`)."
+            "\nNear-duplicate check skipped: no entry has an embedding yet (run `mdkb update`)."
         );
     } else if !outcome.near_duplicate_coverage.complete() {
         // "It ran" is not the same as "it looked at everything", and the
@@ -3657,7 +3810,7 @@ fn audit_gaps_text(outcome: &mdkb::core::memory_audit::AuditOutcome) -> String {
         let _ = writeln!(
             out,
             "\nNear-duplicate check covered {} of {} entries; the rest have no embedding yet \
-             (run `mdkb embed`).",
+             (run `mdkb update`).",
             outcome.near_duplicate_coverage.embedded, outcome.near_duplicate_coverage.scanned
         );
     }
@@ -3790,10 +3943,11 @@ fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFor
             println!("{}", serde_json::to_string_pretty(history).unwrap());
         }
         OutputFormat::Csv => {
-            println!("doc_id,path,title,relationship,scope,reason");
+            println!("evolution_id,doc_id,path,title,relationship,scope,reason");
             for h in history {
                 println!(
-                    "{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{}",
+                    h.evolution_id,
                     h.doc_id,
                     h.path,
                     h.title.as_deref().unwrap_or(""),
@@ -3807,11 +3961,12 @@ fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFor
             if history.is_empty() {
                 println!("No evolution history found.");
             } else {
-                println!("| ID | Path | Title | Relationship | Scope | Reason |");
-                println!("|----|------|-------|--------------|-------|--------|");
+                println!("| Edge | Doc | Path | Title | Relationship | Scope | Reason |");
+                println!("|------|-----|------|-------|--------------|-------|--------|");
                 for h in history {
                     println!(
-                        "| {} | {} | {} | {} | {} | {} |",
+                        "| #{} | {} | {} | {} | {} | {} | {} |",
+                        h.evolution_id,
                         h.doc_id,
                         h.path,
                         h.title.as_deref().unwrap_or("-"),
@@ -3830,8 +3985,8 @@ fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFor
                 for h in history {
                     let title = h.title.as_deref().unwrap_or("(untitled)");
                     println!(
-                        "  [{}] {} - {} ({})",
-                        h.doc_id, h.path, title, h.relationship
+                        "  #{} [{}] {} - {} ({})",
+                        h.evolution_id, h.doc_id, h.path, title, h.relationship
                     );
                     if let Some(scope) = &h.scope {
                         println!("      Scope: {}", scope);
@@ -4053,7 +4208,7 @@ fn format_graph_relations(
             if found.examined.is_empty() {
                 println!("No frontmatter keys carry document references.");
             } else {
-                println!("| Key | Hits | Total | Score | Relation |");
+                println!("| Key | Hits | Total | Score | Detected |");
                 println!("|-----|------|-------|-------|----------|");
                 for c in &found.examined {
                     println!(
@@ -4201,6 +4356,23 @@ fn format_graph_hubs(hubs: &[mdkb::store::graph::Hub], format: OutputFormat) {
     }
 }
 
+/// `-c NAME` filters to one collection; an unknown name must fail, not quietly
+/// return results from corpora the filter does not apply to.
+fn require_collection(ctx: &mdkb::core::Context, name: &str) -> mdkb::error::Result<()> {
+    let known = mdkb::store::collections::list_collections(&ctx.conn)?;
+    if known.iter().any(|c| c.name == name) {
+        return Ok(());
+    }
+    let names = known
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(mdkb::Error::other(format!(
+        "collection not found: {name} (known: {names})"
+    )))
+}
+
 fn format_current_document(doc: &mdkb::domain::Document, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -4226,41 +4398,12 @@ fn format_current_document(doc: &mdkb::domain::Document, format: OutputFormat) {
     }
 }
 
-fn format_superseded_by(evolutions: &[Evolution], format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(evolutions).unwrap());
-        }
-        OutputFormat::Csv => {
-            println!("id,source_doc_id,relationship,scope,reason");
-            for e in evolutions {
-                println!(
-                    "{},{},{},{},{}",
-                    e.id,
-                    e.source_doc_id,
-                    e.relationship,
-                    e.scope.as_deref().unwrap_or(""),
-                    e.reason.as_deref().unwrap_or(""),
-                );
-            }
-        }
-        OutputFormat::Markdown | OutputFormat::Text => {
-            if evolutions.is_empty() {
-                println!("This document has not been superseded.");
-            } else {
-                println!("Superseded by ({} relationships):", evolutions.len());
-                for e in evolutions {
-                    println!("  - Doc #{} ({}", e.source_doc_id, e.relationship);
-                    if let Some(scope) = &e.scope {
-                        println!("    Scope: {}", scope);
-                    }
-                    if let Some(reason) = &e.reason {
-                        println!("    Reason: {}", reason);
-                    }
-                }
-            }
-        }
+fn format_superseded_by(evolutions: &[EvolutionHistoryEntry], format: OutputFormat) {
+    if evolutions.is_empty() && matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        println!("This document has not been superseded.");
+        return;
     }
+    format_evolution_history(evolutions, format);
 }
 
 fn format_metrics_summary(
@@ -4328,59 +4471,6 @@ fn format_metrics_summary(
             println!("  > 0.8: {:.1}%", metrics.score_above_80);
             println!("  0.5-0.8: {:.1}%", metrics.score_50_to_80);
             println!("  < 0.5: {:.1}%", metrics.score_below_50);
-        }
-    }
-}
-
-fn format_telemetry_status(status: &mdkb::core::ops::TelemetryStatus, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(status).unwrap_or_default()
-            );
-        }
-        OutputFormat::Csv => {
-            println!("enabled,retention_days,key_present,stored_events");
-            println!(
-                "{},{},{},{}",
-                status.enabled, status.retention_days, status.key_present, status.stored_events
-            );
-        }
-        OutputFormat::Markdown => {
-            println!("| Enabled | Retention days | Private key | Stored events |");
-            println!("|---|---:|---|---:|");
-            println!(
-                "| {} | {} | {} | {} |",
-                status.enabled,
-                status.retention_days,
-                if status.key_present {
-                    "present"
-                } else {
-                    "missing"
-                },
-                status.stored_events
-            );
-        }
-        OutputFormat::Text => {
-            println!(
-                "Developer telemetry: {}",
-                if status.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-            println!("Retention:          {} days", status.retention_days);
-            println!(
-                "Private HMAC key:    {}",
-                if status.key_present {
-                    "present"
-                } else {
-                    "missing"
-                }
-            );
-            println!("Stored events:      {}", status.stored_events);
         }
     }
 }
@@ -4553,158 +4643,6 @@ fn format_metrics_export(events: &[mdkb::store::stats::QueryEvent], format: Outp
     }
 }
 
-fn format_experiment_status(
-    status: &mdkb::store::stats::ExperimentStatusReport,
-    format: OutputFormat,
-) {
-    match format {
-        OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(status).unwrap_or_default()
-            );
-        }
-        OutputFormat::Csv => {
-            println!(
-                "experiment,variant,sample_count,avg_score,avg_latency_ms,p95_latency_ms,zero_result_rate"
-            );
-            println!(
-                "{},A,{},{:.3},{:.1},{},{}",
-                status.experiment.name,
-                status.variant_a.sample_count,
-                status.variant_a.avg_score,
-                status.variant_a.avg_latency_ms,
-                status.variant_a.p95_latency_ms,
-                status.variant_a.zero_result_rate
-            );
-            println!(
-                "{},B,{},{:.3},{:.1},{},{}",
-                status.experiment.name,
-                status.variant_b.sample_count,
-                status.variant_b.avg_score,
-                status.variant_b.avg_latency_ms,
-                status.variant_b.p95_latency_ms,
-                status.variant_b.zero_result_rate
-            );
-        }
-        OutputFormat::Markdown | OutputFormat::Text => {
-            let exp = &status.experiment;
-            let started = chrono::DateTime::from_timestamp(exp.created_at, 0)
-                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            println!(
-                "Experiment: {} ({} since {})",
-                exp.name, exp.status, started
-            );
-            if let Some(desc) = &exp.description {
-                println!("Description: {desc}");
-            }
-            println!();
-
-            // Variant A
-            let a = &status.variant_a;
-            println!(
-                "Variant A: avg score {:.3}, p95 latency {}ms, n={}",
-                a.avg_score, a.p95_latency_ms, a.sample_count
-            );
-            println!("  Config: {}", exp.config_a);
-
-            // Variant B
-            let b = &status.variant_b;
-            println!(
-                "Variant B: avg score {:.3}, p95 latency {}ms, n={}",
-                b.avg_score, b.p95_latency_ms, b.sample_count
-            );
-            println!("  Config: {}", exp.config_b);
-            println!();
-
-            // Significance
-            if !status.has_min_samples {
-                let needed = exp.min_sample_size - a.sample_count.min(b.sample_count);
-                println!(
-                    "Significance: Need {} more samples before statistical analysis",
-                    needed.max(0)
-                );
-            } else if let Some(sig) = &status.significance {
-                if sig.significant {
-                    println!(
-                        "Significance: {:.0}% confidence {} has better quality (p={:.4}, effect size={:.2})",
-                        sig.confidence_level,
-                        sig.winner.as_deref().unwrap_or("?"),
-                        sig.p_value,
-                        sig.effect_size
-                    );
-                } else {
-                    println!(
-                        "Significance: No significant difference detected (p={:.4})",
-                        sig.p_value
-                    );
-                }
-            }
-        }
-    }
-}
-
-fn format_experiment_list(experiments: &[mdkb::store::stats::Experiment], format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(experiments).unwrap_or_default()
-            );
-        }
-        OutputFormat::Csv => {
-            println!("name,status,traffic_split,min_samples,created_at,winner");
-            for exp in experiments {
-                println!(
-                    "{},{},{},{},{},{}",
-                    exp.name,
-                    exp.status,
-                    exp.traffic_split,
-                    exp.min_sample_size,
-                    exp.created_at,
-                    exp.winner.as_deref().unwrap_or("")
-                );
-            }
-        }
-        OutputFormat::Markdown => {
-            println!("| Name | Status | Split | Min Samples | Winner |");
-            println!("|------|--------|-------|-------------|--------|");
-            for exp in experiments {
-                println!(
-                    "| {} | {} | {:.0}% | {} | {} |",
-                    exp.name,
-                    exp.status,
-                    exp.traffic_split * 100.0,
-                    exp.min_sample_size,
-                    exp.winner.as_deref().unwrap_or("-")
-                );
-            }
-        }
-        OutputFormat::Text => {
-            if experiments.is_empty() {
-                println!("No experiments found.");
-            } else {
-                for exp in experiments {
-                    let started = chrono::DateTime::from_timestamp(exp.created_at, 0)
-                        .map(|dt| dt.format("%Y-%m-%d").to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    let winner_str = exp
-                        .winner
-                        .as_ref()
-                        .map(|w| format!(" -> Winner: {w}"))
-                        .unwrap_or_default();
-                    println!(
-                        "{}: {} (started {}){}",
-                        exp.name, exp.status, started, winner_str
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn format_journal_import_result(result: &JournalImportResult, dry_run: bool, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -4828,15 +4766,21 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
-            println!("Files discovered: {}", stats.files_discovered);
-            println!("Files indexed:    {}", stats.files_indexed);
+            // Every count but the first is what THIS run wrote. Labelled as
+            // totals, "Symbols indexed: 0" read as an empty index after an
+            // incremental run that found nothing changed (story 080-4dae).
+            println!("Files discovered:      {}", stats.files_discovered);
+            println!("Files reindexed:       {}", stats.files_indexed);
             // Deletions are the one number the file counts can't imply — stay
             // quiet when nothing was dropped.
             if stats.files_removed > 0 {
-                println!("Files removed:    {}", stats.files_removed);
+                println!("Files removed:         {}", stats.files_removed);
             }
-            println!("Symbols indexed:  {}", stats.symbols_indexed);
-            println!("Relationships:    {}", stats.relationships_collected);
+            println!("Symbols written:       {}", stats.symbols_indexed);
+            println!("Relationships written: {}", stats.relationships_collected);
+            if stats.files_indexed == 0 {
+                println!("(nothing changed since the last index; `mdkb status` prints totals)");
+            }
             // Only surface parse failures when there are any — a clean run stays quiet.
             if stats.parse_errors > 0 {
                 println!("Parse errors:     {} (see logs)", stats.parse_errors);
@@ -4849,10 +4793,10 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
 /// the list at all, so it travels with the symbol rather than being dropped.
 /// Run the duplication audit for either surface that asks for it.
 ///
-/// `mdkb dup` and `mdkb search --scope duplicates` are two ways of asking the
+/// `mdkb code dup` and `mdkb search --scope duplicates` are two ways of asking the
 /// same question; they load the config the same way and call the same handler,
 /// so they cannot answer differently.
-/// The CLI's only duplication entry point — `mdkb dup` and
+/// The CLI's only duplication entry point — `mdkb code dup` and
 /// `mdkb search --scope duplicates` both come through here.
 ///
 /// That is why the priority drop lives in this function rather than in one of
@@ -4912,7 +4856,7 @@ fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: O
                     s.name,
                     s.kind,
                     s.file_path,
-                    s.range.start_line,
+                    s.range.start_line + 1,
                     score,
                 );
             }
@@ -4927,7 +4871,7 @@ fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: O
                     s.name,
                     s.kind,
                     s.file_path,
-                    s.range.start_line,
+                    s.range.start_line + 1,
                     score,
                 );
             }
@@ -4944,7 +4888,7 @@ fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: O
                     s.kind,
                     s.name,
                     s.file_path,
-                    s.range.start_line,
+                    s.range.start_line + 1,
                     score,
                 );
             }
@@ -4957,7 +4901,7 @@ fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: O
 fn report_find_truncation(found: &mdkb::cli::handlers::CodeFindResult) {
     if found.total > found.symbols.len() {
         eprintln!(
-            "Showing {} of {} matches. Narrow with --kind/--file, or raise --limit.",
+            "Showing {} of {} matches. Narrow with -k KIND or --path PREFIX, or raise --limit.",
             found.symbols.len(),
             found.total,
         );
@@ -5013,7 +4957,7 @@ fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFor
                     s.name,
                     s.kind,
                     s.file_path,
-                    s.range.start_line,
+                    s.range.start_line + 1,
                 );
             }
         }
@@ -5028,7 +4972,7 @@ fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFor
                     if sig.is_empty() { s.name.as_ref() } else { sig },
                     s.kind,
                     s.file_path,
-                    s.range.start_line,
+                    s.range.start_line + 1,
                 );
             }
         }
@@ -5043,7 +4987,7 @@ fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFor
                         s.kind,
                         s.name,
                         s.file_path,
-                        s.range.start_line,
+                        s.range.start_line + 1,
                     );
                     if let Some(ref sig) = s.signature {
                         print!("  sig: {}", sig);
@@ -5075,14 +5019,23 @@ fn format_code_graph(
             for t in related {
                 println!(
                     "{},{},{},{},{},{}",
-                    source.name, label, t.name, t.kind, t.file_path, t.range.start_line,
+                    source.name,
+                    label,
+                    t.name,
+                    t.kind,
+                    t.file_path,
+                    t.range.start_line + 1,
                 );
             }
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!(
                 "{} for {} {} ({}:{})",
-                label, source.kind, source.name, source.file_path, source.range.start_line,
+                label,
+                source.kind,
+                source.name,
+                source.file_path,
+                source.range.start_line + 1,
             );
             if related.is_empty() {
                 println!("  (none)");
@@ -5090,7 +5043,10 @@ fn format_code_graph(
                 for t in related {
                     println!(
                         "  - {} {} ({}:{})",
-                        t.kind, t.name, t.file_path, t.range.start_line,
+                        t.kind,
+                        t.name,
+                        t.file_path,
+                        t.range.start_line + 1,
                     );
                 }
             }
@@ -5122,7 +5078,7 @@ fn format_code_calls(
                     t.name,
                     t.kind,
                     t.file_path,
-                    t.range.start_line,
+                    t.range.start_line + 1,
                     call.tier,
                     call.is_unique,
                 );
@@ -5131,7 +5087,10 @@ fn format_code_calls(
         OutputFormat::Markdown | OutputFormat::Text => {
             println!(
                 "Calls for {} {} ({}:{})",
-                source.kind, source.name, source.file_path, source.range.start_line,
+                source.kind,
+                source.name,
+                source.file_path,
+                source.range.start_line + 1,
             );
             if related.is_empty() {
                 println!("  (none)");
@@ -5143,7 +5102,7 @@ fn format_code_calls(
                         t.kind,
                         t.name,
                         t.file_path,
-                        t.range.start_line,
+                        t.range.start_line + 1,
                         call.tier,
                         if call.is_unique {
                             "unique"
@@ -5236,7 +5195,12 @@ fn format_code_impact(
                 for t in group {
                     println!(
                         "{},{},{},{},{},{}",
-                        source.name, label, t.name, t.kind, t.file_path, t.range.start_line,
+                        source.name,
+                        label,
+                        t.name,
+                        t.kind,
+                        t.file_path,
+                        t.range.start_line + 1,
                     );
                 }
             }
@@ -5254,7 +5218,10 @@ fn format_code_impact(
             for t in &report.ambiguous {
                 println!(
                     "  - {} {} ({}:{})",
-                    t.kind, t.name, t.file_path, t.range.start_line,
+                    t.kind,
+                    t.name,
+                    t.file_path,
+                    t.range.start_line + 1,
                 );
             }
             if report.stopped_arrivals > 0 {
@@ -5268,24 +5235,6 @@ fn format_code_impact(
     }
 }
 
-fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(info).unwrap());
-        }
-        OutputFormat::Csv => {
-            println!("symbols,files,relationships");
-            println!("{},{},{}", info.symbols, info.files, info.relationships);
-        }
-        OutputFormat::Markdown | OutputFormat::Text => {
-            println!("Code Index:");
-            println!("  Symbols:       {}", info.symbols);
-            println!("  Files:         {}", info.files);
-            println!("  Relationships: {}", info.relationships);
-        }
-    }
-}
-
 fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -5295,8 +5244,8 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
                     serde_json::json!({
                         "name": s.name.as_ref(),
                         "kind": s.kind.to_string(),
-                        "line": s.range.start_line,
-                        "end_line": s.range.end_line,
+                        "line": s.range.start_line + 1,
+                        "end_line": s.range.end_line + 1,
                         "signature": s.signature.as_deref(),
                         "doc_comment": s.doc_comment.as_deref(),
                         "visibility": format!("{:?}", s.visibility),
@@ -5313,7 +5262,11 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
             for s in symbols {
                 println!(
                     "{},{},{},{},{:?}",
-                    s.name, s.kind, s.range.start_line, s.range.end_line, s.visibility,
+                    s.name,
+                    s.kind,
+                    s.range.start_line + 1,
+                    s.range.end_line + 1,
+                    s.visibility,
                 );
             }
         }
@@ -5322,8 +5275,8 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
             for s in symbols {
                 print!(
                     "  L{}-{} {} {} {}",
-                    s.range.start_line,
-                    s.range.end_line,
+                    s.range.start_line + 1,
+                    s.range.end_line + 1,
                     s.kind,
                     s.name,
                     format!("{:?}", s.visibility).to_lowercase(),
@@ -5531,7 +5484,7 @@ fn collection_updated_line(name: &str, path: &str, pattern: &str) -> String {
 fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
     let args: Vec<serde_json::Value> = cmd
         .get_arguments()
-        .filter(|a| a.get_id() != "help" && a.get_id() != "version")
+        .filter(|a| a.get_id() != "help" && a.get_id() != "version" && !a.is_hide_set())
         .map(|a| {
             serde_json::json!({
                 "name": a.get_id().as_str(),
@@ -5545,7 +5498,11 @@ fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
         })
         .collect();
 
-    let subcommands: Vec<serde_json::Value> = cmd.get_subcommands().map(command_to_json).collect();
+    let subcommands: Vec<serde_json::Value> = cmd
+        .get_subcommands()
+        .filter(|s| !s.is_hide_set())
+        .map(command_to_json)
+        .collect();
 
     serde_json::json!({
         "name": cmd.get_name(),
@@ -5576,6 +5533,7 @@ mod tests {
                 scanned: 3,
             },
             source_drift_checked: true,
+            symbol_check_skipped: None,
         }
     }
 
@@ -5598,7 +5556,7 @@ mod tests {
             "a skipped pass must be named, not folded into 'found nothing': {text:?}"
         );
         assert!(
-            text.contains("mdkb embed"),
+            text.contains("mdkb update"),
             "the operator needs the command that fixes it: {text:?}"
         );
     }
@@ -5684,8 +5642,7 @@ mod tests {
     fn mcp_unix_default_uses_daemon_proxy() {
         // Proves: the control case is unchanged. The proxy runs when no
         // --socket is typed, and `None` tells the `Command::Mcp` arm to fall
-        // back to `socket_path` in ~/.mdkb/daemon.toml and then to
-        // ~/.mdkb/daemon.sock.
+        // back to ~/.mdkb/daemon.sock, the socket the daemon binds.
         assert_eq!(
             resolve_mcp_run_mode(false, true, None).unwrap(),
             McpRunMode::DaemonProxy {
@@ -5703,7 +5660,7 @@ mod tests {
         // back, so a refactor could drop the path and no test would notice.
         //
         // Scope: this pins the passthrough only. Whether the proxy then
-        // CONNECTS to that path instead of the config default is decided by
+        // CONNECTS to that path instead of ~/.mdkb/daemon.sock is decided by
         // the `unwrap_or_else` chain in the `Command::Mcp` arm, which no
         // test reaches yet.
         let typed = std::path::PathBuf::from("/tmp/override.sock");

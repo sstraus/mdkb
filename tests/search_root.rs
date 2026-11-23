@@ -313,7 +313,10 @@ fn root_paths_search_the_nearest_store_from_the_current_directory() {
 fn an_outside_path_exits_non_zero_and_names_the_path() {
     let tmp = TempDir::new().unwrap();
     let alpha = store(tmp.path(), "alpha", "zonk_harvest");
-    let outside = tmp.path().join("outside");
+    // Outside every store: a fixture under $TMPDIR is not, when $TMPDIR sits
+    // inside a directory that holds a real store (a home with `~/.mdkb`).
+    let far = TempDir::new_in("/tmp").unwrap();
+    let outside = far.path().join("outside");
     std::fs::create_dir_all(outside.join(".mdkb")).unwrap();
     let home = home_knowing(tmp.path(), &[&alpha]);
     let raw = outside.to_str().unwrap();

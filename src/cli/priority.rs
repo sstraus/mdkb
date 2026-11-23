@@ -1,6 +1,6 @@
 //! Scheduling priority for the CLI's long audits.
 //!
-//! `mdkb dup --semantic` saturates every core for minutes and nothing is
+//! `mdkb code dup --semantic` saturates every core for minutes and nothing is
 //! waiting on it: it is a sweep someone asked for, not a query someone is
 //! blocked on. Lowering this process changes no CPU-seconds — measured, the
 //! pass costs what it costs — it changes who gets a core first when an editor,

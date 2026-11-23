@@ -17,10 +17,7 @@
 //! silently absorb the next mutating command someone adds, which is the exact
 //! regression this exists to prevent.
 
-use crate::cli::{
-    CodeCommand, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
-    MemoryCommand, SessionCommand,
-};
+use crate::cli::{CollectionCommand, Command, EvolveCommand, MemoryCommand};
 use crate::core::cli_mutation::CliMutation;
 use crate::core::indexing::UpdateRequest;
 use crate::error::{Error, Result};
@@ -50,14 +47,12 @@ pub enum Routing {
 pub fn routing_for(command: &Command) -> Routing {
     match command {
         // ── writes ──────────────────────────────────────────────────────────
-        Command::Update { .. } | Command::Embed { .. } | Command::Compact { .. } => {
-            Routing::Mutation
-        }
+        Command::Update { .. } | Command::Compact { .. } => Routing::Mutation,
         Command::Collection(c) => match c {
             CollectionCommand::List => Routing::Read,
             CollectionCommand::Add { .. }
             | CollectionCommand::Update { .. }
-            | CollectionCommand::Remove { .. }
+            | CollectionCommand::Rm { .. }
             | CollectionCommand::Rename { .. } => Routing::Mutation,
         },
         Command::Memory(c) => match c {
@@ -71,43 +66,35 @@ pub fn routing_for(command: &Command) -> Routing {
             _ => Routing::Mutation,
         },
         Command::Evolve(c) => match c {
-            EvolveCommand::Supersedes { .. }
-            | EvolveCommand::Updates { .. }
-            | EvolveCommand::Corrects { .. }
-            | EvolveCommand::Retracts { .. }
-            | EvolveCommand::Extends { .. } => Routing::Mutation,
+            EvolveCommand::History { .. }
+            | EvolveCommand::Current { .. }
+            | EvolveCommand::SupersededBy { .. } => Routing::Read,
+            EvolveCommand::Link { .. } | EvolveCommand::Unlink { .. } => Routing::Mutation,
+            // Removed names fail before touching the store.
+            EvolveCommand::Supersedes(_)
+            | EvolveCommand::Updates(_)
+            | EvolveCommand::Corrects(_)
+            | EvolveCommand::Retracts(_)
+            | EvolveCommand::Extends(_) => Routing::Local,
         },
-        Command::Experiment(c) => match c {
-            ExperimentCommand::Status { .. } | ExperimentCommand::List { .. } => Routing::Read,
-            ExperimentCommand::Create { .. }
-            | ExperimentCommand::End { .. }
-            | ExperimentCommand::Cancel { .. } => Routing::Mutation,
-        },
-        Command::Journal(c) => match c {
-            JournalCommand::Import { .. } | JournalCommand::ImportAll { .. } => Routing::Mutation,
-        },
-        Command::Code(c) => match c {
-            CodeCommand::Init | CodeCommand::Index { .. } => Routing::Mutation,
-            _ => Routing::Read,
-        },
-        Command::Session(_) => Routing::Mutation,
+        Command::Code(_) => Routing::Read,
 
         // ── reads ───────────────────────────────────────────────────────────
         Command::Search { .. }
-        | Command::Dup { .. }
-        | Command::Coupling { .. }
         | Command::Get { .. }
-        | Command::Mget { .. }
-        | Command::Stats { .. }
+        | Command::Status { .. }
         | Command::Doctor { .. }
-        | Command::Graph(_)
-        | Command::History { .. }
-        | Command::Current { .. }
-        | Command::SupersededBy { .. }
+        | Command::Graph { .. }
+        | Command::Dup(_)
+        | Command::Coupling(_)
+        | Command::Stats(_)
+        | Command::Embed(_)
+        | Command::Journal(_)
+        | Command::Session(_)
         | Command::Eval(_) => Routing::Read,
         Command::Metrics(c) => match c {
             crate::cli::MetricsCommand::Purge { .. } => Routing::Mutation,
-            crate::cli::MetricsCommand::Status
+            crate::cli::MetricsCommand::Status(_)
             | crate::cli::MetricsCommand::Show { .. }
             | crate::cli::MetricsCommand::Latency { .. }
             | crate::cli::MetricsCommand::Quality { .. }
@@ -179,15 +166,45 @@ pub fn mutation_request(
     };
 
     Ok(Some(match command {
-        Command::Update { files, force } => M::Update {
-            request: UpdateRequest {
-                files: files.clone(),
-                force: *force,
-            },
-        },
-        Command::Embed { collection } => M::Embed {
-            collection: collection.clone(),
-        },
+        Command::Update {
+            files,
+            force,
+            code,
+            sessions,
+            reembed,
+            collection,
+            sessions_path,
+            project_root,
+        } => {
+            if *code {
+                M::CodeIndex {
+                    paths: Vec::new(),
+                    force: *force,
+                }
+            } else if *sessions {
+                M::SessionIndex {
+                    sessions_path: match sessions_path {
+                        Some(path) => absolute(std::path::Path::new(path)),
+                        None => crate::daemon::config::home_dir()?.join(".claude/projects"),
+                    },
+                    project_root: project_root
+                        .clone()
+                        .unwrap_or_else(|| store_root.to_string_lossy().to_string()),
+                }
+            } else if *reembed || collection.is_some() {
+                M::Embed {
+                    reembed: *reembed,
+                    collection: collection.clone(),
+                }
+            } else {
+                M::Update {
+                    request: UpdateRequest {
+                        files: files.clone(),
+                        force: *force,
+                    },
+                }
+            }
+        }
         Command::Compact {
             prune_sessions,
             older_than,
@@ -216,7 +233,7 @@ pub fn mutation_request(
                 path: path.clone(),
                 pattern: pattern.clone(),
             },
-            CollectionCommand::Remove { name } => M::CollectionRemove { name: name.clone() },
+            CollectionCommand::Rm { name } => M::CollectionRemove { name: name.clone() },
             CollectionCommand::Rename { old_name, new_name } => M::CollectionRename {
                 old_name: old_name.clone(),
                 new_name: new_name.clone(),
@@ -286,9 +303,14 @@ pub fn mutation_request(
                     dry_run: *dry_run,
                 }
             }
-            MemoryCommand::Confirm { id, outcome } => M::MemoryConfirm {
+            MemoryCommand::Confirm {
+                id,
+                outcome,
+                session,
+            } => M::MemoryConfirm {
                 id: id.clone(),
                 outcome: outcome.clone(),
+                session: session.clone(),
             },
             MemoryCommand::Link {
                 id,
@@ -306,14 +328,40 @@ pub fn mutation_request(
             MemoryCommand::Rm { id } => M::MemoryRemove { id: id.clone() },
             MemoryCommand::Sync => M::MemorySync,
             MemoryCommand::Import {
-                path,
+                journal: Some(journal),
+                dry_run,
+                ..
+            } => {
+                let source = std::path::PathBuf::from(journal.as_str());
+                let abs = absolute(&source);
+                if abs.is_dir() {
+                    M::JournalImportAll {
+                        dir: abs,
+                        source_dir: source,
+                        dry_run: *dry_run,
+                        skip_existing: true,
+                    }
+                } else {
+                    M::JournalImport {
+                        path: abs,
+                        source_path: source,
+                        dry_run: *dry_run,
+                    }
+                }
+            }
+            MemoryCommand::Import {
+                path: Some(path),
                 dry_run,
                 skip_duplicates,
+                journal: None,
             } => M::MemoryImport {
                 path: absolute(std::path::Path::new(path)),
                 dry_run: *dry_run,
                 skip_duplicates: *skip_duplicates,
             },
+            MemoryCommand::Import { .. } => {
+                return Err(Error::other("memory import needs PATH or --journal PATH"));
+            }
             MemoryCommand::Prune { days, dry_run } => M::MemoryPrune {
                 days: *days,
                 dry_run: *dry_run,
@@ -341,107 +389,41 @@ pub fn mutation_request(
             | MemoryCommand::Export { .. } => return Ok(None),
         },
         Command::Evolve(c) => match c {
-            EvolveCommand::Supersedes { new, old, reason } => M::EvolveSupersedes {
-                new: new.clone(),
-                old: old.clone(),
-                reason: reason.clone(),
-            },
-            EvolveCommand::Updates {
+            EvolveCommand::History { .. }
+            | EvolveCommand::Current { .. }
+            | EvolveCommand::SupersededBy { .. } => return Ok(None),
+            EvolveCommand::Link {
                 new,
+                relation,
                 old,
                 scope,
                 reason,
-            } => M::EvolveUpdates {
-                new: new.clone(),
-                old: old.clone(),
-                scope: scope.clone(),
-                reason: reason.clone(),
-            },
-            EvolveCommand::Corrects { new, old, reason } => M::EvolveCorrects {
-                new: new.clone(),
-                old: old.clone(),
-                reason: reason.clone(),
-            },
-            EvolveCommand::Retracts { new, old, reason } => M::EvolveRetracts {
-                new: new.clone(),
-                old: old.clone(),
-                reason: reason.clone(),
-            },
-            EvolveCommand::Extends { new, old, reason } => M::EvolveExtends {
-                new: new.clone(),
-                old: old.clone(),
-                reason: reason.clone(),
-            },
-        },
-        Command::Experiment(c) => match c {
-            ExperimentCommand::Create {
-                name,
-                config_a,
-                config_b,
-                description,
-                split,
-                min_samples,
-            } => M::ExperimentCreate {
-                name: name.clone(),
-                config_a: config_a.clone(),
-                config_b: config_b.clone(),
-                description: description.clone(),
-                split: *split,
-                min_samples: *min_samples,
-            },
-            ExperimentCommand::End { name, winner } => M::ExperimentEnd {
-                name: name.clone(),
-                winner: winner.clone(),
-            },
-            ExperimentCommand::Cancel { name } => M::ExperimentCancel { name: name.clone() },
-            ExperimentCommand::Status { .. } | ExperimentCommand::List { .. } => return Ok(None),
-        },
-        Command::Journal(c) => match c {
-            JournalCommand::Import { path, dry_run } => M::JournalImport {
-                path: absolute(std::path::Path::new(path)),
-                source_path: std::path::PathBuf::from(path.as_str()),
-                dry_run: *dry_run,
-            },
-            JournalCommand::ImportAll {
-                dir,
-                dry_run,
-                skip_existing,
             } => {
-                let source_dir =
-                    std::path::PathBuf::from(dir.as_deref().unwrap_or(".claude/journal"));
-                M::JournalImportAll {
-                    dir: absolute(&source_dir),
-                    source_dir,
-                    dry_run: *dry_run,
-                    skip_existing: *skip_existing,
+                let (new, old, reason) = (new.clone(), old.clone(), reason.clone());
+                if scope.is_some() && relation != "updates" {
+                    return Err(Error::other(
+                        "--scope applies to `updates` only. Run: mdkb evolve link NEW updates OLD --scope SECTION",
+                    ));
+                }
+                match relation.as_str() {
+                    "supersedes" => M::EvolveSupersedes { new, old, reason },
+                    "updates" => M::EvolveUpdates {
+                        new,
+                        old,
+                        scope: scope.clone(),
+                        reason,
+                    },
+                    "corrects" => M::EvolveCorrects { new, old, reason },
+                    "retracts" => M::EvolveRetracts { new, old, reason },
+                    _ => M::EvolveExtends { new, old, reason },
                 }
             }
-        },
-        Command::Code(c) => match c {
-            CodeCommand::Init => M::CodeInit,
-            CodeCommand::Index { paths, force } => M::CodeIndex {
-                paths: paths.clone(),
-                force: *force,
-            },
-            CodeCommand::Search { .. }
-            | CodeCommand::Find { .. }
-            | CodeCommand::Calls { .. }
-            | CodeCommand::Callers { .. }
-            | CodeCommand::Impact { .. }
-            | CodeCommand::Info
-            | CodeCommand::Parse { .. } => return Ok(None),
-        },
-        Command::Session(SessionCommand::Index {
-            sessions_path,
-            project_root,
-        }) => M::SessionIndex {
-            sessions_path: match sessions_path {
-                Some(path) => absolute(std::path::Path::new(path)),
-                None => crate::daemon::config::home_dir()?.join(".claude/projects"),
-            },
-            project_root: project_root
-                .clone()
-                .unwrap_or_else(|| store_root.to_string_lossy().to_string()),
+            EvolveCommand::Unlink { id } => M::EvolveRemove { id: *id },
+            EvolveCommand::Supersedes(_)
+            | EvolveCommand::Updates(_)
+            | EvolveCommand::Corrects(_)
+            | EvolveCommand::Retracts(_)
+            | EvolveCommand::Extends(_) => return Ok(None),
         },
         Command::Metrics(crate::cli::MetricsCommand::Purge { yes }) => {
             if !*yes {
@@ -453,28 +435,29 @@ pub fn mutation_request(
         }
         Command::Init
         | Command::Search { .. }
-        | Command::Dup { .. }
-        | Command::Coupling { .. }
         | Command::Get { .. }
-        | Command::Mget { .. }
+        | Command::Dup(_)
+        | Command::Coupling(_)
+        | Command::Embed(_)
+        | Command::Journal(_)
+        | Command::Session(_)
+        | Command::Code(_)
+        | Command::Status { .. }
         | Command::Serve { .. }
         | Command::Daemon(_)
         | Command::Repos(_)
         | Command::Mcp { .. }
-        | Command::Stats { .. }
+        | Command::Stats(_)
         | Command::Doctor { .. }
         | Command::Metrics(
-            crate::cli::MetricsCommand::Status
+            crate::cli::MetricsCommand::Status(_)
             | crate::cli::MetricsCommand::Show { .. }
             | crate::cli::MetricsCommand::Latency { .. }
             | crate::cli::MetricsCommand::Quality { .. }
             | crate::cli::MetricsCommand::Export { .. },
         )
         | Command::Eval(_)
-        | Command::History { .. }
-        | Command::Current { .. }
-        | Command::SupersededBy { .. }
-        | Command::Graph(_)
+        | Command::Graph { .. }
         | Command::Setup(_)
         | Command::Cheatsheet
         | Command::Surface

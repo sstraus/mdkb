@@ -747,7 +747,7 @@ pub fn outcome_to_delta(outcome: &str) -> Result<i32> {
 /// superseded.
 pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
-        .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
+        .ok_or_else(|| ErrorKind::MemoryNotFound { id: id.to_string() })?;
 
     if entry.status == EntryStatus::Superseded {
         return Err(ErrorKind::InvalidQuery(format!(
@@ -799,7 +799,7 @@ pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> 
 /// Returns error if entry is superseded or archived.
 pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
-        .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
+        .ok_or_else(|| ErrorKind::MemoryNotFound { id: id.to_string() })?;
 
     if entry.status == EntryStatus::Superseded {
         return Err(ErrorKind::InvalidQuery(format!(
@@ -1287,7 +1287,7 @@ impl Duplicate {
 
 impl From<Duplicate> for Error {
     fn from(duplicate: Duplicate) -> Self {
-        ErrorKind::InvalidQuery(duplicate.message()).into()
+        ErrorKind::DuplicateEntry(duplicate.message()).into()
     }
 }
 
@@ -1303,6 +1303,16 @@ pub fn find_duplicate(
     title: &str,
     embedding: Option<&[f32]>,
 ) -> Result<Option<Duplicate>> {
+    let vector = embedding.map(crate::llm::embeddings::Vector::minilm);
+    find_duplicate_labelled(conn, id, title, vector.as_ref())
+}
+
+pub fn find_duplicate_labelled(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    embedding: Option<&crate::llm::embeddings::Vector>,
+) -> Result<Option<Duplicate>> {
     // The title arm first: it is one indexed comparison and it needs no model,
     // so a cold store is not a store without dedup.
     if let Some(existing) = find_by_exact_title(conn, title, id)? {
@@ -1312,10 +1322,19 @@ pub fn find_duplicate(
     let Some(embedding) = embedding else {
         return Ok(None);
     };
+    if embedding.model == crate::llm::embeddings::Model::Granite107M {
+        // No Granite semantic-duplicate calibration exists; exact-title dedup above still applies.
+        return Ok(None);
+    }
     let mut fetch_limit = NEAR_DUPLICATE_FETCH;
     loop {
-        let neighbours =
-            crate::store::vectors::memory_vector_search(conn, embedding, fetch_limit, None)?;
+        let neighbours = crate::store::vectors::memory_vector_search_for_model(
+            conn,
+            embedding,
+            fetch_limit,
+            None,
+            embedding.model,
+        )?;
         let exhausted = neighbours.len() < fetch_limit;
         for (rowid, distance) in neighbours {
             // The vector query orders by distance. Nothing after this row can
@@ -1376,11 +1395,18 @@ fn find_by_exact_title(
 pub fn find_similar_entries(
     conn: &Connection,
     embedding: &[f32],
+    model: crate::llm::embeddings::Model,
     exclude_rowid: i64,
     exclude_id: &str,
 ) -> Result<String> {
     let mut warnings = String::new();
-    let similar = crate::store::vectors::memory_vector_search(conn, embedding, 5, None)?;
+    // The warning is best effort: a stale, pending or differently selected identity
+    // yields no warning rather than an error for a write that already committed.
+    if !crate::store::vectors::model_is_current(conn, model)? {
+        return Ok(warnings);
+    }
+    let similar =
+        crate::store::vectors::memory_vector_search_for_model(conn, embedding, 5, None, model)?;
     for (sim_rowid, distance) in &similar {
         if *sim_rowid == exclude_rowid || *distance > SIMILAR_ENTRY_DISTANCE {
             continue;
@@ -1489,12 +1515,24 @@ pub fn search_entries_recall(
     entry_type: Option<&str>,
     cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
+    let vector = query_embedding.map(crate::llm::embeddings::Vector::minilm);
+    search_entries_recall_labelled(conn, query_text, vector.as_ref(), limit, entry_type, cfg)
+}
+
+pub fn search_entries_recall_labelled(
+    conn: &Connection,
+    query_text: &str,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
+    limit: usize,
+    entry_type: Option<&str>,
+    cfg: &crate::config::SearchMemoryConfig,
+) -> Result<Vec<ScoredMemoryEntry>> {
     let Some(fts_query) = crate::store::search::build_recall_query(query_text) else {
         // Nothing but stopwords: the vector leg alone would rank the corpus
         // against the embedding of a function word.
         return Ok(Vec::new());
     };
-    search_entries_hybrid_fts(
+    search_entries_hybrid_fts_labelled(
         conn,
         &fts_query,
         query_text,
@@ -1535,242 +1573,275 @@ pub fn search_entries_hybrid_fts(
     entry_type: Option<&str>,
     cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
-    let access_recency_weight = cfg.access_recency_weight;
-    let recency_half_life_secs = cfg.recency_half_life_secs;
-    use crate::store::{hybrid, vectors};
+    let vector = query_embedding.map(crate::llm::embeddings::Vector::minilm);
+    search_entries_hybrid_fts_labelled(
+        conn,
+        fts_query,
+        query_text,
+        vector.as_ref(),
+        limit,
+        entry_type,
+        cfg,
+    )
+}
 
-    // An empty expression is not a query, so neither leg runs: the vector leg
-    // would otherwise rank the whole corpus against the embedding of an empty
-    // string and return arbitrary entries.
-    if crate::store::search::fts_query_is_empty(fts_query) {
-        return Ok(Vec::new());
-    }
+pub fn search_entries_hybrid_fts_labelled(
+    conn: &Connection,
+    fts_query: &str,
+    query_text: &str,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
+    limit: usize,
+    entry_type: Option<&str>,
+    cfg: &crate::config::SearchMemoryConfig,
+) -> Result<Vec<ScoredMemoryEntry>> {
+    crate::store::documents::with_savepoint(conn, "search_entries_hybrid_fts_labelled", || {
+        let access_recency_weight = cfg.access_recency_weight;
+        let recency_half_life_secs = cfg.recency_half_life_secs;
+        use crate::store::{hybrid, vectors};
 
-    // BM25 search (get more for fusion)
-    let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2, entry_type)?;
-
-    // The absolute relevance gate, expressed once as a distance bound. `None`
-    // when the floor is disabled, which restores the pre-gate behavior of
-    // returning every scored candidate.
-    let bound =
-        (cfg.min_recall_cosine > 0.0).then(|| hybrid::distance_bound(cfg.min_recall_cosine));
-
-    // Lexical evidence is a property of (query, entry), independent of which
-    // leg found the entry, so it is computed from the candidate's own text.
-    let strong_lexical = |entry: &MemoryEntry| {
-        hybrid::strong_lexical_match(query_text, &format!("{}\n{}", entry.title, entry.content))
-    };
-
-    // BM25-only fallback: preserve BM25 order but stable-sort by the
-    // access-recency signal so frequently/recently used entries float up
-    // (mirrors the third RRF signal in the fused path below). With no vector
-    // leg, reciprocal BM25 rank supplies the relevance component.
-    let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<ScoredMemoryEntry> {
-        // No vector leg means no distance, so the semantic arm of the gate has
-        // nothing to say and only a strong lexical match is admitted. This is
-        // the deliberate strict case: recall OR-expands the prompt, so keeping
-        // the whole BM25 set here would inject on one shared common word.
-        let mut entries: Vec<(MemoryEntry, bool)> = results
-            .into_iter()
-            .map(|(_, entry)| {
-                let lexical = strong_lexical(&entry);
-                (entry, lexical)
-            })
-            .filter(|(_, lexical)| bound.is_none() || *lexical)
-            .collect();
-        if access_recency_weight > 0.0 {
-            let now = Utc::now().timestamp();
-            entries.sort_by(|(a, _), (b, _)| {
-                let sa = access_recency_score(
-                    a.access_count,
-                    a.last_accessed,
-                    now,
-                    recency_half_life_secs,
-                );
-                let sb = access_recency_score(
-                    b.access_count,
-                    b.last_accessed,
-                    now,
-                    recency_half_life_secs,
-                );
-                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-        entries
-            .into_iter()
-            .take(limit)
-            .enumerate()
-            .map(|(rank, (entry, lexical))| ScoredMemoryEntry {
-                score: final_hybrid_score(1.0 / (rank + 1) as f64, &entry),
-                distance: None,
-                strong_lexical: lexical,
-                entry,
-            })
-            .collect()
-    };
-
-    // If no embedding provided, fall back to BM25-only
-    let Some(query_embedding) = query_embedding else {
-        return Ok(bm25_fallback(bm25_results));
-    };
-
-    // Vector search
-    let vector_results =
-        vectors::memory_vector_search(conn, query_embedding, limit * 2, entry_type)?;
-
-    // If no vector results, fall back to BM25-only
-    if vector_results.is_empty() {
-        return Ok(bm25_fallback(bm25_results));
-    }
-
-    // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)
-    let bm25_for_rrf: Vec<crate::domain::SearchResult> = bm25_results
-        .iter()
-        .map(|(rowid, _)| crate::domain::SearchResult {
-            id: *rowid,
-            collection: String::new(),
-            path: String::new(),
-            title: None,
-            score: 0.0,
-            snippets: vec![],
-            status: None,
-            superseded_by: None,
-            source: None,
-            read_only: false,
-            repo_root: None,
-        })
-        .collect();
-
-    // RRF fusion
-    let config = hybrid::HybridConfig::default();
-    let mut fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
-
-    // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
-    let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results.into_iter().collect();
-
-    // Batch-fetch vector-only entries (not in BM25 results) in a single query
-    let vector_only_rowids: Vec<i64> = fused
-        .iter()
-        .filter(|(rowid, _)| !entry_map.contains_key(rowid))
-        .map(|(rowid, _)| *rowid)
-        .collect();
-    let vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
-
-    // ── Absolute admission ───────────────────────────────────────────────────
-    // Before `normalize_scores`, and before the access-recency bonus, because
-    // both are query-relative: after normalization the best candidate scores
-    // 1.0 whatever the query was, and `final_hybrid_score` then adds
-    // confidence, so a well-confirmed entry about something else clears any
-    // floor. KNN supplies most distances; stored embeddings supply the rest.
-    let mut distances: HashMap<i64, f32> = vector_results.iter().copied().collect();
-    // A BM25 hit outside the bounded KNN pool can still have an embedding.
-    // Recover that evidence before admission: None must mean pending, not distant.
-    // Only fused candidates missing KNN evidence need this indexed lookup.
-    {
-        use zerocopy::AsBytes;
-        let mut distance = conn.prepare(
-            "SELECT vec_distance_L2(embedding, ?1) FROM memory_embeddings WHERE memory_rowid = ?2",
-        )?;
-        for (rowid, _) in &fused {
-            if !distances.contains_key(rowid)
-                && let Some(value) = distance
-                    .query_row(params![query_embedding.as_bytes(), rowid], |row| {
-                        row.get::<_, f32>(0)
-                    })
-                    .optional()?
-            {
-                distances.insert(*rowid, value);
-            }
-        }
-    }
-    let mut evidence: HashMap<i64, (Option<f32>, bool)> = HashMap::new();
-    for (rowid, _) in &fused {
-        let Some(entry) = entry_map.get(rowid).or_else(|| vector_entries.get(rowid)) else {
-            continue;
-        };
-        evidence.insert(
-            *rowid,
-            (distances.get(rowid).copied(), strong_lexical(entry)),
-        );
-    }
-    if let Some(bound) = bound {
-        fused.retain(|(rowid, _)| {
-            evidence
-                .get(rowid)
-                .is_some_and(|(distance, lexical)| hybrid::admits(*lexical, *distance, bound))
-        });
-        if fused.is_empty() {
+        // An empty expression is not a query, so neither leg runs: the vector leg
+        // would otherwise rank the whole corpus against the embedding of an empty
+        // string and return arbitrary entries.
+        if crate::store::search::fts_query_is_empty(fts_query) {
             return Ok(Vec::new());
         }
-    }
 
-    // Third RRF signal: access-count × recency (get-path only). Rank every
-    // candidate rowid by its access_recency_score descending, then fold the
-    // reciprocal-rank contribution back into `fused`. Entries with zero signal
-    // are skipped so they don't displace never-accessed memories.
-    if access_recency_weight > 0.0 {
-        let now = Utc::now().timestamp();
-        let mut ar_ranked: Vec<(i64, f64)> = fused
+        let query_embedding = match query_embedding {
+            Some(vector) if vectors::model_is_current(conn, vector.model)? => Some(vector),
+            _ => None,
+        };
+
+        // BM25 search (get more for fusion)
+        let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2, entry_type)?;
+
+        // The absolute relevance gate, expressed once as a distance bound. `None`
+        // when the floor is disabled, which restores the pre-gate behavior of
+        // returning every scored candidate.
+        let bound =
+            (cfg.min_recall_cosine > 0.0).then(|| hybrid::distance_bound(cfg.min_recall_cosine));
+
+        // Lexical evidence is a property of (query, entry), independent of which
+        // leg found the entry, so it is computed from the candidate's own text.
+        let strong_lexical = |entry: &MemoryEntry| {
+            hybrid::strong_lexical_match(query_text, &format!("{}\n{}", entry.title, entry.content))
+        };
+
+        // BM25-only fallback: preserve BM25 order but stable-sort by the
+        // access-recency signal so frequently/recently used entries float up
+        // (mirrors the third RRF signal in the fused path below). With no vector
+        // leg, reciprocal BM25 rank supplies the relevance component.
+        let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<ScoredMemoryEntry> {
+            // No vector leg means no distance, so the semantic arm of the gate has
+            // nothing to say and only a strong lexical match is admitted. This is
+            // the deliberate strict case: recall OR-expands the prompt, so keeping
+            // the whole BM25 set here would inject on one shared common word.
+            let mut entries: Vec<(MemoryEntry, bool)> = results
+                .into_iter()
+                .map(|(_, entry)| {
+                    let lexical = strong_lexical(&entry);
+                    (entry, lexical)
+                })
+                .filter(|(_, lexical)| bound.is_none() || *lexical)
+                .collect();
+            if access_recency_weight > 0.0 {
+                let now = Utc::now().timestamp();
+                entries.sort_by(|(a, _), (b, _)| {
+                    let sa = access_recency_score(
+                        a.access_count,
+                        a.last_accessed,
+                        now,
+                        recency_half_life_secs,
+                    );
+                    let sb = access_recency_score(
+                        b.access_count,
+                        b.last_accessed,
+                        now,
+                        recency_half_life_secs,
+                    );
+                    sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            entries
+                .into_iter()
+                .take(limit)
+                .enumerate()
+                .map(|(rank, (entry, lexical))| ScoredMemoryEntry {
+                    score: final_hybrid_score(1.0 / (rank + 1) as f64, &entry),
+                    distance: None,
+                    strong_lexical: lexical,
+                    entry,
+                })
+                .collect()
+        };
+
+        // If no embedding provided, fall back to BM25-only
+        let Some(query_embedding) = query_embedding else {
+            return Ok(bm25_fallback(bm25_results));
+        };
+
+        // Vector search
+        let vector_results = vectors::memory_vector_search_for_model(
+            conn,
+            query_embedding,
+            limit * 2,
+            entry_type,
+            query_embedding.model,
+        )?;
+
+        // If no vector results, fall back to BM25-only
+        if vector_results.is_empty() {
+            return Ok(bm25_fallback(bm25_results));
+        }
+
+        // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)
+        let bm25_for_rrf: Vec<crate::domain::SearchResult> = bm25_results
             .iter()
-            .filter_map(|(rowid, _)| {
-                let entry = entry_map.get(rowid).or_else(|| vector_entries.get(rowid))?;
-                let score = access_recency_score(
-                    entry.access_count,
-                    entry.last_accessed,
-                    now,
-                    recency_half_life_secs,
-                );
-                if score > 0.0 {
-                    Some((*rowid, score))
-                } else {
-                    None
-                }
+            .map(|(rowid, _)| crate::domain::SearchResult {
+                id: *rowid,
+                collection: String::new(),
+                path: String::new(),
+                title: None,
+                score: 0.0,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+                source: None,
+                read_only: false,
+                repo_root: None,
             })
             .collect();
-        ar_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (rank, (rowid, _)) in ar_ranked.iter().enumerate() {
-            let bonus = access_recency_weight / (config.rrf_k + rank as f64 + 1.0);
-            if let Some(entry) = fused.iter_mut().find(|(id, _)| id == rowid) {
-                entry.1 += bonus;
+
+        // RRF fusion
+        let config = hybrid::HybridConfig::default();
+        let mut fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
+
+        // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
+        let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results.into_iter().collect();
+
+        // Batch-fetch vector-only entries (not in BM25 results) in a single query
+        let vector_only_rowids: Vec<i64> = fused
+            .iter()
+            .filter(|(rowid, _)| !entry_map.contains_key(rowid))
+            .map(|(rowid, _)| *rowid)
+            .collect();
+        let vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
+
+        // ── Absolute admission ───────────────────────────────────────────────────
+        // Before `normalize_scores`, and before the access-recency bonus, because
+        // both are query-relative: after normalization the best candidate scores
+        // 1.0 whatever the query was, and `final_hybrid_score` then adds
+        // confidence, so a well-confirmed entry about something else clears any
+        // floor. KNN supplies most distances; stored embeddings supply the rest.
+        let mut distances: HashMap<i64, f32> = vector_results.iter().copied().collect();
+        // A BM25 hit outside the bounded KNN pool can still have an embedding.
+        // Recover that evidence before admission: None must mean pending, not distant.
+        // Only fused candidates missing KNN evidence need this indexed lookup.
+        {
+            use zerocopy::AsBytes;
+            let mut distance = conn.prepare(
+            "SELECT vec_distance_L2(embedding, ?1) FROM memory_embeddings WHERE memory_rowid = ?2",
+        )?;
+            for (rowid, _) in &fused {
+                if !distances.contains_key(rowid)
+                    && let Some(value) = distance
+                        .query_row(params![query_embedding.as_bytes(), rowid], |row| {
+                            row.get::<_, f32>(0)
+                        })
+                        .optional()?
+                {
+                    distances.insert(*rowid, value);
+                }
             }
         }
-    }
+        let mut evidence: HashMap<i64, (Option<f32>, bool)> = HashMap::new();
+        for (rowid, _) in &fused {
+            let Some(entry) = entry_map.get(rowid).or_else(|| vector_entries.get(rowid)) else {
+                continue;
+            };
+            evidence.insert(
+                *rowid,
+                (distances.get(rowid).copied(), strong_lexical(entry)),
+            );
+        }
+        if let Some(bound) = bound {
+            fused.retain(|(rowid, _)| {
+                evidence
+                    .get(rowid)
+                    .is_some_and(|(distance, lexical)| hybrid::admits(*lexical, *distance, bound))
+            });
+            if fused.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
 
-    hybrid::normalize_scores(&mut fused);
+        // Third RRF signal: access-count × recency (get-path only). Rank every
+        // candidate rowid by its access_recency_score descending, then fold the
+        // reciprocal-rank contribution back into `fused`. Entries with zero signal
+        // are skipped so they don't displace never-accessed memories.
+        if access_recency_weight > 0.0 {
+            let now = Utc::now().timestamp();
+            let mut ar_ranked: Vec<(i64, f64)> = fused
+                .iter()
+                .filter_map(|(rowid, _)| {
+                    let entry = entry_map.get(rowid).or_else(|| vector_entries.get(rowid))?;
+                    let score = access_recency_score(
+                        entry.access_count,
+                        entry.last_accessed,
+                        now,
+                        recency_half_life_secs,
+                    );
+                    if score > 0.0 {
+                        Some((*rowid, score))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            ar_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (rank, (rowid, _)) in ar_ranked.iter().enumerate() {
+                let bonus = access_recency_weight / (config.rrf_k + rank as f64 + 1.0);
+                if let Some(entry) = fused.iter_mut().find(|(id, _)| id == rowid) {
+                    entry.1 += bonus;
+                }
+            }
+        }
 
-    let mut vector_entries = vector_entries;
+        hybrid::normalize_scores(&mut fused);
 
-    // Resolve fused results to MemoryEntry
-    // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
-    let mut scored_results: Vec<(MemoryEntry, f64, Option<f32>, bool)> = Vec::new();
-    for (rowid, rrf_score) in fused {
-        let entry = if let Some(e) = entry_map.remove(&rowid) {
-            e
-        } else if let Some(e) = vector_entries.remove(&rowid) {
-            e
-        } else {
-            continue;
-        };
-        let final_score = final_hybrid_score(rrf_score, &entry);
-        let (distance, lexical) = evidence.get(&rowid).copied().unwrap_or((None, false));
-        scored_results.push((entry, final_score, distance, lexical));
-    }
+        let mut vector_entries = vector_entries;
 
-    // Re-sort by final score descending
-    scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Resolve fused results to MemoryEntry
+        // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
+        let mut scored_results: Vec<(MemoryEntry, f64, Option<f32>, bool)> = Vec::new();
+        for (rowid, rrf_score) in fused {
+            let entry = if let Some(e) = entry_map.remove(&rowid) {
+                e
+            } else if let Some(e) = vector_entries.remove(&rowid) {
+                e
+            } else {
+                continue;
+            };
+            let final_score = final_hybrid_score(rrf_score, &entry);
+            let (distance, lexical) = evidence.get(&rowid).copied().unwrap_or((None, false));
+            scored_results.push((entry, final_score, distance, lexical));
+        }
 
-    Ok(scored_results
-        .into_iter()
-        .take(limit)
-        .map(
-            |(entry, score, distance, strong_lexical)| ScoredMemoryEntry {
-                entry,
-                score,
-                distance,
-                strong_lexical,
-            },
-        )
-        .collect())
+        // Re-sort by final score descending
+        scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(scored_results
+            .into_iter()
+            .take(limit)
+            .map(
+                |(entry, score, distance, strong_lexical)| ScoredMemoryEntry {
+                    entry,
+                    score,
+                    distance,
+                    strong_lexical,
+                },
+            )
+            .collect())
+    })
 }
 
 /// Get rowid for a memory entry by its slug ID.
@@ -1799,6 +1870,14 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
 /// vector first. This stores that same vector rather than paying the model a
 /// second time through [`embed_entry`].
 pub fn store_entry_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<bool> {
+    store_entry_embedding_labelled(conn, id, &crate::llm::embeddings::Vector::minilm(embedding))
+}
+
+pub fn store_entry_embedding_labelled(
+    conn: &Connection,
+    id: &str,
+    embedding: &crate::llm::embeddings::Vector,
+) -> Result<bool> {
     let Some(rowid) = get_rowid(conn, id)? else {
         return Ok(false);
     };
@@ -1806,7 +1885,7 @@ pub fn store_entry_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> 
         conn,
         rowid,
         embedding,
-        crate::llm::embeddings::MODEL_NAME,
+        embedding.model.identity(),
     )?;
     Ok(true)
 }
@@ -1816,7 +1895,7 @@ pub fn embed_entry(conn: &Connection, id: &str, title: &str, content: &str) -> R
         return Ok(false);
     };
     Ok(matches!(
-        embed_entry_by_rowid(conn, rowid, title, content)?,
+        embed_entry_by_rowid(conn, rowid, title, content, false)?,
         EmbedOutcome::Embedded
     ))
 }
@@ -1841,8 +1920,13 @@ fn embed_entry_by_rowid(
     rowid: i64,
     title: &str,
     content: &str,
+    explicit: bool,
 ) -> Result<EmbedOutcome> {
-    let svc = match crate::llm::get_cached_service() {
+    let model = crate::store::vectors::selected_model(conn)?;
+    if !explicit {
+        crate::store::vectors::require_model(conn, model.identity(), false)?;
+    }
+    let svc = match crate::llm::service_for(model, false) {
         Ok(svc) => svc,
         Err(e) => {
             // Cold model, poisoned lock, or missing asset — leave pending, retry
@@ -1860,12 +1944,7 @@ fn embed_entry_by_rowid(
             return Ok(EmbedOutcome::RowFailed);
         }
     };
-    crate::store::vectors::store_memory_embedding(
-        conn,
-        rowid,
-        &embedding,
-        crate::llm::embeddings::MODEL_NAME,
-    )?;
+    crate::store::vectors::store_memory_embedding(conn, rowid, &embedding, model.identity())?;
     Ok(EmbedOutcome::Embedded)
 }
 
@@ -1963,7 +2042,7 @@ pub fn set_status(conn: &Connection, id: &str, status: EntryStatus) -> Result<()
 }
 
 /// Count entries missing a stored embedding (pending backfill). Surfaced in
-/// `mdkb stats` so a cold-model write leaves a visible, actionable count rather
+/// `mdkb status` so a cold-model write leaves a visible, actionable count rather
 /// than silently degrading hybrid search to BM25.
 pub fn count_pending_embeddings(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
@@ -1985,6 +2064,15 @@ pub fn count_pending_embeddings(conn: &Connection) -> Result<usize> {
 /// on each pass; that's a bounded, visible cost (a warn line + a nonzero
 /// `pending_embeddings`), not silent starvation.
 pub fn backfill_memory_embeddings(conn: &Connection) -> Result<usize> {
+    crate::store::vectors::require_model(
+        conn,
+        crate::store::vectors::selected_model(conn)?.identity(),
+        false,
+    )?;
+    backfill_memory_embeddings_explicit(conn)
+}
+
+pub fn backfill_memory_embeddings_explicit(conn: &Connection) -> Result<usize> {
     let rows: Vec<(i64, String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT e.rowid, e.title, e.content FROM memory_entries e
@@ -1997,7 +2085,7 @@ pub fn backfill_memory_embeddings(conn: &Connection) -> Result<usize> {
     };
 
     drive_backfill(rows, |rowid, title, content| {
-        embed_entry_by_rowid(conn, rowid, title, content)
+        embed_entry_by_rowid(conn, rowid, title, content, true)
     })
 }
 
@@ -4825,7 +4913,8 @@ mod tests {
         )
         .unwrap();
         let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "AllMiniLML6V2")
+            .unwrap();
 
         // Same vector: distance 0, well inside the bar.
         let near = find_duplicate(
@@ -4876,7 +4965,7 @@ mod tests {
                 &conn,
                 rowid,
                 &test_embedding(0.30 + n as f32 * 0.0001),
-                "test",
+                "AllMiniLML6V2",
             )
             .unwrap();
         }
@@ -4889,7 +4978,8 @@ mod tests {
         );
         add_entry(&conn, &live).unwrap();
         let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3050), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3050), "AllMiniLML6V2")
+            .unwrap();
 
         let found = find_duplicate(
             &conn,
@@ -4905,6 +4995,29 @@ mod tests {
         assert_eq!(entry.id, "writer-lock");
     }
 
+    /// A window that comes back short means the index holds no more
+    /// neighbours; the search must stop there instead of widening it.
+    #[test]
+    fn a_lone_archived_neighbour_ends_the_search_without_a_duplicate() {
+        use crate::store::vectors;
+        let conn = setup_db_with_vectors();
+        let mut entry = typed_entry("old", "Old note", "retired", EntryType::Decision);
+        entry.status = EntryStatus::Archived;
+        add_entry(&conn, &entry).unwrap();
+        let rowid = get_rowid(&conn, "old").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "AllMiniLML6V2")
+            .unwrap();
+
+        let found = find_duplicate(
+            &conn,
+            "new",
+            "Another title entirely",
+            Some(&test_embedding(0.30)),
+        )
+        .unwrap();
+        assert!(found.is_none(), "{found:?}");
+    }
+
     #[test]
     fn an_archive_larger_than_the_fetch_window_does_not_hide_a_live_duplicate() {
         use crate::store::vectors;
@@ -4916,7 +5029,8 @@ mod tests {
             entry.status = EntryStatus::Archived;
             add_entry(&conn, &entry).unwrap();
             let rowid = get_rowid(&conn, &id).unwrap().unwrap();
-            vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+            vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "AllMiniLML6V2")
+                .unwrap();
         }
 
         let live = typed_entry(
@@ -4927,7 +5041,8 @@ mod tests {
         );
         add_entry(&conn, &live).unwrap();
         let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.302), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.302), "AllMiniLML6V2")
+            .unwrap();
 
         let found = find_duplicate(
             &conn,
@@ -4963,8 +5078,13 @@ mod tests {
         );
         add_entry(&conn, &wanted).unwrap();
         let wanted_rowid = get_rowid(&conn, "sqlite-writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, wanted_rowid, &test_embedding(0.30), "test")
-            .unwrap();
+        vectors::store_memory_embedding(
+            &conn,
+            wanted_rowid,
+            &test_embedding(0.30),
+            "AllMiniLML6V2",
+        )
+        .unwrap();
 
         // Nearer to the query than the wanted entry, and of another type.
         let decoy = typed_entry(
@@ -4975,7 +5095,8 @@ mod tests {
         );
         add_entry(&conn, &decoy).unwrap();
         let decoy_rowid = get_rowid(&conn, "parser-stack-depth").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, decoy_rowid, &test_embedding(0.10), "test").unwrap();
+        vectors::store_memory_embedding(&conn, decoy_rowid, &test_embedding(0.10), "AllMiniLML6V2")
+            .unwrap();
 
         // A paraphrase: no token of it appears in either entry, so the BM25
         // leg contributes nothing and the answer comes from the vector leg.
@@ -5038,7 +5159,8 @@ mod tests {
         };
         add_entry(&conn, &e1).unwrap();
         let rowid1 = get_rowid(&conn, "auth-basic").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid1, &test_embedding(0.1), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid1, &test_embedding(0.1), "AllMiniLML6V2")
+            .unwrap();
 
         // Entry 2: different keywords but semantically similar embedding
         let e2 = MemoryEntry {
@@ -5066,7 +5188,8 @@ mod tests {
         add_entry(&conn, &e2).unwrap();
         let rowid2 = get_rowid(&conn, "jwt-refresh").unwrap().unwrap();
         // Give jwt-refresh a similar embedding to the query
-        vectors::store_memory_embedding(&conn, rowid2, &test_embedding(0.11), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid2, &test_embedding(0.11), "AllMiniLML6V2")
+            .unwrap();
 
         // Entry 3: unrelated
         let e3 = MemoryEntry {
@@ -5093,7 +5216,8 @@ mod tests {
         };
         add_entry(&conn, &e3).unwrap();
         let rowid3 = get_rowid(&conn, "db-tuning").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid3, &test_embedding(0.9), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid3, &test_embedding(0.9), "AllMiniLML6V2")
+            .unwrap();
 
         // Query: "token expiration" — BM25 matches jwt-refresh, vector matches auth-basic+jwt-refresh
         // Query embedding close to auth entries
@@ -5151,8 +5275,13 @@ mod tests {
             };
             add_entry(&conn, &entry).unwrap();
             let rowid = get_rowid(&conn, &format!("entry-{i}")).unwrap().unwrap();
-            vectors::store_memory_embedding(&conn, rowid, &test_embedding(i as f32 * 0.1), "test")
-                .unwrap();
+            vectors::store_memory_embedding(
+                &conn,
+                rowid,
+                &test_embedding(i as f32 * 0.1),
+                "AllMiniLML6V2",
+            )
+            .unwrap();
         }
 
         let query_emb = test_embedding(0.5);
@@ -6505,7 +6634,8 @@ mod tests {
     fn add_with_embedding(conn: &Connection, entry: &MemoryEntry, embedding: &[f32]) -> i64 {
         add_entry(conn, entry).unwrap();
         let rowid = get_rowid(conn, &entry.id).unwrap().unwrap();
-        crate::store::vectors::store_memory_embedding(conn, rowid, embedding, "test").unwrap();
+        crate::store::vectors::store_memory_embedding(conn, rowid, embedding, "AllMiniLML6V2")
+            .unwrap();
         rowid
     }
 
@@ -6528,7 +6658,14 @@ mod tests {
             );
         }
 
-        let warnings = find_similar_entries(&conn, &offset_embedding(0.0), own, "self").unwrap();
+        let warnings = find_similar_entries(
+            &conn,
+            &offset_embedding(0.0),
+            crate::llm::embeddings::Model::MiniLm,
+            own,
+            "self",
+        )
+        .unwrap();
 
         assert_eq!(
             warnings,
@@ -6782,7 +6919,8 @@ mod tests {
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
         let rowid = get_rowid(&conn, "old").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "AllMiniLML6V2")
+            .unwrap();
 
         let found = find_duplicate(
             &conn,

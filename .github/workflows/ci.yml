@@ -28,13 +28,10 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests
-        run: cargo test --all-features
-
-      # Retrieval eval (docs/retrieval-eval.md). The ONNX model is restored
-      # from the cache when a previous run fetched it; on a miss the warm step
-      # tries once and may fail without failing the job, and the eval then
-      # prints the embedding and hybrid modes as skipped with the reason.
+      # The ONNX model is restored from the cache when a previous run fetched
+      # it; on a miss the warm step tries once and may fail without failing the
+      # job. Tests that embed (smoke_embed, cli_update_*, surface_parity) need
+      # it, so it runs before them; a missing model fails them by name.
       - name: Cache ONNX embedding model
         id: model-cache
         uses: actions/cache@v5
@@ -46,6 +43,12 @@ jobs:
         if: steps.model-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         run: cargo run --all-features --quiet -- eval recall --mode embedding --download
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      # Retrieval eval (docs/retrieval-eval.md). Without the model the eval
+      # prints the embedding and hybrid modes as skipped with the reason.
 
       - name: Retrieval eval
         # No bm25 floor: the absolute recall gate leaves that mode at 0 on this
@@ -75,6 +78,22 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # The ONNX model is restored from the cache when a previous run fetched
+      # it; on a miss the warm step tries once and may fail without failing the
+      # job. Tests that embed (smoke_embed, cli_update_*, surface_parity) need
+      # it, so it runs before them; a missing model fails them by name.
+      - name: Cache ONNX embedding model
+        id: model-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/fastembed/models--Qdrant--all-MiniLM-L6-v2-onnx
+          key: ${{ runner.os }}-fastembed-AllMiniLML6V2
+
+      - name: Warm ONNX model cache
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        run: cargo run --all-features --quiet -- eval recall --mode embedding --download
 
       - name: Run tests
         run: cargo test --all-features --no-fail-fast

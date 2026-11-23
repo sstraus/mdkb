@@ -16,7 +16,7 @@
 //! the caller must wire up: quarantine the corrupt files, SALVAGE the memory
 //! tables out of the quarantined file into the fresh one ([`salvage_memory`]),
 //! and record a [`QuarantineReport`] so the loss is surfaced loudly (stderr now,
-//! `mdkb stats` + SessionStart warmup until the corrupt file is cleaned up).
+//! `mdkb status` + SessionStart warmup until the corrupt file is cleaned up).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,7 +51,7 @@ pub const QUARANTINE_RETENTION: Duration = Duration::from_hours(24 * 15);
 /// [`QUARANTINE_RETENTION`] in whole days, for the surfaces that tell the
 /// operator when the copy goes away.
 ///
-/// Derived here so the two banners — `mdkb stats` and the MCP status payload —
+/// Derived here so the two banners — `mdkb status` and the MCP status payload —
 /// cannot drift from the retention the sweep actually enforces.
 pub const QUARANTINE_RETENTION_DAYS: u64 = QUARANTINE_RETENTION.as_secs() / 86_400;
 
@@ -770,7 +770,7 @@ fn salvage_table(fresh: &Connection, table: &str) -> (usize, bool) {
 }
 
 /// A record of one quarantine event, persisted as a sidecar next to the corrupt
-/// file so `mdkb stats` and SessionStart can surface the loss until the operator
+/// file so `mdkb status` and SessionStart can surface the loss until the operator
 /// cleans up. Serialized to `<corrupt_file>.report.json`.
 ///
 /// The forensic fields exist because a quarantined file on its own has never
@@ -2279,6 +2279,17 @@ mod tests {
             "whatever happened to the copy, the report is still there"
         );
         drop(held);
+    }
+
+    #[test]
+    fn a_salvage_that_read_every_table_is_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-123");
+        make_memory_db(&corrupt);
+        let fresh = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+
+        assert!(salvage_memory(&fresh, &corrupt).complete);
     }
 
     #[test]

@@ -1,12 +1,17 @@
 //! Document embeddings using local ONNX inference.
 //!
-//! Uses fastembed with AllMiniLML6V2 (384-dim) for embedding generation.
+//! Uses fastembed with MiniLM or the pinned Granite107M FP32 encoder.
 //! This is the shared embedding backend for both document search and code
 //! intelligence semantic search.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{
+    EmbeddingModel, InitOptionsUserDefined, Pooling, TextEmbedding, TokenizerFiles,
+    UserDefinedEmbeddingModel,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 
@@ -23,18 +28,186 @@ const EMBED_BATCH_SIZE: usize = 32;
 /// Model identifier stored alongside embeddings for migration detection.
 pub const MODEL_NAME: &str = "AllMiniLML6V2";
 
+/// The encoder contract, including weights, pooling and normalization.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Model {
+    #[default]
+    #[serde(rename = "minilm")]
+    MiniLm,
+    #[serde(rename = "granite107m")]
+    Granite107M,
+}
+
+impl Model {
+    pub const fn identity(self) -> &'static str {
+        match self {
+            Self::MiniLm => MODEL_NAME,
+            Self::Granite107M => {
+                "granite107m:d6cffd338414d6a1c1f5decfad5fec62eebc90d5:fp32:cls:l2:512"
+            }
+        }
+    }
+
+    pub fn from_identity(value: &str) -> Option<Self> {
+        [Self::MiniLm, Self::Granite107M]
+            .into_iter()
+            .find(|m| m.identity() == value)
+    }
+
+    pub fn cached(self) -> bool {
+        match self {
+            Self::MiniLm => model_is_cached(),
+            Self::Granite107M => granite_files().iter().all(|f| {
+                pinned_snapshot(&cache_base_dir(), GRANITE_REPO, GRANITE_REVISION)
+                    .join(f)
+                    .is_file()
+            }),
+        }
+    }
+}
+
+const GRANITE_REPO: &str = "ibm-granite/granite-embedding-107m-multilingual";
+const GRANITE_REVISION: &str = "d6cffd338414d6a1c1f5decfad5fec62eebc90d5";
+fn granite_files() -> [&'static str; 5] {
+    [
+        "model.onnx",
+        "tokenizer.json",
+        "config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+    ]
+}
+fn pinned_snapshot(base: &Path, repo: &str, revision: &str) -> PathBuf {
+    base.join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots")
+        .join(revision)
+}
+
+fn load_model(identity: Model, download: bool) -> Result<TextEmbedding> {
+    let files = granite_files();
+    let (repo_name, revision, pooling) = match identity {
+        Model::MiniLm => (
+            "Qdrant/all-MiniLM-L6-v2-onnx",
+            "5f1b8cd78bc4fb444dd171e59b18f3a3af89a079",
+            Pooling::Mean,
+        ),
+        Model::Granite107M => (GRANITE_REPO, GRANITE_REVISION, Pooling::Cls),
+    };
+    let snapshot = pinned_snapshot(&cache_base_dir(), repo_name, revision);
+    let api = if download {
+        Some(
+            hf_hub::api::sync::ApiBuilder::from_env()
+                .with_cache_dir(cache_base_dir())
+                .build()
+                .map_err(|e| Error::other(e.to_string()))?
+                .repo(hf_hub::Repo::with_revision(
+                    repo_name.into(),
+                    hf_hub::RepoType::Model,
+                    revision.into(),
+                )),
+        )
+    } else {
+        None
+    };
+    let read = |file: &str| -> Result<Vec<u8>> {
+        // Pinned snapshots are complete even without refs/<commit>. hf-hub's
+        // CacheRepo::get requires that optional ref and otherwise misses local files.
+        let local = snapshot.join(file);
+        let path = if local.is_file() {
+            local
+        } else if let Some(api) = &api {
+            api.get(file).map_err(|e| {
+                Error::other(format!(
+                    "Failed to fetch embedding model {identity:?} file {file}: {e}"
+                ))
+            })?
+        } else {
+            return Err(Error::other(
+                "embedding model files not cached; run `mdkb update`",
+            ));
+        };
+        Ok(std::fs::read(path)?)
+    };
+    let tokenizer = TokenizerFiles {
+        tokenizer_file: read(files[1])?,
+        config_file: read(files[2])?,
+        special_tokens_map_file: read(files[3])?,
+        tokenizer_config_file: read(files[4])?,
+    };
+    TextEmbedding::try_new_from_user_defined(
+        UserDefinedEmbeddingModel::new(read(files[0])?, tokenizer).with_pooling(pooling),
+        InitOptionsUserDefined::new().with_max_length(512),
+    )
+    .map_err(|e| Error::other(format!("Failed to initialize {identity:?}: {e}")))
+}
+
+/// A vector and the encoder that produced it. Dimensions do not identify an encoder.
+#[derive(Debug, Clone)]
+pub struct Vector {
+    pub model: Model,
+    pub values: Vec<f32>,
+}
+impl std::ops::Deref for Vector {
+    type Target = [f32];
+    fn deref(&self) -> &[f32] {
+        &self.values
+    }
+}
+impl Vector {
+    pub fn minilm(values: &[f32]) -> Self {
+        Self {
+            model: Model::MiniLm,
+            values: values.to_vec(),
+        }
+    }
+}
+
 /// Shared embedding service for generating document and query vectors.
 ///
 /// Wraps fastembed's `TextEmbedding` model. Thread-safe for concurrent use
 /// via shared reference (fastembed handles internal synchronization).
 pub struct EmbeddingService {
     model: TextEmbedding,
+    identity: Model,
+}
+
+/// Constructions started, constructions finished and instances dropped, since
+/// the process started. Read by the memory benchmark (`examples/memlife`) to
+/// count duplicate cold initializations; nothing in production reads them.
+static STARTED: AtomicUsize = AtomicUsize::new(0);
+static CREATED: AtomicUsize = AtomicUsize::new(0);
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// Lifetime counts of [`EmbeddingService`] instances in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstanceCounts {
+    /// Calls to [`EmbeddingService::new`] that began building a model.
+    pub started: usize,
+    /// Calls that returned a model.
+    pub created: usize,
+    /// Models dropped.
+    pub dropped: usize,
+}
+
+/// The instance counts so far (see [`InstanceCounts`]).
+pub fn instance_counts() -> InstanceCounts {
+    InstanceCounts {
+        started: STARTED.load(Ordering::Relaxed),
+        created: CREATED.load(Ordering::Relaxed),
+        dropped: DROPPED.load(Ordering::Relaxed),
+    }
+}
+
+impl Drop for EmbeddingService {
+    fn drop(&mut self) {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for EmbeddingService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddingService")
-            .field("model", &MODEL_NAME)
+            .field("model", &self.identity)
             .field("dimension", &EMBEDDING_DIM)
             .finish()
     }
@@ -64,15 +237,10 @@ fn cap_rayon_global_pool() {
 
 /// How much nicer than its caller a dedicated embedding process runs.
 ///
-/// Not a thread cap. fastembed's ONNX sessions set
-/// `with_intra_threads(available_parallelism())` and `InitOptions` exposes no
-/// knob for it at the pinned version, so the thread count is not ours to
-/// choose. Priority is, and it expresses the behaviour that was actually
-/// wanted: take every idle core, yield the moment something else wants one.
-/// A static cap cannot do the first half and a load sampler is a scheduler
-/// nobody should have to maintain.
+/// Not a thread cap: [`super::bound_onnx_threads`] is. Priority makes the
+/// bounded threads yield the moment something else wants their cores.
 ///
-/// Measured 2026-09-21 on 14 cores: `mdkb embed` at the caller's priority held
+/// Measured 2026-09-21 on 14 cores: `mdkb update` at the caller's priority held
 /// 900–1080% and took the load average from 10 to 27. Reniced to +15 it still
 /// held 858% with the machine otherwise idle, while a higher-priority
 /// competitor ran unimpeded.
@@ -178,16 +346,26 @@ impl EmbeddingService {
     /// Models are cached in `~/.cache/fastembed/` (shared across all projects)
     /// instead of per-project `.fastembed_cache/` directories.
     pub fn new() -> Result<Self> {
-        cap_rayon_global_pool();
-        let cache_dir = shared_cache_dir();
-        let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
-                .with_cache_dir(cache_dir)
-                .with_show_download_progress(true),
-        )
-        .map_err(|e| Error::other(format!("Failed to initialize embedding model: {e}")))?;
+        Self::for_model(Model::MiniLm, true)
+    }
 
-        Ok(Self { model })
+    pub fn for_model(identity: Model, download: bool) -> Result<Self> {
+        if !download && !identity.cached() {
+            return Err(Error::other(
+                "embedding model not cached; run `mdkb update`",
+            ));
+        }
+        STARTED.fetch_add(1, Ordering::Relaxed);
+        cap_rayon_global_pool();
+        super::bound_onnx_threads();
+        let model = load_model(identity, download)?;
+
+        CREATED.fetch_add(1, Ordering::Relaxed);
+        Ok(Self { model, identity })
+    }
+
+    pub fn identity(&self) -> Model {
+        self.identity
     }
 
     /// Generate embeddings for multiple document texts in batch.
@@ -202,6 +380,13 @@ impl EmbeddingService {
         self.model
             .embed(texts.to_vec(), Some(EMBED_BATCH_SIZE))
             .map_err(|e| Error::other(format!("Failed to embed documents: {e}")))
+    }
+
+    pub fn query(&self, text: &str) -> Result<Vector> {
+        Ok(Vector {
+            model: self.identity,
+            values: self.embed_query(text)?,
+        })
     }
 
     /// Generate embedding for a single query text.
@@ -252,8 +437,10 @@ fn shared_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache/fastembed");
+    // HOME, then USERPROFILE: Windows sets only the second, and reading HOME
+    // alone put the model in a per-directory `.fastembed_cache` there.
+    if let Ok(home) = crate::daemon::config::home_dir() {
+        return home.join(".cache/fastembed");
     }
     // Fallback: use CWD-relative (original fastembed behavior)
     PathBuf::from(".fastembed_cache")
@@ -288,12 +475,8 @@ pub fn model_cache_path() -> PathBuf {
 /// complete, so a snapshot holding `model.onnx` is the signal; a bare cache
 /// directory left by an interrupted download is not.
 pub fn model_cached_at(model_dir: &Path) -> bool {
-    let Ok(snapshots) = std::fs::read_dir(model_dir.join("snapshots")) else {
-        return false;
-    };
-    snapshots
-        .flatten()
-        .any(|snapshot| snapshot.path().join("model.onnx").exists())
+    let snapshot = model_dir.join("snapshots/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079");
+    granite_files().iter().all(|f| snapshot.join(f).is_file())
 }
 
 /// True when the AllMiniLML6V2 weights are cached (see [`model_cached_at`]).
@@ -343,6 +526,30 @@ mod tests {
         // assert the lever itself: once capped, fastembed's `par_chunks` batch
         // loop can no longer fan out to one worker per core on top of ORT's own
         // per-core pool.
+        //
+        // The global pool is per process, and any other test in this binary
+        // that touches rayon first initialises it at one worker per core (CI
+        // saw 4). So the assertion runs in a child that executes only this test.
+        const CHILD: &str = "MDKB_RAYON_CAP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::embeddings::tests::cap_rayon_global_pool_limits_the_batch_loop_to_one_worker",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "child run failed:\n{text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         cap_rayon_global_pool();
         assert_eq!(rayon::current_num_threads(), 1);
         // Idempotent: the second call hits the already-initialised pool and must
@@ -359,10 +566,35 @@ mod tests {
         assert!(!model_cached_at(&model_dir));
         // The layout an interrupted download leaves: blobs, no snapshot file.
         std::fs::create_dir_all(model_dir.join("blobs")).unwrap();
-        std::fs::create_dir_all(model_dir.join("snapshots/abc")).unwrap();
+        std::fs::create_dir_all(
+            model_dir.join("snapshots/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079"),
+        )
+        .unwrap();
         assert!(!model_cached_at(&model_dir));
         // A snapshot holding the weights is a complete download.
-        std::fs::write(model_dir.join("snapshots/abc/model.onnx"), b"onnx").unwrap();
+        std::fs::write(
+            model_dir.join("snapshots/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079/model.onnx"),
+            b"onnx",
+        )
+        .unwrap();
+        assert!(
+            !model_cached_at(&model_dir),
+            "weights alone must never permit network-capable initialization"
+        );
+        for file in [
+            "tokenizer.json",
+            "config.json",
+            "special_tokens_map.json",
+            "tokenizer_config.json",
+        ] {
+            std::fs::write(
+                model_dir
+                    .join("snapshots/5f1b8cd78bc4fb444dd171e59b18f3a3af89a079")
+                    .join(file),
+                b"{}",
+            )
+            .unwrap();
+        }
         assert!(model_cached_at(&model_dir));
     }
 

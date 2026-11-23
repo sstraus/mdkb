@@ -1,4 +1,4 @@
-//! `mdkb daemon` subcommands: `status`, `stop`, `restart`.
+//! `mdkb daemon` subcommands: `stop`, `restart`; `summary` feeds `mdkb status`.
 //!
 //! These read the pid file populated by `run_daemon` and drive the running
 //! daemon via Unix signals. None of them require the daemon to be healthy —
@@ -19,6 +19,10 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const STATUS_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum time `repos prune` waits: a classify per root plus one file write.
+#[cfg(unix)]
+const PRUNE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Maximum time `restart` waits for the fresh daemon's sockets to appear.
 #[cfg(unix)]
 const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -34,6 +38,38 @@ const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(unix)]
 const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
+/// The daemon facts `mdkb status` prints and emits as its `daemon` object.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DaemonSummary {
+    pub running: bool,
+    pub pid: Option<u32>,
+    /// A pid file names a dead process.
+    pub stale_pid: bool,
+    pub base: String,
+    pub uptime_secs: Option<u64>,
+    pub mcp_socket_present: bool,
+    pub hook_socket_present: bool,
+    /// Set when daemon.toml does not parse.
+    pub config_error: Option<String>,
+    /// Repos the running daemon holds; `None` when no daemon runs or it did not answer.
+    pub repos_known: Option<usize>,
+    /// Why `repos_known` is missing although a daemon runs.
+    pub repos_error: Option<String>,
+}
+
+impl DaemonSummary {
+    /// [`summary`] plus the one thing only the running daemon can say: how many repos it holds.
+    pub async fn with_repos() -> Self {
+        let mut summary = summary();
+        match running_daemon_repos().await {
+            Ok(Some(repos)) => summary.repos_known = Some(repos.len()),
+            Ok(None) => {}
+            Err(e) => summary.repos_error = Some(e),
+        }
+        summary
+    }
+}
+
 #[cfg(unix)]
 mod platform {
     use std::path::{Path, PathBuf};
@@ -45,12 +81,11 @@ mod platform {
     use crate::error::{Error, Result};
 
     use super::{
-        RESTART_READY_TIMEOUT, STATUS_QUERY_TIMEOUT, STOP_TIMEOUT, format_duration, process_alive,
+        PRUNE_TIMEOUT, RESTART_READY_TIMEOUT, STATUS_QUERY_TIMEOUT, STOP_TIMEOUT, process_alive,
         signal_term,
     };
 
     struct DaemonState {
-        lock_path: PathBuf,
         base_dir: PathBuf,
         mcp_sock: PathBuf,
         hook_sock: PathBuf,
@@ -77,7 +112,6 @@ mod platform {
                 .and_then(|t| SystemTime::now().duration_since(t).ok());
 
             DaemonState {
-                lock_path,
                 base_dir,
                 mcp_sock,
                 hook_sock,
@@ -118,55 +152,46 @@ mod platform {
         query_repos(DaemonState::probe().running_pid().is_some()).await
     }
 
-    fn present(p: &Path) -> &'static str {
-        if p.exists() { "(present)" } else { "(absent)" }
+    /// Ask the running daemon to prune Gone roots; `None` when no daemon runs.
+    /// Never starts a daemon and never edits `repos.json` itself: the daemon
+    /// owns the map in memory and a second writer would be overwritten by it.
+    pub async fn prune_daemon_repos(
+        paths: &[PathBuf],
+        dry_run: bool,
+    ) -> std::result::Result<Option<crate::daemon::repo_map::PruneReport>, String> {
+        if DaemonState::probe().running_pid().is_none() {
+            return Ok(None);
+        }
+        let result = crate::cli::hook_client::call_running_daemon(
+            crate::daemon::hook_runtime::PRUNE_METHOD,
+            &serde_json::json!({"paths": paths, "dry_run": dry_run}),
+            PRUNE_TIMEOUT,
+        )
+        .await?;
+        serde_json::from_value(result)
+            .map(Some)
+            .map_err(|e| format!("bad prune response: {e}"))
     }
 
-    pub async fn handle_status() -> Result<()> {
+    /// Daemon facts for `mdkb status`. Reads the pid file and sockets only: it
+    /// never asks the daemon anything and never starts one.
+    pub fn summary() -> super::DaemonSummary {
         let s = DaemonState::probe();
-        if let Some(pid) = s.running_pid() {
-            println!("mdkb daemon: running (pid {pid})");
-        } else if let Some(pid) = s.pid {
-            println!(
-                "mdkb daemon: not running (stale pid {pid} in {})",
-                s.lock_path.display()
-            );
-        } else {
-            println!("mdkb daemon: not running");
+        let running = s.running_pid().is_some();
+        super::DaemonSummary {
+            running,
+            pid: s.pid,
+            stale_pid: s.pid.is_some() && !running,
+            base: s.base_dir.display().to_string(),
+            uptime_secs: s.uptime.filter(|_| running).map(|d| d.as_secs()),
+            mcp_socket_present: s.mcp_sock.exists(),
+            hook_socket_present: s.hook_sock.exists(),
+            config_error: crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml"))
+                .err()
+                .map(|e| e.to_string()),
+            repos_known: None,
+            repos_error: None,
         }
-        println!("  base:       {}", s.base_dir.display());
-        // Status is the command run when something is wrong: an unparsable
-        // daemon.toml is reported, never a reason to print nothing.
-        if let Err(e) = crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml")) {
-            println!("  warning:    daemon.toml does not parse, the daemon cannot apply it: {e}");
-        }
-        match query_repos(s.running_pid().is_some()).await {
-            Ok(Some(known)) => {
-                println!("  repos:      {} known", known.len());
-                let rows = crate::daemon::repo_listing::list_repos(&known);
-                for line in crate::daemon::repo_listing::render_text(&rows).lines() {
-                    println!("    {line}");
-                }
-            }
-            Ok(None) => println!("  repos:      unknown (daemon not running)"),
-            Err(e) => println!("  repos:      unavailable: {e}"),
-        }
-        println!(
-            "  mcp  sock:  {} {}",
-            s.mcp_sock.display(),
-            present(&s.mcp_sock)
-        );
-        println!(
-            "  hook sock:  {} {}",
-            s.hook_sock.display(),
-            present(&s.hook_sock)
-        );
-        if let Some(up) = s.uptime {
-            if s.running_pid().is_some() {
-                println!("  uptime:     {}", format_duration(up));
-            }
-        }
-        Ok(())
     }
 
     pub async fn handle_stop() -> Result<()> {
@@ -220,7 +245,9 @@ mod platform {
 }
 
 #[cfg(unix)]
-pub use platform::{handle_restart, handle_status, handle_stop, running_daemon_repos};
+pub use platform::{
+    handle_restart, handle_stop, prune_daemon_repos, running_daemon_repos, summary,
+};
 
 /// No daemon on this platform: the caller falls back to the persisted map.
 #[cfg(not(unix))]
@@ -229,9 +256,21 @@ pub async fn running_daemon_repos() -> std::result::Result<Option<Vec<std::path:
     Ok(None)
 }
 
+/// No daemon on this platform.
 #[cfg(not(unix))]
-pub async fn handle_status() -> Result<()> {
-    Err(Error::other("Daemon commands require Unix"))
+pub fn summary() -> DaemonSummary {
+    DaemonSummary {
+        running: false,
+        pid: None,
+        stale_pid: false,
+        base: String::new(),
+        uptime_secs: None,
+        mcp_socket_present: false,
+        hook_socket_present: false,
+        config_error: None,
+        repos_known: None,
+        repos_error: None,
+    }
 }
 
 #[cfg(not(unix))]
@@ -244,7 +283,7 @@ pub async fn handle_restart() -> Result<()> {
     Err(Error::other("Daemon commands require Unix"))
 }
 
-fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
         format!("{secs}s")
@@ -480,4 +519,13 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         rotate_if_larger_than(&tmp.path().join("daemon.log"), 10).unwrap();
     }
+}
+
+/// No daemon on this platform, so no registry to prune.
+#[cfg(not(unix))]
+pub async fn prune_daemon_repos(
+    _paths: &[std::path::PathBuf],
+    _dry_run: bool,
+) -> std::result::Result<Option<crate::daemon::repo_map::PruneReport>, String> {
+    Ok(None)
 }

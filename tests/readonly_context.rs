@@ -28,23 +28,12 @@ fn set_schema_version(root: &std::path::Path, v: i32) {
         .expect("set version");
 }
 
-const OPTIONAL_TABLES: &[&str] = &[
-    "sessions",
-    "tool_usage",
-    "call_log",
-    "query_events",
-    "experiments_schema_version",
-    "experiments",
-    "experiment_results",
-];
+const OPTIONAL_TABLES: &[&str] = &["sessions", "tool_usage", "call_log", "query_events"];
 
 fn drop_optional_tables(root: &std::path::Path) {
     let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
     conn.execute_batch(
-        "DROP TABLE experiment_results;
-         DROP TABLE experiments;
-         DROP TABLE experiments_schema_version;
-         DROP TABLE query_events;
+        "DROP TABLE query_events;
          DROP TABLE call_log;
          DROP TABLE tool_usage;
          DROP TABLE sessions;",
@@ -78,14 +67,12 @@ fn write_capable_open_backfills_optional_read_schemas() {
     let (_dir, root) = store();
     let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
     conn.execute_batch(
-        "DROP TABLE experiment_results;
-         DROP TABLE experiments;
-         DROP TABLE query_events;
+        "DROP TABLE query_events;
          DROP TABLE call_log;
          DROP TABLE tool_usage;
          DROP TABLE sessions;",
     )
-    .expect("remove optional tables but retain experiment schema version");
+    .expect("remove optional tables");
     drop(conn);
 
     let ctx = Context::open(&root).expect("write-capable open");
@@ -114,22 +101,6 @@ fn legacy_store_without_optional_tables_reads_as_empty() {
     assert!(
         mdkb::core::ops::handle_metrics_export(&ctx, 30)
             .expect("export")
-            .is_empty()
-    );
-
-    assert!(
-        mdkb::core::ops::handle_experiment_status(&ctx, "missing")
-            .expect("experiment status")
-            .is_none()
-    );
-    assert!(
-        mdkb::core::ops::handle_experiment_list(&ctx, false)
-            .expect("experiment list")
-            .is_empty()
-    );
-    assert!(
-        mdkb::core::ops::handle_experiment_list(&ctx, true)
-            .expect("active experiment list")
             .is_empty()
     );
 }
@@ -385,7 +356,7 @@ fn search_and_stats_work_with_no_daemon() {
 
     for args in [
         vec!["search", "daemonless", "--scope", "memory"],
-        vec!["stats"],
+        vec!["status"],
     ] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
             .args(&args)
@@ -455,7 +426,7 @@ fn read_commands_leave_no_write_trace_on_the_store() {
         vec!["collection", "list"],
         vec!["search", "seeded", "--scope", "memory"],
         vec!["get", "seeded"],
-        vec!["stats"],
+        vec!["status"],
         vec!["metrics", "show"],
         vec!["metrics", "latency"],
         vec!["memory", "show", "seeded"],
@@ -463,8 +434,6 @@ fn read_commands_leave_no_write_trace_on_the_store() {
         vec!["memory", "search", "seeded"],
         vec!["memory", "warmup"],
         vec!["memory", "history", "seeded"],
-        vec!["experiment", "status", "missing"],
-        vec!["experiment", "list"],
         vec!["graph", "hubs"],
         vec!["graph", "dangling"],
     ] {
@@ -472,6 +441,9 @@ fn read_commands_leave_no_write_trace_on_the_store() {
             .args(&args)
             .current_dir(&root)
             .env("HOME", home.path())
+            .env_remove("HF_HOME")
+            .env("FASTEMBED_CACHE_DIR", home.path().join("empty-model-cache"))
+            .env("HF_ENDPOINT", "http://127.0.0.1:9")
             .env("MDKB_NO_SPAWN", "1")
             .output()
             .expect("run");
@@ -492,7 +464,8 @@ fn read_commands_leave_no_write_trace_on_the_store() {
         );
     }
 
-    // `HOME` is a fresh tempdir, so the embedding weights are not on disk.
+    // The explicit empty cache ignores inherited model-cache overrides, so this
+    // missing-weight scenario is independent of the machine running the test.
     // `scope=code` is purely semantic — it has no lexical arm to fall back to —
     // and `get_cached_service` no longer downloads on a query path, so the
     // command reports "embedding model not cached" instead of searching. That
@@ -502,9 +475,8 @@ fn read_commands_leave_no_write_trace_on_the_store() {
     for (args, succeeds) in [
         (vec!["search", "missing", "--scope", "code"], false),
         (vec!["search", "missing", "--scope", "symbols"], true),
-        (vec!["code", "search", "missing"], true),
         (vec!["code", "find", "missing"], true),
-        (vec!["code", "info"], true),
+        (vec!["status"], true),
         (vec!["code", "calls", "missing"], false),
         (vec!["code", "callers", "missing"], false),
         (vec!["code", "impact", "missing"], false),
@@ -513,6 +485,9 @@ fn read_commands_leave_no_write_trace_on_the_store() {
             .args(&args)
             .current_dir(&root)
             .env("HOME", home.path())
+            .env_remove("HF_HOME")
+            .env("FASTEMBED_CACHE_DIR", home.path().join("empty-model-cache"))
+            .env("HF_ENDPOINT", "http://127.0.0.1:9")
             .env("MDKB_NO_SPAWN", "1")
             .output()
             .expect("run code read");
@@ -540,11 +515,11 @@ fn a_code_read_does_not_create_a_missing_index() {
     std::fs::remove_file(&code_db).expect("remove fixture code index");
 
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
-        .args(["code", "info"])
+        .args(["code", "callers", "missing"])
         .current_dir(&root)
         .env("MDKB_NO_SPAWN", "1")
         .output()
-        .expect("run code info");
+        .expect("run code callers");
 
     assert!(!out.status.success(), "a missing index must be reported");
     assert!(

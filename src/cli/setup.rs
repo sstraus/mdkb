@@ -912,7 +912,7 @@ pub fn hook_fix_commands(cwd: &Path, profile_dir: Option<&Path>) -> HookFixes {
     }
 }
 
-/// Hook-registration half of `mdkb setup check`: the settings files that are
+/// Hook-registration half of `mdkb doctor --full`: the settings files that are
 /// live for this session, and how their mdkb registrations diverge from
 /// `HOOK_EVENTS`. `user_path` honours `CLAUDE_CONFIG_DIR`, so the check reports
 /// the file the running Claude Code actually reads.
@@ -1019,12 +1019,24 @@ fn upsert_hook_entries(
             *entry_list = serde_json::json!([]);
             entry_list.as_array_mut().unwrap()
         };
-        // Drop any prior mdkb entry for this event so re-running setup replaces
-        // rather than duplicates. See `is_mdkb_hook_entry` for the two cases
-        // (tagged + legacy untagged). rtk's `hook claude` and other hooks don't
-        // match, so they survive.
-        arr.retain(|item| !is_mdkb_hook_entry(item, cli_event));
-        arr.push(mdkb_entry);
+        // Keep the first registration's position: Codex hook trust includes
+        // the group index. Remove later duplicates, including legacy entries,
+        // without changing the relative order of other tools' groups.
+        let mut replaced = false;
+        arr.retain_mut(|item| {
+            if !is_mdkb_hook_entry(item, cli_event) {
+                return true;
+            }
+            if replaced {
+                return false;
+            }
+            *item = mdkb_entry.clone();
+            replaced = true;
+            true
+        });
+        if !replaced {
+            arr.push(mdkb_entry);
+        }
         registered.push((*event_name).to_string());
     }
 

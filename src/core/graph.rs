@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::core::Context;
 use crate::domain::Collection;
 use crate::error::{Error, ErrorKind, Result};
-use crate::store::evolution::{Evolution, RelationshipType};
+use crate::store::evolution::RelationshipType;
 use crate::store::{collections, documents, evolution};
 
 /// Handle `mdkb collection add` command.
@@ -271,10 +271,29 @@ pub fn handle_evolve_extends(
         reason,
     )
 }
-/// Handle `mdkb superseded-by` command - show what replaced this doc.
-pub fn handle_superseded_by(ctx: &Context, path_or_id: &str) -> Result<Vec<Evolution>> {
-    let doc_id = resolve_document_id(ctx, path_or_id)?;
-    evolution::get_superseded_by(&ctx.conn, doc_id)
+/// Handle `mdkb evolve superseded-by` command - the newer documents that evolve this one,
+/// in the same shape `history` prints.
+pub fn handle_superseded_by(
+    ctx: &Context,
+    path_or_id: &str,
+) -> Result<Vec<crate::core::ops::EvolutionHistoryEntry>> {
+    Ok(crate::core::ops::handle_history(ctx, path_or_id)?
+        .into_iter()
+        .filter(|h| h.direction == crate::core::ops::EvolutionDirection::Newer)
+        .collect())
+}
+/// Handle `mdkb evolve remove` - delete one evolution edge by id.
+///
+/// The edge's target becomes current again unless another supersedes or
+/// retracts edge still hides it; delete and status repair are one savepoint.
+pub fn handle_evolve_remove(ctx: &Context, id: i64) -> Result<()> {
+    if evolution::delete_evolution(&ctx.conn, id)? {
+        Ok(())
+    } else {
+        Err(Error::from(ErrorKind::Other(format!(
+            "evolution relationship #{id} not found; `mdkb evolve history <doc>` lists the ids"
+        ))))
+    }
 }
 /// Outgoing edges from an entity (the entity must be an indexed document).
 /// Edge sources are resolved to `relative_path` so output never leaks numeric ids.
@@ -350,9 +369,16 @@ pub(crate) fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64
             return Ok(doc.id);
         }
     }
-
+    // The forms the graph layer accepts: `.md` added or removed, a leading
+    // `./` or collection name stripped, then declared identities and aliases.
+    // One resolver, so `evolve`/`history`/`current` accept what `get` and
+    // `graph` accept.
+    if let Some(id) = crate::store::graph::resolve_entity_ref(&ctx.conn, path_or_id)? {
+        return Ok(id);
+    }
+    let tried = crate::store::graph::resolvable_forms(&ctx.conn, path_or_id).join(", ");
     Err(Error::from(ErrorKind::DocumentNotFound {
-        id: path_or_id.to_string(),
+        id: format!("{path_or_id} (tried: {tried})"),
     }))
 }
 /// Resolve a graph entity argument to a document id. Extends `resolve_document_id`
@@ -360,17 +386,7 @@ pub(crate) fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64
 /// `links`/`neighbors`/`path` accept a bare slug (`people/x`) exactly like
 /// `backlinks` does — not only `people/x.md` or a numeric id.
 fn resolve_graph_entity(ctx: &Context, entity: &str) -> Result<i64> {
-    if let Ok(id) = resolve_document_id(ctx, entity) {
-        return Ok(id);
-    }
-    // Tolerate collection-prefixed paths (`map/people/x.md` == `people/x.md`).
-    if let Some(id) = crate::store::graph::resolve_entity_ref(&ctx.conn, entity)? {
-        return Ok(id);
-    }
-    let tried = crate::store::graph::resolvable_forms(&ctx.conn, entity).join(", ");
-    Err(Error::from(ErrorKind::DocumentNotFound {
-        id: format!("{entity} (tried: {tried})"),
-    }))
+    resolve_document_id(ctx, entity)
 }
 /// Canonical key for a path target. When `b` names an existing document — by
 /// numeric id or path, exactly as the start argument is resolved — use that

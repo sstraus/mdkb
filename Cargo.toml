@@ -1,6 +1,6 @@
 [package]
 name = "mdkb"
-version = "3.14.0"
+version = "3.16.0"
 edition = "2024"
 description = "Persistent memory, hybrid search, and code intelligence for Claude Code and Codex — with CLI, lifecycle hooks, and MCP"
 license = "Apache-2.0"
@@ -78,7 +78,6 @@ sha2 = "0.10"
 ring = "0.17"
 same-file = "1"
 walkdir = "2"
-glob = "0.3"
 globset = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
@@ -89,9 +88,11 @@ regex = "1"
 
 # Embedding - semantic search with local ONNX models
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
-# Same hf-hub fastembed resolves, named here to fetch the recall reranker's
-# pinned revision (fastembed cannot: its reranker downloader has no int8 file).
+# Same hf-hub fastembed resolves, used for pinned encoder files and cache-only loading.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
+# The ONNX Runtime fastembed pins, named here to give every session one bounded
+# global thread pool (fastembed builds each session with one thread per core).
+ort = { version = "=2.0.0-rc.9", default-features = false }
 
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
@@ -127,7 +128,7 @@ rayon = "1.10"
 subtle = { version = "2", optional = true }
 
 # HTTPS server (self-signed certs)
-rcgen = { version = "0.13", optional = true }
+rcgen = { version = "0.13", optional = true, features = ["x509-parser"] }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
 rustls = { version = "0.23", features = ["ring"], default-features = false, optional = true }
 
@@ -152,6 +153,12 @@ rmcp = { version = "3.3", features = ["server", "transport-io", "client"] }
 # `test-util` gives tests a paused clock, so a timeout measured in minutes
 # (the daemon's shutdown drain) can be asserted without waiting for one.
 tokio = { version = "1", features = ["full", "test-util"] }
+# examples/mlbench: generic ONNX and Model2Vec adapters for the multilingual
+# retrieval benchmark. Same versions fastembed already pulls in.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray"] }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ndarray = { version = "0.16", default-features = false }
+half = "2"
 
 # Line tables keep file:line in panic backtraces and drop only the variable and
 # type data a debugger uses. Cold `cargo test --no-run` on the box: 973 s and
@@ -163,6 +170,13 @@ debug = "line-tables-only"
 lto = true
 codegen-units = 1
 strip = true
+
+# Benchmark tools: release codegen without the minutes of fat LTO. Inference
+# time is spent in the prebuilt ONNX Runtime, not in this crate's code.
+[profile.mlbench]
+inherits = "release"
+lto = false
+codegen-units = 16
 
 # Lint configuration per Pragmatic Rust Guidelines (M-STATIC-VERIFICATION)
 [lints.rust]

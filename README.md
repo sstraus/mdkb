@@ -90,7 +90,7 @@ fixed or a user correction, and asks a configured local or remote CLI
 machine-matchable trigger. Lessons that recur across sessions are promoted to
 **priors** and injected exactly where their trigger fires: before a tool call,
 after one, or on a matching prompt. Each injection is settled at the next Stop
-as confirmed or refuted, and `mdkb stats` shows what mining did. Off by
+as confirmed or refuted, and `mdkb status` shows what mining did. Off by
 default. See [Priors](#priors).
 
 ### 4. Structural code intelligence, with audits built on it
@@ -100,15 +100,23 @@ tree-sitter indexes 14 languages into persistent symbols and typed edges
 through a tiered cascade that keeps the written qualifier and the inferred
 receiver type, so `store.write()` and `cache.write()` are different edges and
 an unresolved call says so instead of inventing one. Two audits read the same
-index: `mdkb dup` reports what the repository says twice, bucketed by how
-trustworthy each finding is, and `mdkb coupling` reports files that change
+index: `mdkb code dup` reports what the repository says twice, bucketed by how
+trustworthy each finding is, and `mdkb code coupling` reports files that change
 together in Git with no confidently resolved `Calls` edge between them. See
 [Code Intelligence](#code-intelligence).
 
 ### 5. Retrieval you can measure
 
+> **Real prompts, blind-judged: the multilingual encoder finds the right memory.**
+> On 80 real developer prompts (mostly Italian) over a 4,000-entry memory store,
+> `granite107m` ranked a relevant memory first twice as often as the English
+> default and had one in its top five for every answerable prompt. Its automatic
+> floor stays strict on purpose: on a second, held-out set of 100 prompts every
+> lower floor injected more wrong memories than right ones.
+> [How we measured it](docs/embedding-real-prompts-eval.md).
+
 `mdkb eval` scores memory search against a held-out fixture and fails CI below
-a floor; `mdkb stats` reports hook activation, hit rate, latency and mining
+a floor; `mdkb status` reports hook activation, hit rate, latency and mining
 outcomes; the opt-in developer telemetry profile records recall quality without
 storing prompt text. Numbers in this README and in `CHANGES.md` come from those
 commands, run on this repository. See [Retrieval eval](#retrieval-eval),
@@ -116,7 +124,7 @@ commands, run on this repository. See [Retrieval eval](#retrieval-eval),
 
 Also included: two knowledge graphs (frontmatter and wikilink relations for
 docs, typed relations for memory), 13 annotated MCP tools with a CLI twin for
-each (`mdkb surface`), self-maintaining indexes with integrity checks and
+each (`mdkb cheatsheet` prints the map), self-maintaining indexes with integrity checks and
 repair, and store namespaces so a consumer's test suite cannot pollute its own
 memory.
 
@@ -157,6 +165,9 @@ mdkb setup mcp claude --scope local
 
 # Or user-scoped (global)
 mdkb setup mcp claude --scope user
+
+# Codex CLI (writes ~/.codex/config.toml; --dry-run prints the merged file)
+mdkb setup mcp codex
 ```
 
 Restart Claude Code after setup. The MCP server auto-indexes on startup and watches for file changes.
@@ -175,6 +186,11 @@ mdkb setup hooks claude --scope local
 
 # Claude Code, user-scoped / global (writes ~/.claude/settings.json)
 mdkb setup hooks claude --scope user
+
+# Another Claude Code profile. Without --profile-dir, user scope writes to
+# $CLAUDE_CONFIG_DIR when it is set, else ~/.claude. The same flag works on
+# `setup remove hooks claude`.
+mdkb setup hooks claude --scope user --profile-dir ~/.claude-private
 
 # Terminal 1: serve native HTTP hooks (SessionStart remains a command hook)
 export MDKB_TOKEN='replace-with-a-secret'
@@ -216,7 +232,7 @@ other enabled hooks do not require the sigil.
 ego setup registers the installed binary as `mdkb_prompt_command`; it preserves
 a different existing value unless `--force` is given. Use `--dry-run` to preview
 the TOML. Hosts without transcript files can send bounded inline Stop episodes
-for settlement. See [ego setup and event contracts](docs/hooks.md#ego-prompt-context).
+for settlement. See [ego setup and event contracts](docs/hooks.md#ego-generic-lifecycle-hooks).
 Lifecycle commands outside a project consume their input and exit successfully
 without creating a store.
 
@@ -229,36 +245,104 @@ it while a miss on a sigil prompt costs one search.
 
 | `[hooks]` / `[search.memory]` key | Default | What it gates |
 | --- | --- | --- |
-| `search.memory.min_recall_cosine` | `0.40` | The floor for a `*`-prefixed prompt. Lowest floor admitting no labelled negative on the eval fixture. |
-| `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. Calibrated from the positive recall curve — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
-| `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
+| `search.memory.min_recall_cosine` | MiniLM `0.40`; Granite `0.70` | Memory relevance gate for `*` recall and explicit memory search; a strong lexical match can also admit a result. Granite's default is provisional, selected on an English fixture, not a general rejection guarantee. |
+| `hooks.recall_auto_min_cosine` | MiniLM `0.50`; Granite `0.782` | The semantic floor for automatic memory recall when vector evidence is available. See [docs/retrieval-eval.md](docs/retrieval-eval.md) for the MiniLM curve. |
+| `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall uses the selected model's automatic floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
 
-Cross-encoder reranking is separate and **off by default**. With
-`hooks.recall_rerank_languages = []`, recall stays MiniLM-only: `mdkb embed`
-does not fetch reranker weights and the daemon does not load the cross-encoder.
-To opt in for Italian prompts only:
+Choose the embedding model in each store's `.mdkb/config.toml`:
 
 ```toml
-[hooks]
-recall_rerank_languages = ["it"]
-recall_rerank_min_scores = { it = -1.05, en = -1.95 }
+[embedding]
+model = "minilm" # English default; "granite107m" for multilingual retrieval
 ```
 
-Run `mdkb embed` after opting in to fetch the weights. Only `it` and `en` are
-recognised by the prompt-language detector; a tied vote uses Italian. Each
-selected language needs a finite floor in the table. An explicit table replaces
-the fitted defaults. The English floor came from a small synthetic store and
-admitted 3/24 held-out negatives, so review it before enabling English. Missing
-floors and unsupported codes are configuration errors. Old `recall_rerank_it` /
-`recall_rerank_en` keys are rejected, not translated; replace them with the list.
-Old `recall_rerank_min_score_it/en` keys must become the table above. Daemon
-admission, MCP startup, lifecycle hooks and document watcher updates refuse
-removed rerank keys and log their replacements, rather than discard the file
-and run with defaults. Hooks remain best-effort: they skip the event and
-exit successfully. Diagnostic commands such as `doctor` can still report the
-invalid file. Other malformed files keep the existing logged whole-file fallback;
-malformed daemon hot-reloads keep the last good config. A model already loaded by a previous opt-in stays resident until the daemon restarts.
+To use one model on every repository of the machine, set it once in
+`~/.mdkb/daemon.toml`; a repository's own `[embedding] model` still wins:
+
+```toml
+[embedding]
+model = "granite107m"
+```
+
+**A store with content or questions in any language other than English needs
+`granite107m`.** MiniLM is an English model. It does not place a translation
+near its source, so a question in one language does not reliably find memory or
+documents written in another, and recall can inject the English and the
+translated copy of one entry as two items. Granite places a translation pair
+closer together than two distinct entries, so cross-language search works and
+recall injects one copy.
+
+`granite107m` uses the pinned Granite107M FP32 model with CLS pooling and L2
+normalization. Each store keeps its own selection; searching another repository
+uses that repository's encoder. Serving requests load cached model files only;
+a separate migration worker can fetch missing weights without blocking the
+request. `mdkb update` can also fetch missing weights explicitly.
+
+Changing the selection makes existing document, chunk, memory and code vectors
+stale, even though both models produce 384 dimensions. When the daemon encounters
+an incompatible writable store, it schedules a full rebuild in the background.
+The user does not need to discover or run a recovery command. Heavy migrations
+are serialized within the process, and repeated encounters do not start duplicate
+work for the same store. Read-only discovery does not start a migration.
+Automatic full migration requires the long-lived daemon; a short-lived in-process
+hook or direct CLI route does not own a background rebuild. For those routes,
+use `mdkb update --reembed` explicitly or encounter the store through the daemon.
+
+Regeneration retains source content and records a durable pending state until
+every corpus is complete. Lexical retrieval remains available; incompatible or
+partial vectors are not served. After a failed attempt, an encounter can retry
+after 30 seconds; a configuration change makes a retry eligible immediately.
+The rebuild holds writer admission while it regenerates vectors. Required
+mutations can wait and may reach a client's timeout; lexical reads stay available.
+`mdkb update --reembed` remains available for an explicit rebuild or retry;
+it cannot be restricted to one collection. `stats` and `doctor` report selected,
+current and pending identity, including the code archive. Proven legacy MiniLM
+stores are recognized without a full rebuild; mixed or unknown legacy identities
+also need safe regeneration.
+
+MiniLM's recall floors stay unchanged. Granite defaults to `0.782` for automatic
+memory admission, an initial proxy rounded above the largest
+calibration-negative threshold in the existing four-corpus comparison. On real
+prompts it is the best floor tested: every lower floor serves more prompts but
+adds more wrong entries than relevant ones (see the table below). Granite's
+document floor is
+`0.77`, measured on labelled Italian, English, German, French and Spanish
+questions. Granite's provisional memory
+floor is `0.70` for sigil recall and explicit memory search. The floor trades
+recall for rejection and does not eliminate false admissions. Explicit owner
+floors are preserved independently, even if their ordering differs from the
+defaults. Code thresholds retain their existing meanings. Granite
+semantic duplicate rejection and merge are disabled pending calibration;
+explicit title/key operations remain available.
+
+**Measured on real prompts, not a synthetic fixture.** Same store, same 3,997
+memories, real prompts sent through the production `UserPromptSubmit` hook,
+every injected memory judged blind. Ranking without any floor, on 80 prompts:
+Granite places a relevant memory in the top five for 18 of 18 answerable prompts
+(MiniLM 12) and at rank one for 10 (MiniLM 5).
+
+Granite floor sweep, on the 80-prompt set and on a held-out set of 100 prompts:
+
+| Automatic floor | Served, first set | Wrong, first set | Served, held-out | Wrong, held-out |
+|---|---:|---:|---:|---:|
+| **`0.782` (default)** | **4 of 18** | **1 of 10** | **1 of 27** | **3 of 9** |
+| `0.76` | 6 of 18 | 1 of 18 | 5 of 27 | 12 of 30 |
+| `0.74` | 8 of 18 | 20 of 48 | 9 of 27 | 42 of 73 |
+| `0.70` | 12 of 18 | 74 of 136 | 15 of 27 | 100 of 179 |
+
+Lower floors serve more prompts but inject more wrong memories than right ones on
+the held-out set, so the default stays. Automatic recall serves few interactive
+prompts: cosine alone does not separate a relevant memory from an unrelated one
+in the same area, and neither a lexical condition, a relative gate nor the
+previous turn fixed that on held-out prompts. Counts at `0.782` are small (9-10
+injections), so its wrong rate is not yet known to better than tens of points.
+Method, limits and the full breakdown are in
+[docs/embedding-real-prompts-eval.md](docs/embedding-real-prompts-eval.md).
+
+Production no longer downloads, loads or invokes a reranker. Remove all
+`hooks.recall_rerank_*` keys; they are rejected with migration guidance.
+Historical evaluation reports and benchmark adapters remain available.
 
 **`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
 chose it on 2026-09-30 without a shadow week. The measurement that would have
@@ -353,8 +437,16 @@ Add to your Claude Code MCP config (`.claude/mcp.json` or `~/.claude/mcp.json`):
 The `mcp` subcommand connects to the daemon via unix socket (auto-spawning it
 if needed). Each Claude Code session runs a lightweight proxy instead of a
 full in-process server, sharing one daemon for file watching and indexing.
+`mdkb mcp --socket <path>` connects the proxy to another socket (Unix only). It
+is an error when MCP runs in-process, because the flag would have no effect.
 
-## MCP Tools (12)
+### Network transport (`mdkb serve`)
+
+`mdkb serve --http|--https` serves MCP, native HTTP hooks and `/health` over
+the network with a bearer token. Flags, TLS certificate and the daemon mode:
+[docs/daemon.md](docs/daemon.md#network-transport-mdkb-serve).
+
+## MCP Tools (13)
 
 | Tool | Description |
 |------|-------------|
@@ -372,7 +464,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `repos` | Known repos, one row each: name, kind, doc/memory/symbol counts, index freshness, health. Same rows as `mdkb repos list` |
 | `usage` | Session and lifetime token ledger (per-tool call counts, token totals, truncation stats) |
 
-Every advertised tool includes MCP annotations for read-only, destructive,
+Write tools accept `dry_run` (`memory_write`, `memory_write_batch`, `memory_delete`); each tool's JSON Schema lists every parameter. Every advertised tool includes MCP annotations for read-only, destructive,
 idempotent, and open-world behavior. These hints describe effects; server-side
 validation and write admission remain authoritative.
 
@@ -382,14 +474,27 @@ validation and write admission remain authoritative.
 |-------|-----------------|
 | `source` | Current eligible source lines, including identifiers and comments; report partial scans rather than claiming absence |
 | `literals` | Indexed AST values, not identifiers or all source text |
-| `symbols` | Indexed symbol-name search for uncertain spellings; use `mdkb code find NAME` for an exact definition |
+| `symbols` | Indexed symbol-name search for uncertain spellings; use `mdkb code search NAME --exact` for an exact definition |
 | `semantic-code` | Semantic search across indexed symbols, not exhaustive textual matches |
 | `docs` | Hybrid BM25 + semantic search over indexed documents |
 | `memory` | Hybrid BM25 + semantic search over memory entries. CLI `--entry-type` and MCP `kind` narrow this corpus |
 | `knowledge` | Indexed documents and memory; does not include source or literals |
 | `duplicates` | Audit of near-identical bodies, not a retrieval query; `since="<ref>"` narrows it to clusters touched by a change |
 
-Name a scope explicitly for agent searches. Legacy defaults differ: CLI also searches indexed literals, while MCP searches docs and memory. Old `text`/`strings` (CLI) search AST literals, and old `code` searches semantic symbols. Existing `symbols`, `docs`, and `memory` JSON shapes remain unchanged unless CLI `--search-contract v2` or MCP `contract="v2"` requests a coverage envelope. An indexed no-match does not prove current working-tree absence when freshness is unknown.
+Name a scope explicitly for agent searches. MCP searches docs and memory when no scope is given. The CLI has one command per scope:
+
+| MCP scope | CLI command |
+|-----------|-------------|
+| `docs` | `mdkb search QUERY --docs` |
+| `memory` | `mdkb memory search QUERY` |
+| `knowledge` | `mdkb search QUERY` |
+| `symbols` | `mdkb code search NAME` |
+| `code`, `semantic-code` | `mdkb code search QUERY --semantic` |
+| `source` | `mdkb code grep PATTERN` |
+| `literals` | `mdkb code grep VALUE --literals` |
+| `duplicates` | `mdkb code dup` |
+
+Existing `symbols`, `docs`, and `memory` MCP JSON shapes remain unchanged unless MCP `contract="v2"` requests a coverage envelope. An indexed no-match does not prove current working-tree absence when freshness is unknown.
 
 ### Memory
 
@@ -441,7 +546,7 @@ settles them itself; the loop is off until a distiller is configured.
    must answer with one JSON object: a falsifiable lesson (160 characters, no
    hedging), a trigger kind (`prompt`, `pre_tool`, `post_tool`) with a
    machine-matchable pattern, a scope, and the failure/fix evidence. Anything
-   else is rejected. `mdkb setup check` runs the configured CLI once and prints
+   else is rejected. `mdkb doctor --full` runs the configured CLI once and prints
    the prior or the failure; four tested configurations are in
    [docs/hooks.md](docs/hooks.md).
 2. **Cluster and promote.** Candidates with the same trigger, or a lesson within
@@ -457,7 +562,7 @@ settles them itself; the loop is off until a distiller is configured.
    `mdkb memory confirm <id> --outcome confirmed|refuted` records a human
    verdict on the same counters. The belief score gates future injection.
 
-`mdkb stats` shows mining outcomes for the last seven days (gated, distilled,
+`mdkb status` shows mining outcomes for the last seven days (gated, distilled,
 promoted, rejected, failed, with the last reason). Priors are excluded from
 default searches and listings; query them with `--entry-type prior`. A prior
 can also be written by hand with `entry_type="prior"`, and receives the same
@@ -509,10 +614,10 @@ To force-index files inside a hidden directory, annotate your `.gitignore`:
 Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 
 ```bash
-mdkb embed
+mdkb update
 ```
 
-`mdkb embed` lowers its own scheduling priority by `search.embed_nice` (default
+`mdkb update` lowers its own scheduling priority by `search.embed_nice` (default
 15) so a backfill over a large corpus yields to the editor and the hooks running
 beside it. Unix only, and one-way — an unprivileged process may lower its own
 priority and may not raise it back, which is why only this command does it and
@@ -530,13 +635,15 @@ reported, because those kinds say the two files are related, not that they must
 change together.
 
 ```bash
-mdkb dup                          # sweep the repository
-mdkb dup --file src/code/parsing  # scope the candidates
-mdkb dup --since HEAD             # review mode: only clusters your change touched
-mdkb dup --semantic               # add the embedding pass (minutes, not seconds)
-mdkb coupling                     # 5+ shared commits over the last year
-mdkb coupling --since 6.months --min-cochanges 3
-mdkb dup --format json               # findings with their distance, for bucketing
+mdkb code dup                          # sweep the repository
+mdkb code dup --file src/code/parsing  # scope the candidates
+mdkb code dup --since HEAD             # review mode: only clusters your change touched
+mdkb code dup --semantic               # add the embedding pass (minutes, not seconds)
+mdkb code coupling                     # 5+ shared commits over the last year
+mdkb code coupling --since 6.months --min-cochanges 3
+mdkb graph coupling              # document <-> source pairs; "drifted" = source changed after the doc
+mdkb code coupling --ref origin/main   # walk another revision instead of the current branch
+mdkb code dup --format json               # findings with their distance, for bucketing
 ```
 
 `dup` runs two passes. The structural one compares fingerprints, needs no
@@ -559,22 +666,37 @@ the same `buckets` summary alongside `evidence.hamming` per cluster. See
 
 ## CLI Reference
 
+Run `mdkb cheatsheet` for the task-to-command table, and `mdkb <command> --help` for flags. A wrong
+command prints one line, `error: <what is wrong>. Run: <command that works>`, and exits 2. Under
+`--format json` the same error is `{"error": "...", "run": "..."}` on stderr.
+
 ### Search
 
+One command per thing you look for. Unquoted words are one query.
+
 ```bash
-mdkb search "handler" --scope source --root .
-mdkb search --scope source -e 'first phrase' -e 'second phrase' --root .
-mdkb code find handler
-mdkb search "handler" --scope symbols --kind function
-mdkb search "auth handler" --scope semantic-code
-mdkb search "authentication flow" --scope knowledge
+mdkb search recall latency budget           # docs and memory, two groups, each with its own --limit
+mdkb search handler --docs -c guides        # documents only, one collection
+mdkb search handler --memory                # memory only; same as `mdkb memory search handler`
+mdkb search handler --entry-type decision   # memory entries of one type (implies --memory)
+mdkb code search handler -k function        # symbols by name, fuzzy, exact matches first
+mdkb code search handler --exact --path src # only symbols named exactly this, under a path prefix
+mdkb code search "auth handler" --semantic  # symbols by meaning
+mdkb code grep "handler" --path src/        # live source lines
+mdkb code grep -e 'first phrase' -e 'second phrase' -i
+mdkb code grep "Fork from here" --literals  # indexed AST literal values (JSX text, i18n strings)
 ```
+
+`search --format json` prints `{"documents": [...], "memory": [...]}`; a group you did not ask for is
+an empty list. `code search --format json` prints an array of symbols; `code grep --format json` prints
+`{hits, status, coverage, truncated}`. When `search` finds nothing, or the query looks like a code name,
+it prints the `code search` command on stderr.
 
 ### Collections
 
 ```bash
 mdkb collection add <name> <path> [--pattern <glob>]
-mdkb collection remove <name>
+mdkb collection rm <name>
 mdkb collection rename <old> <new>
 ```
 
@@ -586,11 +708,34 @@ mdkb get 42 --lines 10:50
 mdkb get "docs/*.md"
 ```
 
+### Document Evolution
+
+Record that one document replaces or changes another. A document accepts the
+same reference forms as `get`.
+
+```bash
+mdkb evolve link docs/adr-2.md supersedes docs/adr-1.md --reason "queue moved to SQS"
+mdkb evolve link NEW updates  OLD --reason R   # partial change, OLD stays current
+mdkb evolve link NEW corrects OLD --reason R   # error fix, OLD stays current
+mdkb evolve link NEW extends  OLD --reason R   # added content, OLD stays current
+mdkb evolve link NEW retracts OLD --reason R   # withdrawal, OLD becomes retracted
+mdkb evolve history docs/adr-1.md           # edges with their #N ids
+mdkb evolve current docs/adr-1.md           # follow the chain to the current version
+mdkb evolve superseded-by docs/adr-1.md
+mdkb evolve unlink 3                        # delete edge #3 from `history` (alias: rm)
+```
+
+`supersedes` and `retracts` take the old document out of default search and
+recall; `search --include-superseded` brings it back. A cycle is refused.
+After `evolve unlink`, the old document is current again unless another
+`supersedes` or `retracts` edge still hides it.
+
 ### Code Commands
 
 ```bash
-mdkb code index
-mdkb code search "handler" --kind fn
+mdkb update --code            # index source code only (creates .mdkb/code.sqlite)
+mdkb update --code --force    # rebuild the code index from scratch
+mdkb code search "handler" --kind function
 mdkb code calls main
 mdkb code callers handle_get
 mdkb code impact init --depth 5
@@ -605,10 +750,11 @@ for end users:
 ```bash
 mdkb setup developer                       # 30-day retention
 mdkb setup developer --retention-days 14
-mdkb metrics status
+mdkb status
 mdkb metrics show --period 7
 mdkb metrics latency --period 7
 mdkb metrics quality --period 7
+mdkb metrics export --period 30 --format csv  # raw query events (json, csv, text)
 mdkb metrics purge --yes                   # delete every query event
 ```
 
@@ -626,7 +772,7 @@ The two reports answer different questions:
 
 - `mdkb metrics quality/latency` measures recalls:
   result count, score bands, repeated-query rate, and latency.
-- `mdkb stats` measures engagement. In the Hooks table, `user_prompt_submit`
+- `mdkb status` measures engagement. In the Hooks table, `user_prompt_submit`
   `Calls` is the denominator, `Fired` is successful activation, and `Hit%` is
   the activation rate. A low Hit% indicates that the opt-in instruction may be
   missed; it does not by itself mean retrieval quality is poor.
@@ -733,19 +879,27 @@ how a directory that merely holds repositories is served rather than refused,
 how collections scope folders inside one store, and how cross-repo search fans
 out and states its coverage.
 
+### Daemon Control
+
+`mdkb status|stop|restart` and `~/.mdkb/daemon.toml`:
+[docs/daemon.md](docs/daemon.md).
+
 ### Cross-repository search
 
 One daemon answers about every repository it knows. The map of known roots
 lives in `repos.json`, is seeded from `[[repos]]` in `daemon.toml`, is extended
-by every store the daemon opens, and survives a restart. `mdkb daemon status`
+by every store the daemon opens, and survives a restart. `mdkb status`
 asks the running daemon for that list over its socket, so it answers at once
 and never walks the disk; with no daemon running it says so and lists nothing.
 
-Healthy roots not opened for more than 30 days leave this map, not the disk.
-Set `repo_expiry_days` in `daemon.toml` to another number of days, or `0` to
-turn expiry off. Explicit `[[repos]]` entries and hand-written repo scopes do
-not expire; unreadable stores stay on the map. Expiry runs at map load and
-when the daemon lists known roots. Opening a forgotten store records it again.
+Unpinned roots not opened for more than 30 days leave this map, not the disk,
+whether the directory is present, gone, or no longer holds a store. Set
+`repo_expiry_days` in `daemon.toml` to another number of days, or `0` to turn
+expiry off. Explicit `[[repos]]` entries and hand-written repo scopes do not
+expire; unreadable stores stay on the map. Expiry runs at map load and when
+the daemon lists known roots. The limit is measured from the last successful
+access, not from the first failed probe; startup also drops absent roots
+immediately. Opening a forgotten or moved store records its current path again.
 Activity is persisted on the first successful access per UTC day, including
 access to an already-open handle; later accesses that day do not rewrite the
 file. Thus activity has less than one day of precision. Existing entries without
@@ -790,6 +944,9 @@ ignore rules, and configured ignored paths. Explicit known roots below a pruned
 ancestor remain reachable and are walked independently. Discovery does not
 follow directory symlinks. Register or explicitly name a repository under a
 pruned generated/worktree tree rather than expecting an ancestor scan to find it.
+A repository under a configured ignored path (`ignore = ["~/Gits/.tmp"]` in
+`daemon.toml`) is served while it is open but is never recorded in the
+registry, so scratch repositories leave no `repos list` row.
 
 The daemon caches discovery per covered root set and coalesces simultaneous
 misses, so repeated clients do not repeat the same walk. A repository the daemon
@@ -808,8 +965,10 @@ mdkb memory add auth-patterns -t "OAuth2 PKCE Flow" -T topic --tags auth,securit
   -c "Always use PKCE for public clients..."
 mdkb memory add pay-bill -t "Pay electricity bill" -T reminder --due-in 86400 \
   -c "Monthly utility payment"
+mdkb memory add scratch-note -t "Scratch" -T topic -c "..." --ttl 3600   # expires after one hour
 mdkb memory list
-mdkb memory search "authentication"
+mdkb memory rm scratch-note   # also deletes .mdkb/memory/entries/scratch-note.md
+mdkb memory search "authentication"   # same as `mdkb search "authentication" --memory`
 mdkb memory history auth-patterns
 mdkb memory curate-priors <cluster-id> <cluster-id>...  # merge reviewed prior clusters
 
@@ -826,6 +985,12 @@ mdkb memory export --dir ./memories --include-expired --overwrite
 mdkb memory import .mdkb/memory/entries --skip-duplicates
 mdkb memory import entries.json --dry-run --skip-duplicates
 ```
+
+#### Triggered rules
+
+`memory add --trigger '{"tool":"Bash","command_contains":"cargo"}'` makes the
+hooks inject an entry where it applies, once per session. Selectors and rules:
+[docs/hooks.md](docs/hooks.md#triggered-memory-rules).
 
 #### Team sync (git)
 
@@ -891,20 +1056,20 @@ configuration.
 
 ### Stats
 
-`mdkb stats` is the unified diagnostic dashboard introduced in 2.0.0 (replaces the former `mdkb status` — not aliased, it was removed).
+`mdkb status` is the one-page diagnostic dashboard. It replaces `mdkb stats`, `mdkb code info`, `mdkb daemon status` and `mdkb metrics status`; those names were removed and fail with the command to run instead. Every line that is not healthy ends with the command that fixes it.
 
 ```bash
 # Unified ASCII diagnostic dashboard
-mdkb stats
+mdkb status
 
 # Machine-readable JSON output (safe for pipes and scripts)
-mdkb stats --format json
+mdkb status --format json
 
 # Plain text (no ANSI color, no Unicode box-drawing)
-mdkb stats --no-color
+mdkb status --no-color
 ```
 
-The report is stacked: header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (invocations, hit rate, latency, prior mining, registration drift). Output auto-detects whether stdout is a TTY; the JSON format is stable for scripting.
+The report is stacked: problems (from `mdkb doctor`, each with its fix) → header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (invocations, hit rate, latency, prior mining, registration drift) → daemon (running, pid, uptime, repos held) → developer telemetry (enabled, retention, stored events). Output auto-detects whether stdout is a TTY; `--format json` prints one object: every key of the former `stats` report at the same path, plus `daemon` and `telemetry`. Outside a repository it prints only `daemon`, `error` and `run`.
 
 #### Sessions
 
@@ -912,8 +1077,8 @@ The sessions row comes from Claude Code session JSONL files under
 `~/.claude/projects`, indexed per project for token usage and tool-call counts:
 
 ```bash
-mdkb session index
-mdkb session index --sessions-path /path/to/sessions --project-root /path/to/project
+mdkb update --sessions
+mdkb update --sessions --sessions-path /path/to/sessions --project-root /path/to/project
 ```
 
 The same data backs the `usage` MCP tool: `usage(session_only=true)` for the
@@ -939,7 +1104,7 @@ max_response_tokens = 50000
 max_document_tokens = 10000
 
 [search]
-# Scheduling priority `mdkb embed` gives up while it works. 0 disables it.
+# Scheduling priority `mdkb update` gives up while it works. 0 disables it.
 embed_nice = 15
 
 [graph]
@@ -952,11 +1117,16 @@ relations = "auto"
 identity_keys = ["id", "aliases"]
 ```
 
-`mdkb init` writes every setting with its default, commented out. A key mdkb does not read is ignored on load; `mdkb update` warns and names it by its dotted path.
+`mdkb init` writes every setting with its default, commented out. A key mdkb does not read is ignored on load; `mdkb update` warns and names it by its dotted path. Keys not covered here: [docs/configuration.md](docs/configuration.md).
+
+### Daemon configuration (`~/.mdkb/daemon.toml`)
+
+Machine-wide daemon settings (whitelist, open-store limit, discovery,
+expiry, scopes, telemetry): [docs/daemon.md](docs/daemon.md#daemon-configuration-mdkbdaemontoml).
 
 ### Controlling what gets indexed
 
-Both the document walker (`mdkb update`) and the code walker (`mdkb code index`) share a unified ignore system:
+Both the document walker (`mdkb update`) and the code walker (`mdkb update --code`) share a unified ignore system:
 
 | Mode                       | Files honored                                  | Use when                                                               |
 | -------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------- |
@@ -1011,6 +1181,18 @@ not the current schema version. No manual column edit or index deletion is neede
 for that defect. Use `mdkb repos refresh --only outdated` for a deliberate upgrade
 of known older stores with verified backups.
 
+To remove repositories that no longer exist from the registry, run
+`mdkb repos prune --dry-run`, then `mdkb repos prune [PATH...]`. The running
+daemon removes only roots whose directory is gone (Gone) or whose `.mdkb` is
+missing, empty or holds only lock files (NoStore). With no PATH it removes every such root and
+skips all others without a mention. With PATHs (as `mdkb repos list` prints
+them), healthy, unreadable and unknown paths are refused and reported, the
+removable paths of the same selection are still removed,
+and the exit status is non-zero; `--format json` reports `removed` and `refused`.
+Nothing but the registry entry is removed. With no daemon, or one that predates
+the command, nothing changes; after a timeout, check `mdkb repos list` before
+retrying.
+
 Project state stays local in `.mdkb/`:
 
 ```
@@ -1021,7 +1203,7 @@ Project state stays local in `.mdkb/`:
 └── memory/           # Memory entries (markdown mirror + index.json cache)
 ```
 
-The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached in the platform's user cache directory.
+The embedding model (AllMiniLML6V2, ~30MB ONNX, English; Granite107M for multilingual stores, see the `[embedding]` section above) is downloaded on first use and cached in the platform's user cache directory.
 
 `MDKB_NAMESPACE=<name>` points a process at `.mdkb/namespaces/<name>/` instead:
 its own index, memory projection and locks, invisible to `memory list`, search

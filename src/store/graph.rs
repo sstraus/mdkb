@@ -227,7 +227,7 @@ pub fn get_outgoing(
 /// [`ref_forms`]) so a wikilink `[[projects/x]]` and a document path
 /// `projects/x.md` resolve to the same node.
 pub fn get_incoming(conn: &Connection, entity: &str, relation: Option<&str>) -> Result<Vec<Edge>> {
-    let forms = ref_forms(entity);
+    let forms = target_forms(conn, entity)?;
     let form_count = forms.len();
     let placeholders = (1..=form_count)
         .map(|i| format!("?{i}"))
@@ -253,6 +253,39 @@ pub fn get_incoming(conn: &Connection, entity: &str, relation: Option<&str>) -> 
         edges.push(row?);
     }
     Ok(edges)
+}
+
+/// Every string an edge may have written to name `entity`.
+///
+/// The textual forms of the reference itself, plus — when it resolves to a
+/// document — that document's path forms, its collection-prefixed path forms,
+/// and every identity it declares. So backlinks by path, by `id:` or by alias
+/// return the same edges, as `hubs` and `path` already did (story 075-b14e).
+fn target_forms(conn: &Connection, entity: &str) -> Result<Vec<String>> {
+    let mut forms = ref_forms(entity);
+    let Some(doc_id) = resolve_entity_ref(conn, entity)? else {
+        return Ok(forms);
+    };
+    let mut push = |form: String| {
+        if !forms.contains(&form) {
+            forms.push(form);
+        }
+    };
+    if let Some(path) = doc_relative_path(conn, doc_id) {
+        for form in ref_forms(&path) {
+            push(form);
+        }
+        for prefix in collection_prefixes(conn) {
+            for form in ref_forms(&format!("{prefix}/{path}")) {
+                push(form);
+            }
+        }
+    }
+    let mut stmt = conn.prepare("SELECT alias FROM document_aliases WHERE doc_id = ?1")?;
+    for alias in stmt.query_map(params![doc_id], |r| r.get::<_, String>(0))? {
+        push(alias?);
+    }
+    Ok(forms)
 }
 
 /// An edge rendered for display: the numeric `source_doc_id` is resolved to the
@@ -1080,6 +1113,50 @@ mod tests {
         // And by the raw slug form.
         let by_slug = get_incoming(&conn, "projects/x", None).unwrap();
         assert_eq!(by_slug.len(), 1);
+    }
+
+    /// Story 075-b14e: backlinks matched only the literal target string, so a
+    /// document named by its `id:` or an alias had no backlinks by path, while
+    /// `hubs` and `path` resolved the same edges to it.
+    #[test]
+    fn backlinks_by_path_id_or_alias_return_the_same_edges() {
+        let conn = setup_db();
+        let alice = declare(&conn, "people/alice.md", "person:alice");
+        add_alias(&conn, alice, "@alice", "aliases").unwrap();
+        let adr1 = insert_doc(&conn, "adr/1.md");
+        let adr2 = insert_doc(&conn, "adr/2.md");
+        let adr3 = insert_doc(&conn, "adr/3.md");
+        add_edge(&conn, adr1, "person:alice", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, adr2, "@alice", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(
+            &conn,
+            adr3,
+            "people/alice",
+            RELATION_WIKILINK,
+            KIND_WIKILINK,
+            None,
+        )
+        .unwrap();
+
+        let sources = |entity: &str| {
+            let mut ids: Vec<i64> = get_incoming(&conn, entity, None)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.source_doc_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let all = vec![adr1, adr2, adr3];
+        assert_eq!(sources("people/alice"), all, "by path without .md");
+        assert_eq!(sources("people/alice.md"), all, "by path");
+        assert_eq!(
+            sources("docs/people/alice.md"),
+            all,
+            "by collection-prefixed path"
+        );
+        assert_eq!(sources("person:alice"), all, "by id");
+        assert_eq!(sources("@alice"), all, "by alias");
     }
 
     #[test]

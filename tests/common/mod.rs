@@ -204,8 +204,9 @@ impl McpTestHarness {
             return response;
         }
 
-        // Poll until the server's startup reindex finishes and ctx is available.
-        // The status tool needs ctx, so a successful call means the server is ready.
+        // Probe server readiness after the protocol handshake.
+        // A successful snapshot is ready at that instant; call_tool also handles
+        // a startup task that acquires its writer admission after this probe.
         let start = std::time::Instant::now();
         loop {
             let status = self.call_tool("status", json!({}));
@@ -225,10 +226,30 @@ impl McpTestHarness {
 
     /// Call an MCP tool and return the result.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.send_request(
-            "tools/call",
-            json!({ "name": name, "arguments": arguments }),
-        )
+        // Startup writer admission can finish after the first successful status
+        // snapshot. Retry only its pre-dispatch refusal, never a completed tool
+        // result or another protocol error (especially a mutation's error).
+        let start = std::time::Instant::now();
+        loop {
+            let response = self.send_request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            );
+            if response["error"]["code"] != -32603
+                || !matches!(
+                    response["error"]["message"].as_str(),
+                    Some("Server initializing, retry shortly" | "Repo initializing, retry shortly")
+                )
+            {
+                return response;
+            }
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "Server for {} refused {name} during startup for 10s: {response}",
+                self.root.display()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// Extract text content from a tool call result.

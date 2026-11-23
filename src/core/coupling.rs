@@ -1,4 +1,4 @@
-//! `mdkb coupling`: pairs of files that git says must change together, but
+//! `mdkb code coupling`: pairs of files that git says must change together, but
 //! the code graph has never recorded an edge between.
 //!
 //! The static graph answers "what does this call?"; git answers "what broke
@@ -32,7 +32,7 @@ use crate::git::{CoChangeHistory, co_change_history};
 ///
 /// Below this, two files sharing a handful of commits is coincidence — a
 /// docs pass or a dependency bump that happened to touch both — not a
-/// pattern. Matches the order of magnitude `mdkb dup`'s own defaults use for
+/// pattern. Matches the order of magnitude `mdkb code dup`'s own defaults use for
 /// "this is not noise".
 pub const DEFAULT_MIN_COCHANGES: usize = 5;
 
@@ -55,7 +55,7 @@ pub const DEFAULT_SINCE: &str = "12 months ago";
 /// work for that false signal: a single 500-file commit would contribute
 /// ~124,750 pairs. 100 is comfortably above an ordinary multi-file feature
 /// commit and comfortably below a repo-wide sweep.
-const MAX_FILES_PER_COMMIT: usize = 100;
+pub(crate) const MAX_FILES_PER_COMMIT: usize = 100;
 
 /// What the caller overrode on the command line. `None` keeps the default.
 #[derive(Debug, Default, Clone)]
@@ -100,7 +100,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
     let code_path = root.join(".mdkb/code.sqlite");
     let missing = || CouplingReport {
         markdown: format!(
-            "# Hidden Coupling\n\nNo code index in {}. Run `mdkb code index` first.\n",
+            "# Hidden Coupling\n\nNo code index in {}. Run `mdkb update --code` first.\n",
             root.display()
         ),
         findings: Vec::new(),
@@ -110,7 +110,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
         return Ok(missing());
     }
 
-    // Announce the connection before opening it, matching `mdkb dup`: autoheal
+    // Announce the connection before opening it, matching `mdkb code dup`: autoheal
     // quarantines by renaming the path while surviving connections still
     // derive -wal/-shm from it, and the shared live lock is what makes
     // quarantine wait instead.
@@ -190,7 +190,7 @@ pub fn handle_coupling(root: &Path, overrides: &CouplingOverrides) -> Result<Cou
 /// path twice inside one `--name-only` diff (e.g. a rename recorded as a
 /// delete and an add of the same path under `--no-renames`), and an
 /// unordered pair must not be counted twice for the same commit.
-fn count_cochanges(
+pub(crate) fn count_cochanges(
     commits: &[Vec<String>],
     max_files_per_commit: usize,
 ) -> HashMap<(String, String), usize> {
@@ -254,7 +254,7 @@ fn connected_file_pairs(code: &Connection) -> Result<HashSet<(String, String)>> 
 /// [`connected_file_pairs`]. A commit's file list is filtered against this
 /// set before counting co-changes, so a lockfile paired with the source file
 /// it accompanies never becomes a candidate in the first place.
-fn indexed_file_set(code: &Connection) -> Result<HashSet<String>> {
+pub(crate) fn indexed_file_set(code: &Connection) -> Result<HashSet<String>> {
     let mut stmt = code.prepare("SELECT rel_path FROM code_files")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut set = HashSet::new();

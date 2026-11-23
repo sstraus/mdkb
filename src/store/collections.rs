@@ -100,18 +100,29 @@ pub fn get_collection_document_count(conn: &Connection, name: &str) -> Result<i6
 pub fn rename_collection(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
     super::external::refuse_collection(old_name)?;
     super::external::refuse_collection(new_name)?;
-    let rows_affected = conn.execute(
-        "UPDATE collections SET name = ?1 WHERE name = ?2",
-        params![new_name, old_name],
-    )?;
-
-    if rows_affected == 0 {
-        return Err(ErrorKind::CollectionNotFound {
-            name: old_name.to_string(),
+    // `documents.collection` references `collections(name)` with no ON UPDATE
+    // action, so renaming the parent row in place violates the key as soon as
+    // the collection holds a document. Copy the row under the new name, move
+    // the documents, then drop the old row (its cascade now finds nothing).
+    super::documents::with_savepoint(conn, "rename_collection", || {
+        let copied = conn.execute(
+            "INSERT INTO collections (name, path, pattern, source, created_at, updated_at)
+             SELECT ?1, path, pattern, source, created_at, updated_at FROM collections WHERE name = ?2",
+            params![new_name, old_name],
+        )?;
+        if copied == 0 {
+            return Err(ErrorKind::CollectionNotFound {
+                name: old_name.to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    Ok(())
+        conn.execute(
+            "UPDATE documents SET collection = ?1 WHERE collection = ?2",
+            params![new_name, old_name],
+        )?;
+        conn.execute("DELETE FROM collections WHERE name = ?1", params![old_name])?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -247,6 +258,39 @@ mod tests {
             .unwrap()
             .expect("should exist");
         assert_eq!(renamed.path, "./path");
+    }
+
+    #[test]
+    fn rename_carries_indexed_documents_to_the_new_name() {
+        let conn = setup_db();
+        add_collection(&conn, &make_collection("notes", "./notes")).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h1', '# m', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
+             VALUES ('notes', 'm1.md', 'h1', 'M1', 0, 0)",
+            [],
+        )
+        .unwrap();
+
+        rename_collection(&conn, "notes", "meetings").expect("rename with documents succeeds");
+
+        let moved: String = conn
+            .query_row(
+                "SELECT collection FROM documents WHERE relative_path = 'm1.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(moved, "meetings");
+        assert!(get_collection(&conn, "notes").unwrap().is_none());
+        assert_eq!(
+            get_collection(&conn, "meetings").unwrap().unwrap().path,
+            "./notes"
+        );
     }
 
     #[test]

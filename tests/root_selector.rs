@@ -33,10 +33,23 @@ fn parse(raw: &str) -> Result<RootSelector, String> {
     RootSelector::parse(Some(raw))
 }
 
+/// A scratch directory with no store above it. `$TMPDIR` can sit inside a home
+/// that holds a real `~/.mdkb`, and the nearest-store walk then resolves there.
+fn scratch_outside_any_store() -> tempfile::TempDir {
+    #[cfg(unix)]
+    {
+        tempfile::TempDir::new_in("/tmp").expect("tmp")
+    }
+    #[cfg(not(unix))]
+    {
+        tempfile::tempdir().expect("tmp")
+    }
+}
+
 /// Catches: an uninitialized path silently opening a store outside the known map.
 #[test]
 fn an_outside_path_names_the_path_and_refuses_an_unknown_repo() {
-    let tmp = tempfile::tempdir().expect("tmp");
+    let tmp = scratch_outside_any_store();
     let alpha = dir(tmp.path(), "alpha");
     let stranger = dir(tmp.path(), "stranger");
     std::fs::create_dir(stranger.join(".mdkb")).unwrap();
@@ -52,7 +65,7 @@ fn an_outside_path_names_the_path_and_refuses_an_unknown_repo() {
 /// of the nearest registered ancestor, including after normalizing dot components.
 #[test]
 fn descendant_paths_select_the_nearest_registered_ancestor() {
-    let tmp = tempfile::tempdir().expect("tmp");
+    let tmp = scratch_outside_any_store();
     let outer = dir(tmp.path(), "outer");
     let nested = dir(&outer, "nested");
     let leaf = dir(&nested, "src");

@@ -17,12 +17,17 @@ pub struct HybridConfig {
     pub vector_weight: f64,
 }
 
+/// Both legs weigh the same. A vector weight of 0.7 put the best vector-only
+/// hit (0.7/61) below the 24th BM25 hit (1/84). Recall OR-expands the prompt, so
+/// BM25 always filled its pool and the documents recall saw were BM25 hits only.
+/// Measured 2026-11-21 on 12 Italian questions over the tuicommander store: the
+/// target document had a cosine in 6 of 12 recall pools at 0.7, 10 of 12 at 1.0.
 impl Default for HybridConfig {
     fn default() -> Self {
         Self {
             rrf_k: 60.0,
             bm25_weight: 1.0,
-            vector_weight: 0.7,
+            vector_weight: 1.0,
         }
     }
 }
@@ -49,9 +54,16 @@ pub fn rrf_fusion(
         *scores.entry(*doc_id).or_default() += score;
     }
 
-    // Sort by combined score descending
+    // Sort by combined score descending. Equal weights make exact ties common
+    // (rank 0 + rank 1 in one leg equals rank 1 + rank 0 in the other), and the
+    // map has no order of its own: the lower id wins a tie, so every process
+    // returns the same order.
     let mut results: Vec<_> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
 
     results
 }
@@ -413,8 +425,34 @@ mod tests {
     fn test_config_default() {
         let config = HybridConfig::default();
         assert!((config.rrf_k - 60.0).abs() < 0.001);
-        assert!((config.bm25_weight - 1.0).abs() < 0.001);
-        assert!((config.vector_weight - 0.7).abs() < 0.001);
+    }
+
+    /// Catches tie order left to `HashMap` iteration: two processes ranked an
+    /// exact tie differently, so CLI and MCP returned different memory entries.
+    #[test]
+    fn test_rrf_exact_tie_orders_by_id() {
+        let bm25 = vec![make_bm25_result(7, 1.0), make_bm25_result(3, 0.9)];
+        let vector = vec![(3, 0.1), (7, 0.2)];
+        for _ in 0..32 {
+            let fused = rrf_fusion(&bm25, &vector, &HybridConfig::default());
+            assert_eq!(
+                fused.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![3, 7]
+            );
+        }
+    }
+
+    /// Catches a vector leg that cannot reach the head of the fused list: with a
+    /// lighter vector weight, every hit of a full BM25 pool (an OR-expanded recall
+    /// query always fills it) outranked the best vector-only hit, so a pool of the
+    /// first 12 held BM25 hits only.
+    #[test]
+    fn test_best_vector_hit_ranks_with_best_bm25_hit_in_a_full_pool() {
+        let bm25: Vec<SearchResult> = (1..=24).map(|id| make_bm25_result(id, 1.0)).collect();
+        let vector: Vec<(i64, f32)> = (100..124).map(|id| (id, 0.1)).collect();
+        let fused = rrf_fusion(&bm25, &vector, &HybridConfig::default());
+        let head: Vec<i64> = fused.iter().take(2).map(|(id, _)| *id).collect();
+        assert!(head.contains(&1) && head.contains(&100), "{head:?}");
     }
 
     #[test]
@@ -517,10 +555,10 @@ mod tests {
             assert!(*score > 0.0);
         }
 
-        // BM25 docs should generally rank higher due to higher weight
+        // Equal weights interleave the two legs rank by rank.
         let top_10: Vec<i64> = fused.iter().take(10).map(|(id, _)| *id).collect();
         let bm25_in_top10 = top_10.iter().filter(|id| **id <= 50).count();
-        assert!(bm25_in_top10 >= 7); // Most of top 10 should be from BM25
+        assert_eq!(bm25_in_top10, 5, "{top_10:?}");
     }
 
     #[test]

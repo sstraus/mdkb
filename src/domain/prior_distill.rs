@@ -477,22 +477,34 @@ impl DistillerRun {
         excerpt(&self.stdout, max_chars)
     }
 
-    /// What the CLI said about its own failure: stdout when it printed
-    /// something, stderr otherwise. A rejected codex model exits non-zero with
-    /// an empty stdout and the HTTP status on stderr, so reporting stdout alone
-    /// names no cause; a CLI that did answer makes its answer the evidence and
-    /// its stderr mere progress logging.
+    /// Prefer stdout, otherwise start at the last explicit stderr error and
+    /// retain its following detail. Error markers are hints, not provenance:
+    /// an echoed prompt can contain them too. Redact before truncation.
     pub fn failure_excerpt(&self, max_chars: usize) -> String {
-        if self.stdout.trim().is_empty() {
-            return excerpt(&self.stderr, max_chars);
+        if !self.stdout.trim().is_empty() {
+            return self.stdout_excerpt(max_chars);
         }
-        excerpt(&self.stdout, max_chars)
+        let mut source = self.stderr.as_str();
+        let mut offset = 0;
+        for line in self.stderr.split_inclusive('\n') {
+            if line
+                .trim_start()
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("error:"))
+            {
+                source = &self.stderr[offset..];
+            }
+            offset += line.len();
+        }
+        excerpt(source, max_chars)
     }
 }
 
-/// The first `max_chars` characters of `s`, trimmed, with an ellipsis when cut.
+/// Redact, trim and bound a diagnostic, with an ellipsis when cut.
 fn excerpt(s: &str, max_chars: usize) -> String {
-    let trimmed = s.trim();
+    // Conservative redaction can also mask ordinary words in credential positions.
+    let redacted = redact_secrets(s);
+    let trimmed = redacted.trim();
     if trimmed.chars().count() <= max_chars {
         return trimmed.to_string();
     }
@@ -1128,6 +1140,106 @@ mod tests {
             msg.contains("400 Bad Request"),
             "the cause must be in the line: {msg}"
         );
+    }
+
+    /// Catches: a startup warning or trailing shutdown trace hides the actual HTTP failure.
+    #[test]
+    fn a_warning_prefixed_distiller_failure_reports_the_recorded_auth_error() {
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stderr: include_str!("../../tests/fixtures/distiller-warning-auth-error.stderr"),
+            exit: 1,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let run = run_distiller_cli(&program, &args, "p").expect("fixture must run");
+        let msg = distiller_failure("distiller", &run, None).expect("failure must be reported");
+        assert!(msg.contains("401 Unauthorized"), "{msg}");
+        assert!(msg.contains("authentication in header"), "{msg}");
+        assert!(!msg.contains("Untrusted project"), "{msg}");
+        assert!(!msg.contains("Shutting down"), "{msg}");
+    }
+
+    /// Catches: the first failed retry wins, or mixed-case terminal errors are ignored.
+    #[test]
+    fn distiller_failure_reports_the_last_explicit_error_regardless_of_case() {
+        let recorded = include_str!("../../tests/fixtures/distiller-warning-auth-error.stderr");
+        let terminal = recorded
+            .lines()
+            .find(|line| line.starts_with("ERROR:"))
+            .unwrap();
+        for marker in ["ERROR:", "error:", "Error:"] {
+            let run = DistillerRun {
+                stdout: String::new(),
+                stderr: format!(
+                    "ERROR: earlier attempt\n  {}\n",
+                    terminal.replacen("ERROR:", marker, 1)
+                ),
+                exit_code: Some(1),
+            };
+            let msg = distiller_failure("distiller", &run, None).unwrap();
+            assert!(msg.contains("401 Unauthorized"), "{marker}: {msg}");
+            assert!(!msg.contains("earlier attempt"), "{marker}: {msg}");
+        }
+    }
+
+    /// Catches: truncating before redaction leaks a token prefix, or byte slicing breaks Unicode.
+    #[test]
+    fn distiller_failure_redacts_credentials_before_bounding_unicode_output() {
+        let secret = "private-token-".repeat(40);
+        for (stdout, exit_code) in [(false, 1), (true, 1), (true, 0)] {
+            let output = format!("ERROR: token={secret} {}", "é".repeat(300));
+            let run = DistillerRun {
+                stdout: if stdout {
+                    output.clone()
+                } else {
+                    String::new()
+                },
+                stderr: if stdout { String::new() } else { output },
+                exit_code: Some(exit_code),
+            };
+            let reject = (exit_code == 0).then_some(DistillReject::NotJson);
+            let msg = distiller_failure("distiller", &run, reject.as_ref()).unwrap();
+            assert!(msg.contains("token=[REDACTED]"), "{msg}");
+            assert!(!msg.contains("private-token"), "{msg}");
+            let excerpt = run.failure_excerpt(200);
+            assert_eq!(excerpt.chars().count(), 201);
+            assert!(excerpt.ends_with('…'));
+        }
+    }
+
+    /// Catches: choosing one error line discards the diagnostic's following cause.
+    #[test]
+    fn a_multiline_distiller_error_retains_its_following_cause() {
+        let run = DistillerRun {
+            stdout: String::new(),
+            stderr: "Error: request failed\n\nCaused by:\n    401 Unauthorized\n".into(),
+            exit_code: Some(1),
+        };
+        let msg = distiller_failure("distiller", &run, None).unwrap();
+        assert!(msg.contains("request failed"), "{msg}");
+        assert!(msg.contains("401 Unauthorized"), "{msg}");
+    }
+
+    /// Catches: truncation leaves too little of a token for the redactor to recognize it.
+    #[test]
+    fn a_credential_crossing_the_excerpt_boundary_does_not_leak_its_prefix() {
+        let run = DistillerRun {
+            stdout: String::new(),
+            // The fake key is split so a release secret scan of this source
+            // does not flag it; the runtime string is unchanged.
+            stderr: format!(
+                "error: {} {}",
+                "x".repeat(180),
+                concat!("sk", "-ABCDEFGHIJKLMNOPQRSTUVWXYZ012345")
+            ),
+            exit_code: Some(1),
+        };
+        let msg = distiller_failure("distiller", &run, None).unwrap();
+        assert!(!msg.contains("sk-ABCD"), "{msg}");
+        assert!(msg.contains("[REDACTED]"), "{msg}");
+        assert!(run.failure_excerpt(200).chars().count() <= 201);
     }
 
     /// When the CLI did print an answer, that answer is the evidence — stderr on

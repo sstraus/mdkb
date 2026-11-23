@@ -4,7 +4,7 @@
 //! 1. A definition Grep/Bash for an *indexed* symbol injects real `file:line`
 //!    hits from the code index ("act, not suggest").
 //! 2. A definition search for an *unknown* symbol falls back to the generic
-//!    `mdkb search --scope symbols` suggestion.
+//!    `mdkb code search` suggestion.
 
 use std::io::Write;
 use std::path::Path;
@@ -69,12 +69,12 @@ fn seed_indexed_project(symbol: &str) -> TempDir {
     )
     .unwrap();
 
-    let (code, _) = run(&["code", "init"], root);
+    let (code, _) = run(&["update", "--code"], root);
     assert_eq!(code, 0, "code init must succeed");
     // Index from the project root so stored paths are root-relative
     // (`src/lib.rs`) — matching how `mdkb code index` runs in production and
     // keeping the injected `file:line` openable from the repo root.
-    let (code, _) = run(&["code", "index"], root);
+    let (code, _) = run(&["update", "--code"], root);
     assert_eq!(code, 0, "code index must succeed");
     tmp
 }
@@ -125,7 +125,7 @@ fn pre_tool_use_injects_code_index_hits_for_indexed_symbol() {
         "must label the symbol kind, got: {ctx}"
     );
     assert!(
-        !ctx.contains("search --scope symbols"),
+        !ctx.contains("code search"),
         "must NOT fall back to the suggestion when a hit exists, got: {ctx}"
     );
     assert_context_only_response(&stdout);
@@ -148,8 +148,8 @@ fn pre_tool_use_caps_hits_at_five() {
         )
         .unwrap();
     }
-    assert_eq!(run(&["code", "init"], root).0, 0);
-    assert_eq!(run(&["code", "index"], root).0, 0);
+    assert_eq!(run(&["update", "--code"], root).0, 0);
+    assert_eq!(run(&["update", "--code"], root).0, 0);
 
     let event = format!(r#"{{"tool_name":"Grep","tool_input":{{"pattern":"fn {symbol}"}}}}"#);
     let (code, stdout) = run_pre_tool_use(root, &event);
@@ -192,7 +192,7 @@ fn pre_tool_use_falls_back_to_suggestion_for_unknown_symbol() {
     let ctx = additional_context(&stdout)
         .unwrap_or_else(|| panic!("expected fallback suggestion, got: {stdout}"));
     assert!(
-        ctx.contains("search --scope symbols") && ctx.contains("no_such_symbol_here"),
+        ctx.contains("code search") && ctx.contains("no_such_symbol_here"),
         "unknown symbol must fall back to the suggestion string, got: {ctx}"
     );
     assert_context_only_response(&stdout);
@@ -217,7 +217,7 @@ fn pre_tool_use_flag_off_falls_back_to_suggestion() {
     let ctx =
         additional_context(&stdout).unwrap_or_else(|| panic!("expected suggestion, got: {stdout}"));
     assert!(
-        ctx.contains("search --scope symbols") && !ctx.contains("src/lib.rs:"),
+        ctx.contains("code search") && !ctx.contains("src/lib.rs:"),
         "flag off must fall back to the suggestion, not inject hits, got: {ctx}"
     );
 }
@@ -247,7 +247,7 @@ fn pre_tool_use_missing_code_index_still_suggests() {
     let ctx = additional_context(&stdout)
         .unwrap_or_else(|| panic!("expected suggestion without index, got: {stdout}"));
     assert!(
-        ctx.contains("search --scope symbols"),
+        ctx.contains("code search"),
         "without a code index the hook must still emit the suggestion, got: {ctx}"
     );
     assert!(

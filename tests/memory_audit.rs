@@ -511,12 +511,21 @@ fn a_partly_embedded_store_reports_how_far_the_duplicate_pass_reached() {
     // reaches when entries were written before the model was available. Adds
     // embed by default here, so partial coverage has to be made, not waited for.
     ctx.conn
-        .execute(
-            "DELETE FROM memory_embeddings WHERE rowid IN \
-             (SELECT rowid FROM memory_entries WHERE id IN ('two', 'three'))",
-            [],
+        .execute_batch(
+            "BEGIN;
+             DELETE FROM vec_memory WHERE memory_rowid IN
+             (SELECT rowid FROM memory_entries WHERE id IN ('two', 'three'));
+             DELETE FROM memory_embeddings WHERE memory_rowid IN
+             (SELECT rowid FROM memory_entries WHERE id IN ('two', 'three'));
+             COMMIT;",
         )
-        .expect("strip two embeddings");
+        .expect("strip both representations of two embeddings");
+    // The audit's coverage contract does not depend on an installed encoder.
+    // Seed the retained vector through the real storage boundary when automatic
+    // embedding was unavailable during fixture creation.
+    let rowid = memory::get_rowid(&ctx.conn, "one").unwrap().unwrap();
+    mdkb::store::vectors::store_memory_embedding(&ctx.conn, rowid, &[0.5; 384], "AllMiniLML6V2")
+        .expect("retain one labelled embedding");
 
     let outcome = handle_memory_audit(&ctx, false).expect("audit");
 
@@ -547,8 +556,8 @@ fn a_store_with_no_embeddings_reports_the_near_duplicate_check_as_skipped() {
     let (_dir, root) = store_with(&[("alone", "topic", "nothing to compare against")]);
     let ctx = Context::open(&root).expect("open");
     ctx.conn
-        .execute("DELETE FROM memory_embeddings", [])
-        .expect("clear embeddings");
+        .execute_batch("BEGIN; DELETE FROM vec_memory; DELETE FROM memory_embeddings; COMMIT;")
+        .expect("clear both representations without creating orphan vectors");
 
     let outcome = handle_memory_audit(&ctx, false).expect("audit");
 
@@ -586,7 +595,7 @@ fn identical_embeddings_make_both_entries_candidates() {
                 |r| r.get(0),
             )
             .expect("rowid");
-        mdkb::store::vectors::store_memory_embedding(&ctx.conn, rowid, &vector, "test")
+        mdkb::store::vectors::store_memory_embedding(&ctx.conn, rowid, &vector, "AllMiniLML6V2")
             .expect("store embedding");
     }
 
@@ -1003,4 +1012,104 @@ fn a_dead_path_cited_from_two_entries_spawns_git_once() {
         "both citations of the dead path must still be reported dead: {:?}",
         outcome.candidates
     );
+}
+
+/// Story 081-1642. Catches a renamed function the audit keeps calling live,
+/// and a standard-library method it calls dead because the repo defines no
+/// `unwrap`: only the name the code lost both its definition and every
+/// mention of is reported.
+#[test]
+fn a_renamed_function_is_a_dead_symbol_and_a_std_method_is_not() {
+    let _lock = env_lock();
+    let (_dir, root) = store_with(&[
+        ("cites-old", "topic", "call `old_name()` before saving"),
+        ("cites-new", "topic", "call `new_name()` before saving"),
+        (
+            "cites-std",
+            "topic",
+            "the parser uses `unwrap()` on purpose",
+        ),
+    ]);
+    git(&root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    std::fs::write(root.join("src/lib.rs"), "pub fn old_name() {}\n").expect("write");
+    git(&root, &["add", "src/lib.rs"]);
+    git_commit(&root, "add");
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn new_name() { let _ = Some(1).unwrap(); }\n",
+    )
+    .expect("write");
+    git(&root, &["add", "src/lib.rs"]);
+    git_commit(&root, "rename");
+    mdkb::core::code::handle_code_index(&root, &["src".to_string()]).expect("code index");
+
+    let ctx = Context::open(&root).expect("open");
+    let outcome = handle_memory_audit(&ctx, true).expect("audit");
+
+    assert_eq!(outcome.symbol_check_skipped, None, "{outcome:?}");
+    let dead: Vec<(&str, &AuditSignal)> = outcome
+        .candidates
+        .iter()
+        .flat_map(|c| c.signals.iter().map(move |s| (c.id.as_str(), s)))
+        .filter(|(_, s)| matches!(s, AuditSignal::DeadSymbolReference { .. }))
+        .collect();
+    assert_eq!(
+        dead,
+        vec![(
+            "cites-old",
+            &AuditSignal::DeadSymbolReference {
+                symbol: "old_name()".into()
+            }
+        )],
+        "{outcome:?}"
+    );
+}
+
+/// Catches a pass over a code index that predates HEAD reading as "no dead
+/// symbol": a function renamed after the last index would be judged against
+/// the old index.
+#[test]
+fn the_symbol_check_says_it_was_skipped_when_the_code_index_predates_head() {
+    let _lock = env_lock();
+    let (_dir, root) = store_with(&[("cites-old", "topic", "call `old_name()` first")]);
+    git(&root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    std::fs::write(root.join("src/lib.rs"), "pub fn new_name() {}\n").expect("write");
+    git(&root, &["add", "src/lib.rs"]);
+    // Opening the store may refresh the code index, so "older than HEAD" is
+    // made certain by a HEAD dated a day ahead rather than by timing.
+    let tomorrow = format!("@{} +0000", chrono::Utc::now().timestamp() + 86_400);
+    let committed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args([
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "add",
+        ])
+        .env("GIT_COMMITTER_DATE", &tomorrow)
+        .status()
+        .expect("git");
+    assert!(committed.success());
+
+    let ctx = Context::open(&root).expect("open");
+    let outcome = handle_memory_audit(&ctx, true).expect("audit");
+
+    assert!(
+        outcome
+            .symbol_check_skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("older than HEAD")),
+        "{outcome:?}"
+    );
+    assert!(outcome.candidates.iter().all(|c| {
+        !c.signals
+            .iter()
+            .any(|s| matches!(s, AuditSignal::DeadSymbolReference { .. }))
+    }));
 }

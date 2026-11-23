@@ -27,7 +27,26 @@ pub fn hybrid_search_fts(
     collection: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<SearchResult>> {
-    Ok(hybrid_search_fts_scored(
+    let vector = query_embedding.map(crate::llm::embeddings::Vector::minilm);
+    hybrid_search_fts_labelled(
+        ctx,
+        fts_query,
+        vector.as_ref(),
+        limit,
+        collection,
+        include_superseded,
+    )
+}
+
+pub fn hybrid_search_fts_labelled(
+    ctx: &Context,
+    fts_query: &str,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
+    limit: usize,
+    collection: Option<&str>,
+    include_superseded: bool,
+) -> Result<Vec<SearchResult>> {
+    Ok(hybrid_search_fts_scored_labelled(
         ctx,
         fts_query,
         query_embedding,
@@ -51,104 +70,136 @@ pub fn hybrid_search_fts_scored(
     collection: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<(SearchResult, Option<f64>)>> {
-    // An empty expression is not a query, so neither leg runs: the vector leg
-    // would otherwise rank the whole corpus against the embedding of an empty
-    // string and return arbitrary documents.
-    if search::fts_query_is_empty(fts_query) {
-        return Ok(Vec::new());
-    }
-
-    // Get BM25 results
-    let bm25_query = SearchQuery {
-        text: String::new(), // ignored: `fts_query` is already escaped
-        limit: limit * 2,    // Get more for fusion
-        collection: collection.map(String::from),
-        tags: vec![],
+    let vector = query_embedding.map(crate::llm::embeddings::Vector::minilm);
+    hybrid_search_fts_scored_labelled(
+        ctx,
+        fts_query,
+        vector.as_ref(),
+        limit,
+        collection,
         include_superseded,
-    };
-    let bm25_results = search::search_fts(&ctx.conn, fts_query, &bm25_query)?;
+    )
+}
 
-    let vector_results = match query_embedding {
-        Some(embedding) => {
-            vectors::chunk_vector_search(&ctx.conn, embedding, limit * 2, collection)?
+pub fn hybrid_search_fts_scored_labelled(
+    ctx: &Context,
+    fts_query: &str,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
+    limit: usize,
+    collection: Option<&str>,
+    include_superseded: bool,
+) -> Result<Vec<(SearchResult, Option<f64>)>> {
+    crate::store::documents::with_savepoint(&ctx.conn, "hybrid_search_fts_scored_labelled", || {
+        // An empty expression is not a query, so neither leg runs: the vector leg
+        // would otherwise rank the whole corpus against the embedding of an empty
+        // string and return arbitrary documents.
+        if search::fts_query_is_empty(fts_query) {
+            return Ok(Vec::new());
         }
-        None => Vec::new(),
-    };
 
-    // Fuse results using RRF
-    let config = hybrid::HybridConfig::default();
-    let mut fused = hybrid::rrf_fusion(&bm25_results, &vector_results, &config);
+        let query_embedding = match query_embedding {
+            Some(vector) if vectors::model_is_current(&ctx.conn, vector.model)? => Some(vector),
+            _ => None,
+        };
 
-    // Normalize scores
-    hybrid::normalize_scores(&mut fused);
+        // Get BM25 results
+        let bm25_query = SearchQuery {
+            text: String::new(), // ignored: `fts_query` is already escaped
+            limit: limit * 2,    // Get more for fusion
+            collection: collection.map(String::from),
+            tags: vec![],
+            include_superseded,
+        };
+        let bm25_results = search::search_fts(&ctx.conn, fts_query, &bm25_query)?;
 
-    if fused.is_empty() {
-        return Ok(Vec::new());
-    }
+        let vector_results = match query_embedding {
+            Some(embedding) => vectors::chunk_vector_search_for_model(
+                &ctx.conn,
+                embedding,
+                limit * 2,
+                collection,
+                embedding.model,
+            )?,
+            None => Vec::new(),
+        };
 
-    // Batch retrieve all documents in a single query (includes status)
-    let doc_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
-    let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
+        // Fuse results using RRF
+        let config = hybrid::HybridConfig::default();
+        let mut fused = hybrid::rrf_fusion(&bm25_results, &vector_results, &config);
 
-    // Build BM25 lookup for superseded_by metadata
-    let bm25_map: HashMap<i64, &SearchResult> = bm25_results.iter().map(|r| (r.id, r)).collect();
+        // Normalize scores
+        hybrid::normalize_scores(&mut fused);
 
-    // Build a map for quick lookup
-    let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
+        if fused.is_empty() {
+            return Ok(Vec::new());
+        }
 
-    // Best-chunk distance per document, for the absolute score.
-    let distance_map: HashMap<i64, f32> = vector_results.iter().copied().collect();
+        // Batch retrieve all documents in a single query (includes status)
+        let doc_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+        let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
 
-    // Convert to SearchResult format, preserving RRF order
-    let mut results = Vec::new();
-    for (doc_id, score) in fused {
-        if let Some(doc) = doc_map.get(&doc_id) {
-            // Filter by collection if specified; exclude claude_sessions from default search
-            if let Some(coll) = collection {
-                if doc.collection != coll {
+        // Build BM25 lookup for superseded_by metadata
+        let bm25_map: HashMap<i64, &SearchResult> =
+            bm25_results.iter().map(|r| (r.id, r)).collect();
+
+        // Build a map for quick lookup
+        let doc_map: std::collections::HashMap<i64, _> =
+            docs.into_iter().map(|d| (d.id, d)).collect();
+
+        // Best-chunk distance per document, for the absolute score.
+        let distance_map: HashMap<i64, f32> = vector_results.iter().copied().collect();
+
+        // Convert to SearchResult format, preserving RRF order
+        let mut results = Vec::new();
+        for (doc_id, score) in fused {
+            if let Some(doc) = doc_map.get(&doc_id) {
+                // Filter by collection if specified; exclude claude_sessions from default search
+                if let Some(coll) = collection {
+                    if doc.collection != coll {
+                        continue;
+                    }
+                } else if doc.collection == crate::domain::COLLECTION_CLAUDE_SESSIONS {
                     continue;
                 }
-            } else if doc.collection == crate::domain::COLLECTION_CLAUDE_SESSIONS {
-                continue;
-            }
 
-            // Filter superseded/retracted documents (vector search doesn't filter by status)
-            if !include_superseded {
-                if matches!(doc.status.as_deref(), Some("superseded" | "retracted")) {
-                    continue;
+                // Filter superseded/retracted documents (vector search doesn't filter by status)
+                if !include_superseded {
+                    if matches!(doc.status.as_deref(), Some("superseded" | "retracted")) {
+                        continue;
+                    }
+                }
+
+                // Populate superseded_by from BM25 results if available
+                let bm25 = bm25_map.get(&doc_id);
+                let cosine = distance_map
+                    .get(&doc_id)
+                    .map(|d| hybrid::cosine_from_distance(*d));
+                results.push((
+                    SearchResult {
+                        id: doc.id,
+                        collection: doc.collection.clone(),
+                        path: doc.relative_path.clone(),
+                        title: doc.title.clone(),
+                        score,
+                        snippets: vec![],
+                        status: doc.status.clone(),
+                        superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
+                        source: crate::store::external::source(&doc.collection).map(str::to_owned),
+                        read_only: crate::store::external::source(&doc.collection).is_some(),
+                        repo_root: None,
+                    },
+                    cosine,
+                ));
+
+                // Stop once we have enough results
+                if results.len() >= limit {
+                    break;
                 }
             }
-
-            // Populate superseded_by from BM25 results if available
-            let bm25 = bm25_map.get(&doc_id);
-            let cosine = distance_map
-                .get(&doc_id)
-                .map(|d| hybrid::cosine_from_distance(*d));
-            results.push((
-                SearchResult {
-                    id: doc.id,
-                    collection: doc.collection.clone(),
-                    path: doc.relative_path.clone(),
-                    title: doc.title.clone(),
-                    score,
-                    snippets: vec![],
-                    status: doc.status.clone(),
-                    superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
-                    source: crate::store::external::source(&doc.collection).map(str::to_owned),
-                    read_only: crate::store::external::source(&doc.collection).is_some(),
-                    repo_root: None,
-                },
-                cosine,
-            ));
-
-            // Stop once we have enough results
-            if results.len() >= limit {
-                break;
-            }
         }
-    }
 
-    Ok(results)
+        Ok(results)
+    })
 }
 /// Handle `mdkb query` command - hybrid search with RRF fusion.
 ///
@@ -163,24 +214,25 @@ pub fn handle_hybrid_search(
 ) -> Result<Vec<SearchResult>> {
     let fts_query = search::escape_fts5_query(query_text);
     // Falls back to BM25-only if the embedding service is unavailable.
-    let query_embedding =
-        match crate::llm::get_cached_service().and_then(|s| s.embed_query(query_text)) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::debug!("Hybrid search falling back to BM25-only: {e}");
-                None
-            }
-        };
-    hybrid_search_fts(
+    let query_embedding = match crate::llm::service_for(vectors::selected_model(&ctx.conn)?, false)
+        .and_then(|s| s.query(query_text))
+    {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::debug!("Hybrid search falling back to BM25-only: {e}");
+            None
+        }
+    };
+    hybrid_search_fts_labelled(
         ctx,
         &fts_query,
-        query_embedding.as_deref(),
+        query_embedding.as_ref(),
         limit,
         collection,
         include_superseded,
     )
 }
-/// Handle `mdkb mget` command - batch retrieval by pattern.
+/// Handle `mdkb get PATTERN` - batch retrieval by glob.
 ///
 /// Uses batch content retrieval to avoid N+1 queries.
 pub fn handle_mget(

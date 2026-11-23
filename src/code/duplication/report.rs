@@ -724,7 +724,7 @@ fn fence_tag(path: &str) -> &'static str {
 // membership it stood for is not recoverable from it, and neither is the new
 // identity. Such an entry is left exactly as it is and keeps matching by id
 // prefix — which, since the member key changed, means it matches nothing, and
-// its cluster is reported again. Re-running `mdkb dup` and accepting it once
+// its cluster is reported again. Re-running `mdkb code dup` and accepting it once
 // more writes the membership down and is the whole migration. Nothing here
 // rewrites an existing ignore entry: the rationale on it is a human's, and a
 // pass that edited it would be editing something it cannot re-derive.

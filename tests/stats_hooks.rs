@@ -17,9 +17,16 @@ fn mdkb_bin() -> Command {
 }
 
 fn run_hook(dir: &Path, event: &str, stdin_json: &str) {
+    // A throwaway HOME: the machine-wide ~/.mdkb/daemon.toml may opt every
+    // repository in to query telemetry (`[telemetry] query_events = true`),
+    // which would make the "off by default" test read the developer's account.
+    let home = std::env::temp_dir().join("mdkb-stats-hooks-home");
+    std::fs::create_dir_all(&home).expect("test home");
     let mut child = mdkb_bin()
         .args(["hook", event])
         .current_dir(dir)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
         .env("MDKB_NO_DAEMON", "1")
         .env("MDKB_HOOK_TELEMETRY", "1")
         .stdin(Stdio::piped())

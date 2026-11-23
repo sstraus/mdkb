@@ -1,6 +1,5 @@
 //! Configuration management for .mdkb/config.toml.
 
-use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -11,6 +10,9 @@ use crate::error::{ErrorKind, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Per-store encoder. Changing it requires explicit `mdkb update --reembed`.
+    pub embedding: EmbeddingConfig,
+
     /// Indexing configuration.
     pub indexing: IndexingConfig,
 
@@ -46,6 +48,41 @@ pub struct Config {
 
     /// Usage telemetry (opt-in and privacy-minimized, not anonymous).
     pub telemetry: TelemetryConfig,
+}
+
+/// Per-store document, memory and semantic-code embedding model.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub model: crate::llm::embeddings::Model,
+}
+
+/// Set by `.cargo/config.toml` for every process cargo starts, so the test
+/// suite does not change behaviour on a developer machine whose `daemon.toml`
+/// selects a model.
+pub const IGNORE_DAEMON_TOML_ENV: &str = "MDKB_IGNORE_DAEMON_TOML";
+
+/// The model a repository gets when its config does not set `[embedding] model`:
+/// `[embedding] model` in `~/.mdkb/daemon.toml`, else the built-in default.
+pub fn global_default_model() -> crate::llm::embeddings::Model {
+    if std::env::var_os(IGNORE_DAEMON_TOML_ENV).is_some() {
+        return crate::llm::embeddings::Model::default();
+    }
+    global_default_model_from(&crate::daemon::config::DaemonConfig::config_path())
+}
+
+fn global_default_model_from(daemon_toml: &Path) -> crate::llm::embeddings::Model {
+    let Some(value) = raw_section(daemon_toml, "embedding").and_then(|t| t.get("model").cloned())
+    else {
+        return crate::llm::embeddings::Model::default();
+    };
+    value.clone().try_into().unwrap_or_else(|_| {
+        tracing::warn!(
+            "{} [embedding] model = {value} ignored: choose 'minilm' or 'granite107m'",
+            daemon_toml.display()
+        );
+        crate::llm::embeddings::Model::default()
+    })
 }
 
 /// Usage telemetry settings. Hook-call counts are always recorded (counts, not
@@ -109,9 +146,9 @@ pub struct SearchConfig {
     /// silently degrades to BM25. Killable if the ONNX cost is unwanted.
     pub auto_embed_docs: bool,
 
-    /// Include the `claude_sessions` collection in auto-embed / `mdkb embed`.
+    /// Include the `claude_sessions` collection in auto-embed / `mdkb update`.
     /// Off by default: transcripts are large, high-churn, and excluded from
-    /// default search — embed them explicitly with `mdkb embed --collection`.
+    /// default search — embed them explicitly with `mdkb update --collection`.
     pub auto_embed_sessions: bool,
 
     /// Embed memory entries on write (`memory add`, `memory import`) so they are
@@ -123,9 +160,9 @@ pub struct SearchConfig {
 
     /// How much nicer than its caller a dedicated embedding command runs.
     ///
-    /// `mdkb embed` saturates every core — ONNX sets one worker thread per
-    /// core and exposes no cap — so it drops its own priority instead: all the
-    /// idle cores, none of the busy ones. 0 disables it. Applies only to
+    /// `mdkb update` keeps its ONNX threads busy (`MDKB_ORT_THREADS`, default
+    /// 2), so it drops its own priority as well: they yield to any busy
+    /// neighbour. 0 disables it. Applies only to
     /// short-lived commands; the daemon never lowers itself, because the drop
     /// cannot be undone without privilege.
     pub embed_nice: i32,
@@ -148,7 +185,7 @@ pub struct SearchMemoryConfig {
     /// Half-life for recency decay in seconds (default ~30 days).
     pub recency_half_life_secs: i64,
 
-    /// Absolute cosine floor a memory entry must clear to be returned at all.
+    /// Memory relevance gate: a cosine floor with a strong lexical alternative.
     ///
     /// The relevance gate. Fusion scores are max-normalized, so the best match
     /// to any prompt scores 1.0 and no relative floor can reject it; this one
@@ -157,10 +194,13 @@ pub struct SearchMemoryConfig {
     /// phrase, or several rare terms — `store::hybrid::strong_lexical_match`).
     /// Confidence is not part of the decision.
     ///
-    /// Calibrated on `assets/eval/memory-recall.json`: see
-    /// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`. `0.0`
-    /// keeps every semantically scored candidate, restoring the pre-gate
-    /// behavior.
+    /// The omitted default is 0.40 for MiniLM and a provisional 0.70 for
+    /// Granite, selected on the English `assets/eval/memory-recall.json`
+    /// fixture. It is not a general false-admission guarantee. This setting
+    /// also gates explicit memory search, not only sigil recall. Explicit
+    /// values are preserved. See the MiniLM curve in
+    /// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`.
+    /// `0.0` keeps every semantically scored candidate.
     pub min_recall_cosine: f32,
 }
 
@@ -237,56 +277,6 @@ pub const USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT: u64 = 1000;
 /// well above that, and is only ever spent when the daemon itself stalls: a
 /// healthy hook is bounded by the deadline, not by the margin.
 pub const USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS: u64 = 250;
-
-/// Rerank deadline for automatic recall, in milliseconds: how long the hook
-/// waits for the cross-encoder before it injects MiniLM's result instead.
-///
-/// jina-v2 int8 on five candidates costs 0.45 s at 8 cores (p95 0.46 s) on an
-/// idle arm64 box, `docs/recall-options-eval.md`. 700 ms is that with a third
-/// of headroom; the hook also clamps it to what is left of
-/// [`USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT`], so it can never be the reason
-/// the prompt is answered with nothing.
-pub const RECALL_RERANK_DEADLINE_MS_DEFAULT: u64 = 700;
-
-/// Lowest top reranker score at which an Italian prompt injects recall.
-///
-/// A raw logit of jina-reranker-v2 int8, not a probability. The rule is the
-/// one every gate in this store follows: the lowest 0.05 step above the best
-/// score of any labelled negative. Fitted on the 38 Italian negatives of the
-/// 2026-09-30 eval (best negative -1.0813), on MiniLM's top five. In-sample;
-/// `docs/recall-options-eval.md` ("Reranker on MiniLM top-5, held out") checks
-/// it on prompts the fit never saw.
-pub const RECALL_RERANK_MIN_SCORE_IT_DEFAULT: f32 = -1.05;
-
-/// Lowest top reranker score at which an English prompt injects recall. Same
-/// rule and model as [`RECALL_RERANK_MIN_SCORE_IT_DEFAULT`], on the 40 English
-/// negatives (best negative -1.9864). Lower than the Italian floor because an
-/// English prompt over an English store scores its negatives lower.
-pub const RECALL_RERANK_MIN_SCORE_EN_DEFAULT: f32 = -1.95;
-
-/// The languages the automatic-recall prompt detector recognises.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecallRerankLanguage {
-    It,
-    En,
-}
-
-impl RecallRerankLanguage {
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::It => "it",
-            Self::En => "en",
-        }
-    }
-
-    fn from_code(code: &str) -> Option<Self> {
-        match code {
-            "it" => Some(Self::It),
-            "en" => Some(Self::En),
-            _ => None,
-        }
-    }
-}
 
 /// Memory index settings (Phase 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,11 +485,11 @@ pub struct CodeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CodeDuplicationConfig {
-    /// Enable the semantic pass — the embedding half of `mdkb dup`, which
+    /// Enable the semantic pass — the embedding half of `mdkb code dup`, which
     /// loads a model and costs roughly 2.4 CPU-seconds per body. The
     /// structural pass runs either way and needs no weights; measured on this
     /// repository the semantic half took 817 s of an 818 s run and found 69 of
-    /// 767 clusters. Off by default: `mdkb dup --semantic`, or a
+    /// 767 clusters. Off by default: `mdkb code dup --semantic`, or a
     /// `--threshold` override, turns it on for a single run, and this key is
     /// the standing opt-in. Never runs during `mdkb index` either way.
     pub semantic: bool,
@@ -608,6 +598,7 @@ impl Default for CodeSemanticSearchConfig {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            embedding: EmbeddingConfig::default(),
             indexing: IndexingConfig::default(),
             chunking: ChunkingConfig::default(),
             search: SearchConfig::default(),
@@ -688,12 +679,75 @@ impl Default for PriorsConfig {
 /// explicitly are returned, so a layered merge can distinguish "unset" from
 /// "set to the default value".
 pub fn raw_priors_layer(path: impl AsRef<Path>) -> Option<toml::Table> {
+    raw_section(path, "priors")
+}
+
+/// The raw `[telemetry]` table a repo config declares; see [`raw_priors_layer`].
+pub fn raw_telemetry_layer(path: impl AsRef<Path>) -> Option<toml::Table> {
+    raw_section(path, "telemetry")
+}
+
+fn raw_section(path: impl AsRef<Path>, name: &str) -> Option<toml::Table> {
     let content = std::fs::read_to_string(path).ok()?;
     let table: toml::Table = toml::from_str(&content).ok()?;
-    match table.get("priors") {
+    match table.get(name) {
         Some(toml::Value::Table(t)) => Some(t.clone()),
         _ => None,
     }
+}
+
+/// Layer the daemon-wide `[telemetry]` defaults under a repo's own, key by key:
+/// `default < daemon.toml < repo config.toml`, the rule `[priors]` follows.
+///
+/// `repo` is the raw `[telemetry]` table the repo file declares, so a key the
+/// repo sets explicitly — `query_events = false` included — is never replaced.
+/// A global `retention_days` outside the range [`Config::validate`] accepts is
+/// ignored with a warning rather than failing every repo open.
+pub fn layer_telemetry(
+    telemetry: &mut TelemetryConfig,
+    global: &crate::daemon::config::DaemonTelemetry,
+    repo: Option<&toml::Table>,
+) {
+    let repo_sets = |key: &str| repo.is_some_and(|t| t.contains_key(key));
+    if let (false, Some(enabled)) = (repo_sets("query_events"), global.query_events) {
+        telemetry.query_events = enabled;
+    }
+    if let (false, Some(days)) = (repo_sets("retention_days"), global.retention_days) {
+        if (1..=365).contains(&days) {
+            telemetry.retention_days = days;
+        } else {
+            tracing::warn!(
+                "daemon.toml telemetry.retention_days = {days} ignored: must be between 1 and 365"
+            );
+        }
+    }
+}
+
+/// The `[telemetry]` the daemon records with for the repo whose config lives at
+/// `config_path`: the same layering `RepoHandle::open` applies. Anything that
+/// reports telemetry status has to come through here, or it reports "disabled"
+/// for a repo the machine-wide opt-in covers.
+pub fn effective_telemetry(config_path: impl AsRef<Path>) -> TelemetryConfig {
+    effective_telemetry_from(
+        config_path,
+        &crate::daemon::config::DaemonConfig::config_path(),
+    )
+}
+
+fn effective_telemetry_from(config_path: impl AsRef<Path>, daemon_toml: &Path) -> TelemetryConfig {
+    let config_path = config_path.as_ref();
+    let mut telemetry = Config::load_or_default(config_path).telemetry;
+    match crate::daemon::config::DaemonConfig::load_or_default(daemon_toml) {
+        Ok(global) => layer_telemetry(
+            &mut telemetry,
+            &global.telemetry,
+            raw_telemetry_layer(config_path).as_ref(),
+        ),
+        Err(e) => {
+            tracing::warn!("daemon.toml failed to load, telemetry from repo config only: {e}")
+        }
+    }
+    telemetry
 }
 
 /// Merge a global `[priors]` base with an optional per-repo override, the repo's
@@ -853,8 +907,7 @@ pub struct HooksConfig {
     /// automatic floor is the stricter one.
     ///
     /// Calibrated from the eval recall curve at 0.50. With a query embedding,
-    /// incidental lexical overlap cannot bypass it; without one, lexical fallback remains. A successful
-    /// cross-encoder rerank uses its own semantic score floor.
+    /// incidental lexical overlap cannot bypass it; without one, lexical fallback remains.
     ///
     /// Unused while the sigil is required except in shadow mode.
     pub recall_auto_min_cosine: f32,
@@ -890,26 +943,6 @@ pub struct HooksConfig {
     /// shows nothing), injects at most one entry per prompt, and is reported
     /// apart from the headline precision.
     pub recall_holdout_rate: f32,
-
-    /// Prompt languages that opt in to jina-v2-int8 reranking of MiniLM's top
-    /// five automatic-recall candidates. Empty by default: no reranker weight
-    /// download, model load, or resident cross-encoder memory. Supported codes
-    /// are `it` and `en`, as recognised by the function-word detector (ties =
-    /// Italian). Every selected code needs a finite `recall_rerank_min_scores`
-    /// entry. Sigil prompts never rerank; failures keep the MiniLM result.
-    pub recall_rerank_languages: Vec<String>,
-
-    /// How long the hook waits for the reranker, in milliseconds, before it
-    /// falls back to MiniLM's result. Clamped to what is left of
-    /// `user_prompt_submit_deadline_ms`. See
-    /// [`RECALL_RERANK_DEADLINE_MS_DEFAULT`].
-    pub recall_rerank_deadline_ms: u64,
-
-    /// Per-language minimum reranker logits. Defaults are fitted `it = -1.05`
-    /// and `en = -1.95`; the English fit used a small synthetic store and
-    /// admitted 3/24 held-out negatives. This table alone does not enable any
-    /// language. An explicit table replaces the default table.
-    pub recall_rerank_min_scores: BTreeMap<String, f32>,
 }
 
 impl HooksConfig {
@@ -922,11 +955,6 @@ impl HooksConfig {
             0 => USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT,
             ms => ms,
         }
-    }
-
-    /// True when any language reranks, which is when the weights are worth fetching.
-    pub fn recall_rerank_any(&self) -> bool {
-        !self.recall_rerank_languages.is_empty()
     }
 }
 
@@ -952,12 +980,6 @@ impl Default for HooksConfig {
             recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
             user_prompt_submit_shadow: false,
             recall_holdout_rate: 0.0,
-            recall_rerank_languages: Vec::new(),
-            recall_rerank_deadline_ms: RECALL_RERANK_DEADLINE_MS_DEFAULT,
-            recall_rerank_min_scores: BTreeMap::from([
-                ("it".into(), RECALL_RERANK_MIN_SCORE_IT_DEFAULT),
-                ("en".into(), RECALL_RERANK_MIN_SCORE_EN_DEFAULT),
-            ]),
         }
     }
 }
@@ -1175,29 +1197,93 @@ impl Config {
 
     /// Parse user config, including removed-key and value validation.
     pub(crate) fn from_toml(content: &str) -> Result<Self> {
+        Self::from_toml_with(content, global_default_model())
+    }
+
+    /// [`Config::from_toml`] with the model a repository gets when it does not
+    /// set `[embedding] model` itself.
+    fn from_toml_with(content: &str, default_model: crate::llm::embeddings::Model) -> Result<Self> {
         // Unknown keys normally produce warnings, but removed rerank controls
         // must fail: silently ignoring a previous opt-in or custom floor would
         // change recall policy without the operator's consent.
         let raw: toml::Table = toml::from_str(content)?;
         if let Some(hooks) = raw.get("hooks").and_then(toml::Value::as_table) {
-            for (old, replacement) in [
-                ("recall_rerank_it", "recall_rerank_languages"),
-                ("recall_rerank_en", "recall_rerank_languages"),
-                ("recall_rerank_min_score_it", "recall_rerank_min_scores"),
-                ("recall_rerank_min_score_en", "recall_rerank_min_scores"),
-            ] {
-                if hooks.contains_key(old) {
-                    return Err(ErrorKind::ConfigInvalid {
-                        field: format!("hooks.{old}"),
-                        message: format!("removed; use hooks.{replacement}"),
-                    }
-                    .into());
-                }
+            if let Some(old) = hooks.keys().find(|key| key.starts_with("recall_rerank_")) {
+                return Err(ErrorKind::ConfigInvalid {
+                    field: format!("hooks.{old}"),
+                    message: "removed; remove hooks.recall_rerank_languages and other rerank keys; choose embedding.model = 'minilm' or 'granite107m' and run `mdkb update --reembed`".into(),
+                }.into());
             }
         }
-        let config: Config = toml::from_str(content)?;
+        if let Some(embedding) = raw.get("embedding") {
+            let valid = embedding.as_table().is_some_and(|table| {
+                table.iter().all(|(key, value)| {
+                    key == "model" && matches!(value.as_str(), Some("minilm" | "granite107m"))
+                })
+            });
+            if !valid {
+                return Err(ErrorKind::ConfigInvalid {
+                    field: "embedding.model".into(),
+                    message: "choose 'minilm' or 'granite107m'".into(),
+                }
+                .into());
+            }
+        }
+        let mut config: Config = toml::from_str(content)?;
+        let repo_sets_model = raw
+            .get("embedding")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|table| table.contains_key("model"));
+        if !repo_sets_model {
+            config.embedding.model = default_model;
+        }
+        config.apply_model_floors(&raw);
         config.validate()?;
         Ok(config)
+    }
+
+    /// Defaults of the floors that depend on the model. Granite's cosines sit
+    /// higher than MiniLM's, so its unset floors get their own values; a key the
+    /// repository sets in `raw` is kept.
+    fn apply_model_floors(&mut self, raw: &toml::Table) {
+        if self.embedding.model == crate::llm::embeddings::Model::Granite107M {
+            let memory = raw
+                .get("search")
+                .and_then(|search| search.get("memory"))
+                .and_then(toml::Value::as_table);
+            // The MiniLM 0.40 floor admits all 40 labelled in-domain negatives
+            // with Granite. The existing memory-recall fixture's lowest clean
+            // 0.05-grid floor is 0.70 (14/36 positives); keep owner overrides.
+            if !memory.is_some_and(|m| m.contains_key("min_recall_cosine")) {
+                self.search.memory.min_recall_cosine = 0.70;
+            }
+            let hooks = raw.get("hooks").and_then(toml::Value::as_table);
+            // Initial admission proxy: round up max calibration-negative threshold
+            // 0.7811089168058166 (harrier-055 dynamic comparison, four corpora).
+            // This is not a verified semantic production-context rate.
+            if !hooks.is_some_and(|h| h.contains_key("recall_auto_min_cosine")) {
+                self.hooks.recall_auto_min_cosine = 0.782;
+            }
+            // Documents, measured 2026-11-21 on the tuicommander store with 39
+            // labelled questions (24 Italian, 6 English, 9 German/French/Spanish)
+            // and 20 process prompts that need no project document: at 0.77 the
+            // target was admitted for 18 of 39 and one process prompt admitted
+            // worktree documents; at 0.782, 15 of 39. Relevant and unrelated
+            // documents overlap from 0.73 to 0.80, so no floor separates them
+            // fully; a margin over the pool median separated no better.
+            if !hooks.is_some_and(|h| h.contains_key("recall_docs_min_cosine")) {
+                self.hooks.recall_docs_min_cosine = 0.77;
+            }
+        }
+    }
+
+    /// The configuration of a repository with no usable config file: the
+    /// built-in defaults with the machine-wide model and its floors.
+    fn machine_default() -> Self {
+        let mut config = Self::default();
+        config.embedding.model = global_default_model();
+        config.apply_model_floors(&toml::Table::new());
+        config
     }
 
     pub(crate) fn is_removed_rerank_error(error: &crate::error::Error) -> bool {
@@ -1212,15 +1298,18 @@ impl Config {
         match Self::load(path) {
             Ok(config) => Ok(config),
             Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
-                Ok(Self::default())
+                Ok(Self::machine_default())
             }
-            Err(error) if Self::is_removed_rerank_error(&error) => {
+            Err(error)
+                if Self::is_removed_rerank_error(&error)
+                    || matches!(error.kind(), ErrorKind::ConfigInvalid { field, .. } if field.starts_with("embedding.")) =>
+            {
                 tracing::warn!(root_config = %path.display(), %error, "Refusing repository with removed rerank configuration");
                 Err(error)
             }
             Err(error) => {
                 tracing::warn!(root_config = %path.display(), %error, "Invalid configuration; every setting in the file is ignored, built-in defaults are in use");
-                Ok(Self::default())
+                Ok(Self::machine_default())
             }
         }
     }
@@ -1244,9 +1333,12 @@ impl Config {
         match Self::load(path) {
             Ok(config) => (config, None),
             Err(e) if matches!(e.kind(), ErrorKind::ConfigNotFound { .. }) => {
-                (Self::default(), None)
+                (Self::machine_default(), None)
             }
-            Err(e) => (Self::default(), Some(format!("{}: {e}", path.display()))),
+            Err(e) => (
+                Self::machine_default(),
+                Some(format!("{}: {e}", path.display())),
+            ),
         }
     }
 
@@ -1315,31 +1407,6 @@ impl Config {
 
     /// Validate configuration values.
     pub fn validate(&self) -> Result<()> {
-        for language in &self.hooks.recall_rerank_languages {
-            if RecallRerankLanguage::from_code(language).is_none() {
-                return Err(ErrorKind::ConfigInvalid {
-                    field: "hooks.recall_rerank_languages".into(),
-                    message: format!("language '{language}' is not recognised by the prompt detector; supported: it, en"),
-                }.into());
-            }
-            if !self.hooks.recall_rerank_min_scores.contains_key(language) {
-                return Err(ErrorKind::ConfigInvalid {
-                    field: "hooks.recall_rerank_min_scores".into(),
-                    message: format!("missing score floor for selected language '{language}'"),
-                }
-                .into());
-            }
-        }
-        for (language, value) in &self.hooks.recall_rerank_min_scores {
-            if !value.is_finite() {
-                return Err(ErrorKind::ConfigInvalid {
-                    field: format!("hooks.recall_rerank_min_scores.{language}"),
-                    message: format!("must be a finite number, got {value}"),
-                }
-                .into());
-            }
-        }
-
         if self.telemetry.retention_days == 0 || self.telemetry.retention_days > 365 {
             return Err(ErrorKind::ConfigInvalid {
                 field: "telemetry.retention_days".to_string(),
@@ -1668,54 +1735,20 @@ mod tests {
     // ==================== Validation Tests ====================
 
     #[test]
-    fn selected_rerank_languages_without_detector_or_floor_are_rejected() {
-        // Catches unsupported codes being accepted, or an omitted floor using
-        // another language's threshold and admitting unfitted negatives.
-        for (raw, language, reason) in [
-            (
-                "[hooks]\nrecall_rerank_languages = ['fr']\n[hooks.recall_rerank_min_scores]\nfr = -1.0",
-                "fr",
-                "detector",
-            ),
-            (
-                "[hooks]\nrecall_rerank_languages = ['it']\n[hooks.recall_rerank_min_scores]\nen = -1.95",
-                "it",
-                "missing",
-            ),
-            (
-                "[hooks]\nrecall_rerank_languages = ['en']\n[hooks.recall_rerank_min_scores]\nit = -1.05",
-                "en",
-                "missing",
-            ),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("config.toml");
-            std::fs::write(&path, raw).unwrap();
-            let message = Config::load(&path).unwrap_err().to_string();
-            assert!(
-                message.contains(language) && message.contains(reason),
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
     fn removed_rerank_keys_fail_loading_and_name_the_new_key() {
         // Catches removed controls being silently ignored by serde, losing a
         // user's opt-in or custom admission threshold without a migration hint.
         for (old, replacement, value) in [
-            ("recall_rerank_it", "recall_rerank_languages", "true"),
-            ("recall_rerank_en", "recall_rerank_languages", "false"),
+            ("recall_rerank_it", "embedding.model", "true"),
+            ("recall_rerank_en", "embedding.model", "false"),
+            ("recall_rerank_languages", "embedding.model", "['it', 'en']"),
             (
-                "recall_rerank_min_score_it",
                 "recall_rerank_min_scores",
-                "-1.05",
+                "embedding.model",
+                "{ it = -1.05, en = -1.95 }",
             ),
-            (
-                "recall_rerank_min_score_en",
-                "recall_rerank_min_scores",
-                "-1.95",
-            ),
+            ("recall_rerank_min_score_it", "embedding.model", "-1.05"),
+            ("recall_rerank_min_score_en", "embedding.model", "-1.95"),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("config.toml");
@@ -1732,25 +1765,6 @@ mod tests {
     fn test_validate_valid_config() {
         let config = Config::default();
         assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn test_validate_rejects_non_finite_rerank_floor() {
-        // Catches: a NaN floor (TOML `nan`) making `score >= floor` false for
-        // every entry, so the reranker silently injects nothing.
-        for (it, en) in [(f32::NAN, -1.95), (-1.05, f32::INFINITY)] {
-            let mut config = Config::default();
-            config
-                .hooks
-                .recall_rerank_min_scores
-                .insert("it".into(), it);
-            config
-                .hooks
-                .recall_rerank_min_scores
-                .insert("en".into(), en);
-            let message = config.validate().unwrap_err().to_string();
-            assert!(message.contains("recall_rerank_min_score"), "{message}");
-        }
     }
 
     #[test]
@@ -2269,6 +2283,37 @@ distiller_args = ["exec", "-m", "gpt-5-mini"]"#,
         assert!(merged.injection_enabled);
     }
 
+    /// Catches: `mdkb metrics status` reading only the repo file and reporting
+    /// "disabled" while the daemon records events under the daemon.toml opt-in.
+    #[test]
+    fn effective_telemetry_layers_daemon_toml_under_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemon_toml = dir.path().join("daemon.toml");
+        std::fs::write(
+            &daemon_toml,
+            "[telemetry]\nquery_events = true\nretention_days = 400\n",
+        )
+        .unwrap();
+        let repo = dir.path().join("config.toml");
+        std::fs::write(&repo, "[graph]\nenabled = true\n").unwrap();
+
+        let telemetry = effective_telemetry_from(&repo, &daemon_toml);
+        assert!(telemetry.query_events);
+        assert_eq!(
+            telemetry.retention_days, 30,
+            "out-of-range global retention is ignored"
+        );
+
+        std::fs::write(&repo, "[telemetry]\nquery_events = false\n").unwrap();
+        assert!(!effective_telemetry_from(&repo, &daemon_toml).query_events);
+
+        let absent = dir.path().join("missing.toml");
+        assert!(
+            effective_telemetry_from(&absent, &daemon_toml).query_events,
+            "no repo file at all"
+        );
+    }
+
     #[test]
     fn merge_priors_no_repo_layer_yields_global() {
         let global: toml::Table = toml::from_str(r#"distiller_program = "codex""#).unwrap();
@@ -2322,3 +2367,7 @@ distiller_args = ["exec", "-m", "gpt-5-mini"]"#,
         assert!(config.ignore_patterns.contains(&"**/vendor/**".to_string()));
     }
 }
+
+#[cfg(test)]
+#[path = "config_global_model_tests.rs"]
+mod global_model_tests;

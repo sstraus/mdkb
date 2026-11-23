@@ -39,7 +39,7 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
     SurfaceEntry {
         mcp_tool: "search",
         cli_command: Some("search"),
-        note: "CLI search also includes indexed literals by default; --scope text and --ignore-case are CLI-only.",
+        note: "The MCP tool picks the corpus with `scope`; the CLI has one command per corpus. See the scope table below.",
     },
     SurfaceEntry {
         mcp_tool: "get",
@@ -48,10 +48,10 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
     },
     SurfaceEntry {
         mcp_tool: "status",
-        cli_command: Some("stats"),
-        note: "Named differently on purpose and worth knowing: the MCP tool \
-               returns the index status an agent needs to decide whether to \
-               reindex, while `mdkb stats` renders the full operator report.",
+        cli_command: Some("status"),
+        note: "The MCP tool returns the index status an agent needs to decide \
+               whether to reindex, while `mdkb status` renders the full \
+               operator report (one page, one JSON object).",
     },
     SurfaceEntry {
         mcp_tool: "update",
@@ -91,8 +91,9 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
         mcp_tool: "graph",
         cli_command: Some("graph"),
         note: "The MCP tool takes the traversal kind as a parameter; the CLI \
-               splits it into subcommands (links, backlinks, neighbors, path, \
-               hubs, dangling).",
+               splits it into subcommands (links, backlinks, neighbors, path) \
+               and adds full-scan reports MCP lacks (dangling, hubs, relations). \
+               `--scope memory` and MCP `scope: memory` cover links and backlinks only.",
     },
     SurfaceEntry {
         mcp_tool: "code_graph",
@@ -110,6 +111,24 @@ pub const SURFACE_MAP: &[SurfaceEntry] = &[
         cli_command: Some("repos list"),
         note: "Same rows, same renderer; `--format json` is CLI only.",
     },
+];
+
+/// Each MCP `search` scope next to the CLI command that answers it.
+///
+/// Permanent while MCP keeps these names: agents learn them from MCP and then
+/// use them in a shell, where `mdkb search --scope NAME` (hidden) still works.
+/// `tests::every_mcp_search_scope_has_a_cli_command` fails when a scope is added
+/// on the MCP side without a row here.
+pub const SCOPE_MAP: &[(&str, &str)] = &[
+    ("docs", "search QUERY --docs"),
+    ("memory", "memory search QUERY"),
+    ("knowledge", "search QUERY"),
+    ("symbols", "code search NAME"),
+    ("code", "code search QUERY --semantic"),
+    ("semantic-code", "code search QUERY --semantic"),
+    ("source", "code grep PATTERN"),
+    ("literals", "code grep VALUE --literals"),
+    ("duplicates", "dup"),
 ];
 
 /// The CLI command for an MCP tool name.
@@ -152,7 +171,7 @@ pub fn cli_command_exists(path: &str) -> bool {
 /// The point is that the answer is a command, not a grep: an agent holding one
 /// name can get the other without reading the source.
 pub fn render() -> String {
-    let mut out = String::from("MCP tool -> CLI command\n\n");
+    let mut out = String::from("# MCP <-> CLI\nMCP tool -> CLI command\n\n");
     for e in SURFACE_MAP {
         let cli = e.cli_command.unwrap_or("(none)");
         out.push_str(&format!("  {:<20} {}\n", e.mcp_tool, cli));
@@ -162,6 +181,10 @@ pub fn render() -> String {
             out.push_str(&format!("  {:<20} note: {}\n", "", note.join(" ")));
         }
     }
+    out.push_str("\nMCP search scope -> CLI command\n\n");
+    for (scope, command) in SCOPE_MAP {
+        out.push_str(&format!("  {scope:<20} mdkb {command}\n"));
+    }
     out.push_str("\nDaemon JSON-RPC (no CLI/MCP write equivalent):\n  external.upsert\n  external.delete\n  external.list\n  Contract: docs/external-ingest.md\n");
     out
 }
@@ -169,6 +192,28 @@ pub fn render() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_mcp_search_scope_has_a_cli_command() {
+        use crate::mcp::tools::SearchScope;
+        for scope in SearchScope::ALL {
+            let row = SCOPE_MAP.iter().find(|(name, _)| *name == scope.as_str());
+            let (_, command) = row.unwrap_or_else(|| {
+                panic!(
+                    "MCP scope `{}` has no CLI command in SCOPE_MAP",
+                    scope.as_str()
+                )
+            });
+            let path: Vec<&str> = command
+                .split_whitespace()
+                .take_while(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+                .collect();
+            assert!(
+                cli_command_exists(&path.join(" ")),
+                "`mdkb {command}` names a command clap does not define"
+            );
+        }
+    }
 
     #[test]
     fn a_nested_command_path_resolves() {

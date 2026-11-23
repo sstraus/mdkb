@@ -23,6 +23,8 @@ pub enum CliMutation {
         request: UpdateRequest,
     },
     Embed {
+        #[serde(default)]
+        reembed: bool,
         collection: Option<String>,
     },
     Compact {
@@ -71,6 +73,8 @@ pub enum CliMutation {
     MemoryConfirm {
         id: String,
         outcome: String,
+        #[serde(default)]
+        session: Option<String>,
     },
     MemoryLink {
         id: String,
@@ -130,20 +134,8 @@ pub enum CliMutation {
         old: String,
         reason: Option<String>,
     },
-    ExperimentCreate {
-        name: String,
-        config_a: String,
-        config_b: String,
-        description: Option<String>,
-        split: f64,
-        min_samples: i64,
-    },
-    ExperimentEnd {
-        name: String,
-        winner: Option<String>,
-    },
-    ExperimentCancel {
-        name: String,
+    EvolveRemove {
+        id: i64,
     },
     JournalImport {
         path: PathBuf,
@@ -224,14 +216,9 @@ pub enum CliMutationResult {
     EvolutionCreated {
         id: i64,
     },
-    ExperimentCreated {
+    EvolutionRemoved {
         id: i64,
-        name: String,
     },
-    ExperimentEnded {
-        winner: Option<String>,
-    },
-    ExperimentCancelled,
     JournalImported {
         outcome: JournalImportResult,
     },
@@ -273,8 +260,15 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
         Update { .. } | Compact { .. } | CodeInit | CodeIndex { .. } => {
             return Err(Error::other("mutation requires daemon-owned resources"));
         }
-        Embed { collection } => {
-            let r = crate::core::ops::handle_embed(ctx, collection.as_deref())?;
+        Embed {
+            collection,
+            reembed,
+        } => {
+            let r = crate::core::ops::handle_embed_explicit_under_lock(
+                ctx,
+                collection.as_deref(),
+                reembed,
+            )?;
             CliMutationResult::Embed {
                 generated: r.generated,
                 skipped: r.skipped,
@@ -347,8 +341,17 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
             )?;
             R::MemoryAdded
         }
-        MemoryConfirm { id, outcome } => R::MemoryConfirmed {
-            outcome: crate::core::memory::handle_memory_confirm(ctx, &id, &outcome)?,
+        MemoryConfirm {
+            id,
+            outcome,
+            session,
+        } => R::MemoryConfirmed {
+            outcome: crate::core::memory::handle_memory_confirm(
+                ctx,
+                &id,
+                &outcome,
+                session.as_deref(),
+            )?,
         },
         MemoryLink {
             id,
@@ -458,34 +461,9 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
         EvolveExtends { new, old, reason } => R::EvolutionCreated {
             id: crate::core::graph::handle_evolve_extends(ctx, &new, &old, reason.as_deref())?,
         },
-        ExperimentCreate {
-            name,
-            config_a,
-            config_b,
-            description,
-            split,
-            min_samples,
-        } => {
-            let r = crate::core::ops::handle_experiment_create(
-                ctx,
-                &name,
-                description.as_deref(),
-                &config_a,
-                &config_b,
-                split,
-                min_samples,
-            )?;
-            R::ExperimentCreated {
-                id: r.id,
-                name: r.name,
-            }
-        }
-        ExperimentEnd { name, winner } => R::ExperimentEnded {
-            winner: crate::core::ops::handle_experiment_end(ctx, &name, winner.as_deref())?,
-        },
-        ExperimentCancel { name } => {
-            crate::core::ops::handle_experiment_cancel(ctx, &name)?;
-            R::ExperimentCancelled
+        EvolveRemove { id } => {
+            crate::core::graph::handle_evolve_remove(ctx, id)?;
+            R::EvolutionRemoved { id }
         }
         JournalImport {
             path,

@@ -26,7 +26,7 @@ use crate::code::indexing::IndexFacade;
 use crate::core::Context;
 use crate::core::cli_mutation::{CliMutation, CliMutationResult};
 use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents_unverified};
-use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
+use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts_labelled};
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 use crate::domain::{SearchResult, UpdateResult};
 use crate::error::ErrorKind;
@@ -38,7 +38,6 @@ use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
-use super::recall_rerank;
 /// Pick the JSON-RPC code a store error must travel under.
 ///
 /// `INTERNAL_ERROR` is the daemon's post-dispatch code: it tells the CLI that a
@@ -49,7 +48,7 @@ use super::recall_rerank;
 /// the fallback that would have printed the real cause.
 fn store_error_code(error: &crate::Error) -> ErrorCode {
     if error.is_validation_refusal() {
-        ErrorCode::INVALID_PARAMS
+        ErrorCode(crate::daemon::hook_runtime::REJECTED_ERROR_CODE)
     } else {
         ErrorCode::INTERNAL_ERROR
     }
@@ -57,9 +56,16 @@ fn store_error_code(error: &crate::Error) -> ErrorCode {
 
 fn mcp_store_error(context: &str, error: impl Into<crate::Error>) -> McpError {
     let error = error.into();
+    // A refusal is the whole story ("memory entry not found: x"); a context
+    // prefix only pushes the fact the caller acts on to the end of the line.
+    let message = if error.is_validation_refusal() {
+        error.to_string()
+    } else {
+        format!("{context}: {error}")
+    };
     McpError {
         code: store_error_code(&error),
-        message: format!("{context}: {error}").into(),
+        message: message.into(),
         data: error
             .is_index_corrupt()
             .then(|| json!({ "index_corrupt": true })),
@@ -126,7 +132,7 @@ fn format_symbol_with_file_tokens(
         sym.kind,
         sym.name,
         sym.file_path,
-        sym.range.start_line,
+        sym.range.start_line + 1,
         suffix,
     );
     if let Some(signature) = &sym.signature {
@@ -543,7 +549,6 @@ fn session_provenance(dctx: &DispatchContext) -> Option<String> {
 }
 
 impl DispatchContext {
-    #[cfg(feature = "http-server")]
     pub(crate) fn new(
         metrics: Arc<UsageMetrics>,
         session_id: Arc<AtomicI64>,
@@ -556,7 +561,7 @@ impl DispatchContext {
             persistent_call_count,
             optimize_interval_calls,
             hook_dedup: Arc::new(StdMutex::new(HookDedupState::default())),
-            // The HTTP server has no caller to hand background work back to:
+            // Long-lived servers have no caller to hand background work back to:
             // it outlives every request, so a task parked here would never be
             // awaited. Spawning detached is the correct behaviour there.
             background: None,
@@ -681,44 +686,47 @@ impl DispatchContext {
             return;
         }
 
-        let mut ctx_guard = handle.ctx.lock().await;
-        let _hold = crate::core::SlotHold::start("record_persistent_call");
-        if ctx_guard.is_none() {
-            return;
-        }
-
         let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let outcome =
-            crate::core::run_guarded_write(&mut ctx_guard, "persistent call telemetry", |ctx| {
-                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)?;
-                if crate::store::maintenance::should_optimize(
-                    call_count,
-                    self.optimize_interval_calls,
-                ) {
+        let interval = self.optimize_interval_calls;
+        let tool_name = tool_name.to_string();
+        let mut slot = handle.ctx.lock().await;
+        slot_write_or_defer(
+            &mut slot,
+            SlotOpener::of(handle),
+            "persistent call telemetry",
+            move |ctx| {
+                stats::record_call(
+                    &ctx.conn, session_id, &tool_name, tokens, results, truncated,
+                )?;
+                if crate::store::maintenance::should_optimize(call_count, interval) {
                     crate::store::maintenance::run_optimize(&ctx.conn)?;
                 }
                 Ok(())
-            });
-        if let Some(Err(error)) = outcome {
-            tracing::warn!("Failed to record call stats: {error}");
-        }
+            },
+        );
     }
 }
 
 /// Ensure the repo's database context is initialized.
 pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
-    let mut ctx_guard = handle.ctx.lock().await;
-    let _hold = crate::core::SlotHold::start("ensure_handle_context");
-    open_handle_context(&mut ctx_guard, handle)
-}
-
-/// Open the repo's context into an already locked slot when it is empty.
-fn open_handle_context(
-    ctx_guard: &mut Option<Context>,
-    handle: &RepoHandle,
-) -> Result<(), McpError> {
-    if ctx_guard.is_none() {
-        SlotOpener::of(handle).open(ctx_guard)?;
+    if handle.ctx.lock().await.is_some() {
+        return Ok(());
+    }
+    if handle.doc_reindex_active.load(Ordering::Acquire) {
+        return Err(mcp_error("Repo initializing, retry shortly"));
+    }
+    let opener = SlotOpener::of(handle);
+    let admission = admit_slot_writer(&opener)
+        .await
+        .map_err(|e| mcp_error(e.to_string()))?;
+    let mut slot = Arc::clone(&handle.ctx).lock_owned().await;
+    if slot.is_none() {
+        tokio::task::spawn_blocking(move || {
+            let _admission = admission;
+            opener.open(&mut slot)
+        })
+        .await
+        .map_err(|e| mcp_error(e.to_string()))??;
     }
     Ok(())
 }
@@ -747,23 +755,19 @@ impl SlotOpener {
     /// Open the context into the locked, empty slot: initializes a store that is
     /// not there, and heals one that is damaged.
     fn open(&self, ctx_guard: &mut Option<Context>) -> Result<(), McpError> {
-        self.open_impl(ctx_guard, false)
+        self.open_impl(ctx_guard)
     }
 
-    fn open_impl(&self, ctx_guard: &mut Option<Context>, admitted: bool) -> Result<(), McpError> {
+    fn open_impl(&self, ctx_guard: &mut Option<Context>) -> Result<(), McpError> {
         if self.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let opened = if admitted {
-            Context::open_writer_admitted_reusing_process_probe(&self.root)
-        } else {
-            Context::open_reusing_process_probe(&self.root)
-        };
+        let opened = Context::open_writer_admitted_reusing_process_probe(&self.root);
         let ctx = match opened {
             Ok(ctx) => ctx,
-            Err(e) if e.is_not_found() && !admitted => {
+            Err(e) if e.is_not_found() => {
                 tracing::info!("Auto-initializing mdkb at {}", self.root.display());
-                Context::init(&self.root)
+                Context::init_writer_admitted(&self.root)
                     .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
@@ -783,18 +787,34 @@ impl SlotOpener {
     }
 }
 
+const SHORT_ADMISSION_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Wait cooperatively for writer admission, including a cold slot's open.
 /// A cancelled hook must not leave an OS lock waiter on a blocking thread.
 async fn admit_slot_writer(
     opener: &SlotOpener,
 ) -> crate::error::Result<crate::store::mutation_lock::MutationGuard> {
-    let dir = crate::store::namespace::store_dir(&opener.root)?;
+    if opener.doc_reindex_active.load(Ordering::Acquire) {
+        return Err(crate::Error::other("Repo initializing, retry shortly"));
+    }
+    admit_root_writer(&opener.root).await
+}
+
+pub(crate) async fn admit_root_writer(
+    root: &std::path::Path,
+) -> crate::error::Result<crate::store::mutation_lock::MutationGuard> {
+    let dir = crate::store::namespace::store_dir(root)?;
     std::fs::create_dir_all(&dir)?;
     let db = crate::domain::canonicalize_plain(&dir)?.join("index.sqlite");
+    admit_writer_path(&db, "background slot writer").await
+}
+
+async fn admit_writer_path(
+    db: &std::path::Path,
+    what: &str,
+) -> crate::error::Result<crate::store::mutation_lock::MutationGuard> {
     loop {
-        if let Some(admission) =
-            crate::store::mutation_lock::try_acquire_writer(&db, "background slot writer")?
-        {
+        if let Some(admission) = crate::store::mutation_lock::try_acquire_writer(db, what)? {
             return Ok(admission);
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -815,21 +835,26 @@ fn warm_slot_in_background(handle: &RepoHandle) {
     }
     let opener = SlotOpener::of(handle);
     tokio::spawn(async move {
+        if opener.ctx.lock().await.is_some() {
+            return;
+        }
+        let admission =
+            match tokio::time::timeout(SHORT_ADMISSION_BUDGET, admit_slot_writer(&opener)).await {
+                Ok(Ok(admission)) => admission,
+                Ok(Err(error)) => {
+                    tracing::warn!("warm open admission failed: {error}");
+                    return;
+                }
+                Err(_) => return, // Next encounter can warm; do not retain pollers.
+            };
         let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
         if guard.is_some() {
             return;
         }
-        let admission = match admit_slot_writer(&opener).await {
-            Ok(admission) => admission,
-            Err(error) => {
-                tracing::warn!("warm open admission failed: {error}");
-                return;
-            }
-        };
         let opened = tokio::task::spawn_blocking(move || {
             let _admission = admission;
             let _hold = crate::core::SlotHold::start("warm open");
-            opener.open_impl(&mut guard, true)
+            opener.open_impl(&mut guard)
         })
         .await;
         match opened {
@@ -990,15 +1015,40 @@ impl HookStore {
         }
     }
 
-    /// The slot itself, for a write that cannot be answered from a snapshot:
-    /// waits for it when a bypass was reading. Only the rare write paths pay.
-    async fn for_write(&mut self, handle: &RepoHandle) -> Result<&mut Option<Context>, McpError> {
-        if matches!(self, Self::Bypass(_)) {
-            ensure_handle_context(handle).await?;
+    /// Give ordinary accounting a short chance to finish, without owning the
+    /// serving slot while waiting for admission. The enclosing hook deadline
+    /// can cancel this wait; expiry omits the unrecorded line.
+    async fn for_write(
+        &mut self,
+        handle: &RepoHandle,
+    ) -> Result<
+        (
+            &mut Option<Context>,
+            crate::store::mutation_lock::MutationGuard,
+        ),
+        McpError,
+    > {
+        *self = Self::Bypass(Box::new(None));
+        let opener = SlotOpener::of(handle);
+        let (guard, admission) = tokio::time::timeout(SHORT_ADMISSION_BUDGET, async {
+            let admission = admit_slot_writer(&opener)
+                .await
+                .map_err(|e| mcp_error(e.to_string()))?;
             let guard = Arc::clone(&handle.ctx).lock_owned().await;
-            *self = Self::Slot(guard, crate::core::SlotHold::start("hook write"));
-        }
-        Ok(self.slot())
+            if opener.doc_reindex_active.load(Ordering::Acquire) {
+                return Err(mcp_error("Repo initializing, retry shortly"));
+            }
+            // A cold slot warms separately; do not turn the short injection
+            // budget into an inline integrity scan.
+            if guard.is_none() {
+                return Err(mcp_error("Hook injection store warming"));
+            }
+            Ok((guard, admission))
+        })
+        .await
+        .map_err(|_| mcp_error("Hook injection admission timed out"))??;
+        *self = Self::Slot(guard, crate::core::SlotHold::start("hook write"));
+        Ok((self.slot(), admission))
     }
 
     /// A telemetry write nothing waits on: under the slot it runs now, on a
@@ -1012,10 +1062,31 @@ impl HookStore {
     ) {
         match self {
             Self::Slot(guard, _hold) => {
-                log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
+                slot_write_or_defer(guard, opener, what, f);
             }
             Self::Bypass(_) => write_behind_slot(opener, what, f),
         }
+    }
+}
+
+/// A slot holder only probes admission; contention uses the existing drain.
+fn slot_write_or_defer(
+    slot: &mut Option<Context>,
+    opener: SlotOpener,
+    what: &'static str,
+    f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
+) {
+    let admission = slot
+        .as_ref()
+        .filter(|ctx| !ctx.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(true))
+        .map(|ctx| crate::store::mutation_lock::try_acquire_writer(&ctx.db_path, what));
+    match admission {
+        Some(Ok(Some(admission))) => log_slot_write(
+            what,
+            crate::core::run_admitted_write(slot, what, &admission, f),
+        ),
+        Some(Err(error)) => tracing::warn!("{what} admission failed: {error}"),
+        _ => write_behind_slot(opener, what, f),
     }
 }
 
@@ -1028,10 +1099,6 @@ fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
         None => tracing::warn!("{what} dropped: the store was closed before it could be written"),
     }
 }
-
-/// Longest a queued write waits for the startup document reindex to hand the
-/// store back before it is given up on.
-const WRITE_BEHIND_REINDEX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Admit at most 64 telemetry rows together: a 50-hook burst needs one sync,
 /// while larger backlogs release the writer lock between bounded batches so
@@ -1136,14 +1203,10 @@ fn write_behind_slot(
     // Spawn outside the map lock so that cleanup can acquire it safely.
     let task = runtime.spawn(async move {
         let _drain = drain;
-        let give_up = tokio::time::Instant::now() + WRITE_BEHIND_REINDEX_WAIT;
-        while opener.doc_reindex_active.load(Ordering::Relaxed)
-            && tokio::time::Instant::now() < give_up
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
         loop {
-            let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+            while opener.doc_reindex_active.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
             {
                 let mut queues = deferred_writes();
                 if queues.get(&key).is_none_or(|queue| queue.writes.is_empty()) {
@@ -1151,7 +1214,7 @@ fn write_behind_slot(
                     return;
                 }
             }
-            let admission = match admit_slot_writer(&opener).await {
+            let admission = match admit_root_writer(&opener.root).await {
                 Ok(admission) => admission,
                 Err(error) => {
                     tracing::warn!("deferred writer admission failed: {error}");
@@ -1159,6 +1222,12 @@ fn write_behind_slot(
                     return;
                 }
             };
+            let mut guard = Arc::clone(&opener.ctx).lock_owned().await;
+            if opener.doc_reindex_active.load(Ordering::Acquire) {
+                drop(guard);
+                drop(admission);
+                continue;
+            }
             let batch = {
                 let mut queues = deferred_writes();
                 let writes = queues
@@ -1177,7 +1246,7 @@ fn write_behind_slot(
             let opener = SlotOpener::clone(&opener);
             let written = tokio::task::spawn_blocking(move || {
                 if guard.is_none() {
-                    if let Err(error) = opener.open_impl(&mut guard, true) {
+                    if let Err(error) = opener.open_impl(&mut guard) {
                         for (what, _) in &batch {
                             tracing::warn!("{what} dropped: {}", error.message);
                         }
@@ -1288,9 +1357,11 @@ fn hook_store_if_open(handle: &RepoHandle) -> Option<HookStore> {
 async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
     #[cfg(test)]
     store_stall::maybe_stall(&handle.root).await;
-    if let Ok(mut guard) = Arc::clone(&handle.ctx).try_lock_owned() {
+    if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
         if guard.is_some() || handle.doc_reindex_active.load(Ordering::Relaxed) {
-            open_handle_context(&mut guard, handle)?;
+            if guard.is_none() {
+                return Err(mcp_error("Repo initializing, retry shortly"));
+            }
             return Ok(HookStore::Slot(
                 guard,
                 crate::core::SlotHold::start("hook read"),
@@ -1308,7 +1379,9 @@ async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
             }
             Err(error) => {
                 tracing::debug!("hook cold read bypass unavailable, opening the store: {error}");
-                open_handle_context(&mut guard, handle)?;
+                drop(guard);
+                ensure_handle_context(handle).await?;
+                let guard = Arc::clone(&handle.ctx).lock_owned().await;
                 return Ok(HookStore::Slot(
                     guard,
                     crate::core::SlotHold::start("hook read"),
@@ -1350,21 +1423,39 @@ async fn run_handle_memory_mutation<T>(
     what: &str,
     f: impl FnOnce(&Context) -> Result<T, McpError>,
 ) -> Result<T, McpError> {
-    let (db_path, generation, result) = {
+    let (db_path, generation, result) = loop {
+        let (db_path, generation) = {
+            let guard = slot.lock().await;
+            let ctx = guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+            (ctx.db_path.clone(), ctx.generation)
+        };
+        let writer = admit_writer_path(&db_path, what)
+            .await
+            .map_err(|e| mcp_error(e.to_string()))?;
+        let mutation_path = db_path.clone();
+        let operation = what.to_string();
+        let mutation = tokio::task::spawn_blocking(move || {
+            crate::store::mutation_lock::acquire(&mutation_path, &operation)
+        })
+        .await
+        .map_err(|e| mcp_error(e.to_string()))?
+        .map_err(|e| mcp_error(e.to_string()))?;
         let guard = slot.lock().await;
-        let mut hold = crate::core::SlotHold::start(what);
         let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
+        if ctx.db_path != db_path || ctx.generation != generation {
+            drop(guard);
+            drop(mutation);
+            drop(writer);
+            continue;
+        }
+        let mut hold = crate::core::SlotHold::start(what);
         hold.in_repo(ctx.root());
-        let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
-            .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
-        let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, what)
-            .map_err(|e| mcp_error(format!("Failed to acquire mutation lock: {e}")))?;
-
-        crate::store::heal::invalidate_marker(&ctx.db_path);
-        let result = f(ctx);
-        (ctx.db_path.clone(), ctx.generation, result)
+        crate::store::heal::invalidate_marker(&db_path);
+        break (db_path, generation, f(ctx));
     };
 
     let probe_path = db_path.clone();
@@ -1395,77 +1486,305 @@ async fn run_handle_memory_mutation<T>(
     result
 }
 
-/// Drain pending memory embeddings in the background. Single-flight per handle
-/// (a second call while one is in flight is a no-op), gated on a cheap `COUNT(*)`,
-/// with ONNX inference pushed off the async runtime via `spawn_blocking`.
-///
-/// Best-effort: every failure degrades to a debug log — a background task must
-/// never surface errors. Returns the spawned task handle when this call won the
-/// single-flight guard, or `None` when a drain was already running. Hook callers
-/// ignore the handle; tests await it to observe the drain deterministically.
+/// Drain memory embeddings or migrate an incompatible store off the serving path.
+/// Repeated encounters share one flight, including across config reloads.
 pub fn spawn_embedding_backfill(handle: Arc<RepoHandle>) -> Option<tokio::task::JoinHandle<usize>> {
-    if handle.backfill_in_flight.swap(true, Ordering::AcqRel) {
-        return None; // another drain already in flight
-    }
-    Some(tokio::spawn(run_embedding_backfill(handle)))
+    schedule_embedding_backfill_mode(&handle, true)
 }
 
-/// Awaitable core of [`spawn_embedding_backfill`]: reset the single-flight guard
-/// on exit (even on panic), open the context, and — only when something is
-/// pending — drain it off the runtime. Returns the number of entries embedded.
-/// Standalone (not inlined into the spawn) so tests can await it directly.
-async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
-    // RAII reset so a panicking drain can't wedge the guard permanently.
-    struct FlightGuard(Arc<RepoHandle>);
-    impl Drop for FlightGuard {
-        fn drop(&mut self) {
-            self.0.backfill_in_flight.store(false, Ordering::Release);
-        }
-    }
-    let _guard = FlightGuard(Arc::clone(&handle));
+/// Only explicitly long-lived callers schedule full conversion. The public
+/// spawn entry point transfers job ownership to its caller; encounters use the
+/// daemon DispatchContext below, never runtime presence as a lifetime signal.
+pub(crate) fn schedule_embedding_backfill(
+    handle: &RepoHandle,
+) -> Option<tokio::task::JoinHandle<usize>> {
+    schedule_embedding_backfill_mode(handle, true)
+}
 
-    if let Err(e) = ensure_handle_context(&handle).await {
-        tracing::debug!("embedding backfill: context open failed: {e}");
-        return 0;
+fn schedule_embedding_backfill_mode(
+    handle: &RepoHandle,
+    full: bool,
+) -> Option<tokio::task::JoinHandle<usize>> {
+    let runtime = tokio::runtime::Handle::try_current().ok()?;
+    // Reject repeats before config/identity/archive probes.
+    if handle.backfill_in_flight.load(Ordering::Acquire) {
+        return None;
     }
-    let ctx = Arc::clone(&handle.ctx);
-    let drained = tokio::task::spawn_blocking(move || {
-        // Cheap indexed COUNT(*): only a positive count is worth loading the model.
-        let pending = {
-            let mut guard = ctx.blocking_lock();
-            let _hold = crate::core::SlotHold::start("embedding backlog count");
-            crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
-                crate::store::memory::count_pending_embeddings(&ctx.conn)
-            })
-        };
-        match pending {
-            Some(Ok(0)) | None => Some(0),
-            Some(Ok(_)) => {
-                match crate::core::run_mutation(&ctx, "memory embedding backfill", |ctx| {
-                    crate::store::memory::backfill_memory_embeddings(&ctx.conn)
-                }) {
-                    Some(Ok(n)) => Some(n),
-                    Some(Err(e)) => {
-                        tracing::debug!("embedding backfill: backfill failed: {e}");
-                        Some(0)
-                    }
-                    None => Some(0),
-                }
-            }
-            Some(Err(error)) => {
-                tracing::debug!("embedding backfill: pending count failed: {error}");
-                Some(0)
-            }
+    if handle.doc_reindex_active.load(Ordering::Acquire) {
+        return None;
+    }
+    let opener = SlotOpener::of(handle);
+    let slot = opener.ctx.try_lock().ok()?;
+    // Reject a read-only serving context using metadata, never SQL. The worker
+    // probes its own snapshot so it cannot retain the serving slot after reply.
+    if slot
+        .as_ref()
+        .is_some_and(|ctx| ctx.conn.is_readonly(rusqlite::MAIN_DB).unwrap_or(true))
+    {
+        return None;
+    }
+    drop(slot);
+    let dir = crate::store::namespace::store_dir(&opener.root).ok()?;
+    let signature = std::fs::read(dir.join("config.toml")).ok();
+    let retry = Arc::clone(&handle.embedding_retry);
+    {
+        let memo = retry.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.as_ref().is_some_and(|(config, until)| {
+            *config == signature && std::time::Instant::now() < *until
+        }) {
+            return None;
         }
-    })
-    .await
-    .ok()
-    .flatten()
-    .unwrap_or(0);
-    if drained > 0 {
-        tracing::debug!("embedding backfill: drained {drained} pending memory embeddings");
     }
-    drained
+    if handle.backfill_in_flight.swap(true, Ordering::AcqRel) {
+        return None;
+    }
+    let flight = EmbeddingFlight(Arc::clone(&handle.backfill_in_flight));
+    // Seed before spawning: cancellation or panic must not permit an immediate
+    // same-config attempt. Only a verified, fully drained result clears it.
+    *retry.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        signature.clone(),
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    ));
+    let code_index = Arc::clone(&handle.code_index);
+    Some(runtime.spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let _flight = flight;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // The flight is published before returning to the caller, but
+                // identity inspection is SQLite work and must not delay it.
+                if embedding_encounter_needs_work(&opener.root, &dir, full) != Some(true) {
+                    return Ok((0, true));
+                }
+                static SERIAL: StdMutex<()> = StdMutex::new(());
+                let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+                run_embedding_generation(&opener, &dir, &signature, full, &code_index)
+            })).unwrap_or_else(|_| Err(crate::Error::other("background embedding generation panicked")));
+            let mut memo = retry.lock().unwrap_or_else(|e| e.into_inner());
+            *memo = if result.as_ref().is_ok_and(|(_, complete)| *complete) {
+                None
+            } else {
+                Some((signature, std::time::Instant::now() + std::time::Duration::from_secs(30)))
+            };
+            result
+        }).await;
+        match result {
+            Ok(Ok((count, _))) => count,
+            Ok(Err(error)) => { tracing::warn!("background embedding generation failed; retry eligible in 30s or after configuration change: {error}"); 0 }
+            Err(error) => { tracing::warn!("background embedding worker failed: {error}"); 0 }
+        }
+    }))
+}
+
+/// Inspect a current snapshot before scheduling any writable open or encoder.
+fn embedding_encounter_needs_work(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    full: bool,
+) -> Option<bool> {
+    if !dir.join("index.sqlite").is_file() {
+        return Some(false);
+    }
+    // Probe the serving store without opening a writable context or waiting
+    // on an unrelated writer just to find an already-current generation.
+    {
+        let ctx = Context::open_read_only(root).ok()?;
+        let state = crate::store::vectors::identity_status(&ctx.conn).ok()?;
+        let code_stale = crate::code::semantic::identity_status(
+            &dir.join("vectors.bin"),
+            crate::store::vectors::selected_model(&ctx.conn).ok()?,
+        )
+        .stale;
+        if !full && (state.stale || code_stale) {
+            return None;
+        }
+        if !state.stale
+            && !code_stale
+            && crate::store::memory::count_pending_embeddings(&ctx.conn).ok()? == 0
+        {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Establish no-write preconditions and acquire weights before writer admission.
+fn run_embedding_generation(
+    opener: &SlotOpener,
+    dir: &std::path::Path,
+    signature: &Option<Vec<u8>>,
+    full: bool,
+    code_index: &tokio::sync::Mutex<Option<IndexFacade>>,
+) -> crate::error::Result<(usize, bool)> {
+    let config_path = dir.join("config.toml");
+    let config = match crate::config::Config::load(&config_path) {
+        Ok(config) => config,
+        Err(e) if matches!(e.kind(), ErrorKind::ConfigNotFound { .. }) => {
+            crate::config::Config::default()
+        }
+        Err(e) => return Err(e),
+    };
+    if !dir.join("index.sqlite").is_file() {
+        return Ok((0, true));
+    }
+    if !dir.join("code.sqlite").exists() && dir.join("vectors.bin").exists() {
+        return Err(crate::Error::other(
+            "code vectors have no source code index; rebuild the code index before migration",
+        ));
+    }
+    let _service = crate::llm::service_for(config.embedding.model, full)?;
+    #[cfg(test)]
+    migration_test_hook(&MIGRATION_STARTED, &opener.root);
+    let ctx = Context::open_reusing_process_probe(&opener.root)?;
+    apply_embedding_generation(&ctx, dir, signature, config.embedding.model, code_index)
+}
+
+/// Revalidate under admission, then release it before cache refresh and probing.
+fn apply_embedding_generation(
+    ctx: &Context,
+    dir: &std::path::Path,
+    signature: &Option<Vec<u8>>,
+    configured_model: crate::llm::embeddings::Model,
+    code_index: &tokio::sync::Mutex<Option<IndexFacade>>,
+) -> crate::error::Result<(usize, bool)> {
+    let config_path = dir.join("config.toml");
+    let _writer = crate::store::mutation_lock::acquire_writer(&ctx.db_path, "embedding backfill")?;
+    let _mutation = crate::store::mutation_lock::acquire(&ctx.db_path, "embedding backfill")?;
+    let state = crate::store::vectors::identity_status(&ctx.conn)?;
+    let model = crate::store::vectors::selected_model(&ctx.conn)?;
+    if model != configured_model || std::fs::read(&config_path).ok().as_ref() != signature.as_ref()
+    {
+        return Err(crate::Error::other(
+            "embedding configuration changed before background generation",
+        ));
+    }
+    let stale = state.stale
+        || crate::code::semantic::identity_status(&dir.join("vectors.bin"), model).stale;
+    if !stale && crate::store::memory::count_pending_embeddings(&ctx.conn)? == 0 {
+        return Ok((0, true));
+    }
+    if stale {
+        // The child takes writer admission itself; `flock` is not shared with it.
+        drop(_mutation);
+        drop(_writer);
+        let result = regenerate_in_child(ctx.root(), &ctx.db_path);
+        *code_index.blocking_lock() = None;
+        #[cfg(test)]
+        migration_test_hook(&MIGRATION_BEFORE_VERIFY, ctx.root());
+        crate::store::heal::verify_and_mark_unadmitted(&ctx.db_path)?;
+        let remaining = crate::store::memory::count_pending_embeddings(&ctx.conn)?;
+        return result.map(|report| (report.generated, remaining == 0));
+    }
+    let before = ctx.conn.total_changes();
+    let result = write_embedding_generation(ctx);
+    let wrote = ctx.conn.total_changes() != before;
+    let remaining = crate::store::memory::count_pending_embeddings(&ctx.conn);
+    drop(_mutation);
+    drop(_writer);
+    let remaining = remaining?;
+    if wrote {
+        #[cfg(test)]
+        migration_test_hook(&MIGRATION_BEFORE_VERIFY, ctx.root());
+        crate::store::heal::verify_and_mark_unadmitted(&ctx.db_path)?;
+    }
+    result.map(|count| (count, remaining == 0))
+}
+
+/// Drain pending memory embeddings and keep the health marker honest.
+fn write_embedding_generation(ctx: &Context) -> crate::error::Result<usize> {
+    let before = ctx.conn.total_changes();
+    // Keep successful no-write passes from invalidating health.
+    // The savepoint holds real writes unpublished until their
+    // marker is invalidated, before RELEASE commits them.
+    documents::with_savepoint(&ctx.conn, "background_memory_backfill", || {
+        let result = crate::store::memory::backfill_memory_embeddings(&ctx.conn);
+        if ctx.conn.total_changes() != before {
+            crate::store::heal::invalidate_marker(&ctx.db_path);
+        }
+        result
+    })
+}
+
+/// What a regeneration child reported (`mdkb --format json embed --reembed`).
+#[derive(serde::Deserialize)]
+struct RegenerationReport {
+    generated: usize,
+    skipped: usize,
+    errors: Vec<String>,
+}
+
+/// Overrides the executable a regeneration child runs; tests point it at the
+/// built `mdkb` binary, because their own executable is the test harness.
+const EMBED_WORKER_ENV: &str = "MDKB_EMBED_WORKER";
+
+/// Run a full regeneration in a child `mdkb update --reembed` (story 068-6648).
+///
+/// Lowering a process's priority cannot be undone, so the daemon may not lower
+/// its own (tests/layering.rs), and its ONNX pool is bounded to two threads.
+/// Measured 2026-11-20: run inside the daemon, a Granite regeneration of
+/// tuicommander held two cores at nice 0 for its whole run and competed with
+/// interactive work. The child lowers itself to `search.embed_nice` and gets an
+/// ONNX pool of half the cores, so it uses idle cores and yields busy ones.
+///
+/// The caller must hold no store lock: the child takes writer admission itself.
+/// The health marker is invalidated before the child writes; the caller verifies
+/// and republishes it afterwards.
+fn regenerate_in_child(
+    root: &std::path::Path,
+    db_path: &std::path::Path,
+) -> crate::error::Result<RegenerationReport> {
+    let worker = match std::env::var_os(EMBED_WORKER_ENV) {
+        Some(path) => std::path::PathBuf::from(path),
+        None => std::env::current_exe()?,
+    };
+    crate::store::heal::invalidate_marker(db_path);
+    let output = std::process::Command::new(&worker)
+        .args(["--format", "json", "update", "--reembed"])
+        .current_dir(root)
+        .env("MDKB_NO_DAEMON", "1")
+        .env(
+            crate::llm::ORT_THREADS_ENV,
+            crate::llm::regeneration_threads().to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(crate::Error::other(format!(
+            "embedding regeneration process failed ({}): {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    serde_json::from_slice(&output.stdout)
+        .map_err(|e| crate::Error::other(format!("embedding regeneration process output: {e}")))
+}
+
+fn schedule_daemon_embedding_encounter(handle: &RepoHandle) {
+    schedule_embedding_backfill(handle);
+}
+
+#[cfg(test)]
+type MigrationTestHooks = StdMutex<HashMap<std::path::PathBuf, Box<dyn FnOnce() + Send>>>;
+#[cfg(test)]
+static MIGRATION_STARTED: std::sync::LazyLock<MigrationTestHooks> =
+    std::sync::LazyLock::new(Default::default);
+#[cfg(test)]
+static MIGRATION_BEFORE_VERIFY: std::sync::LazyLock<MigrationTestHooks> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+fn migration_test_hook(hooks: &MigrationTestHooks, root: &std::path::Path) {
+    let hook = hooks.lock().unwrap().remove(root);
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+struct EmbeddingFlight(Arc<AtomicBool>);
+impl Drop for EmbeddingFlight {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Acquire (and lazily initialize) the code index on a repo handle.
@@ -1496,9 +1815,8 @@ pub async fn acquire_handle_code_index(
 /// `status` — returns the human-readable index status string. Callers wrap
 /// this in the transport-appropriate envelope (CallToolResult or JSON-RPC).
 pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
-    ensure_handle_context(handle).await?;
-
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("status_impl");
     let mut output = crate::core::run_guarded_read(&mut ctx_guard, "status", |ctx| {
         let index_status = search::get_status(&ctx.conn)?;
@@ -1533,7 +1851,7 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
     })
     .ok_or_else(|| mcp_error("Database not initialized"))?
     .map_err(|e| mcp_error(format!("Failed to get status: {e}")))?;
-    drop(ctx_guard);
+    drop(store);
 
     if let Ok(idx_guard) = acquire_handle_code_index(handle).await {
         if let Some(facade) = idx_guard.as_ref() {
@@ -1561,10 +1879,10 @@ pub async fn memory_delete_impl(
     dry_run: bool,
 ) -> Result<String, McpError> {
     memory::validate_entry_id(id).map_err(mcp_refusal)?;
-    ensure_handle_context(handle).await?;
 
     if dry_run {
-        let mut ctx_guard = handle.ctx.lock().await;
+        let mut store = hook_store(handle).await?;
+        let mut ctx_guard = store.slot();
         let _hold = crate::core::SlotHold::start("memory_delete_impl");
         let exists =
             crate::core::run_guarded_read(&mut ctx_guard, "memory delete dry run", |ctx| {
@@ -1580,6 +1898,7 @@ pub async fn memory_delete_impl(
         });
     }
 
+    ensure_handle_context(handle).await?;
     let deleted = run_handle_memory_mutation(&handle.ctx, "memory delete", |ctx| {
         // Literally the same door as `mdkb memory rm`, not a copy of it: the
         // archive-then-delete order that keeps a retired entry from being
@@ -1698,10 +2017,13 @@ fn resolve_source_file(
 /// stalls a tokio worker and serializes every call on that repo. This mirrors
 /// the `spawn_blocking`-before-lock pattern in `memory_write_impl`. On failure
 /// returns `None` (with a warn) so callers transparently fall back to BM25.
-async fn embed_query_off_lock(query: &str) -> Option<Vec<f32>> {
+async fn embed_query_off_lock(
+    query: &str,
+    model: crate::llm::embeddings::Model,
+) -> Option<crate::llm::embeddings::Vector> {
     let query = query.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        crate::llm::get_cached_service().and_then(|s| s.embed_query(&query))
+        crate::llm::service_for(model, false).and_then(|s| s.query(&query))
     })
     .await;
     match result {
@@ -1750,10 +2072,11 @@ pub async fn memory_write_impl(
         None
     } else {
         let embed_text = format!("{} {}", entry.title, content);
+        let model = handle.config.embedding.model;
         tokio::task::spawn_blocking(move || {
-            crate::llm::get_cached_service()
+            crate::llm::service_for(model, false)
                 .ok()
-                .and_then(|svc| svc.embed_query(&embed_text).ok())
+                .and_then(|svc| svc.query(&embed_text).ok())
         })
         .await
         .unwrap_or(None)
@@ -1778,7 +2101,7 @@ pub async fn memory_write_impl(
         triggers: entry.triggers.as_deref(),
         ttl: entry.ttl,
         due_in: entry.due_in,
-        embedding: embedding.as_deref(),
+        embedding: embedding.as_ref(),
         // Already embedded off the lock above: letting `write_memory` do it
         // would run ONNX on the runtime thread holding the context.
         embed_when_missing: false,
@@ -1855,7 +2178,7 @@ pub async fn memory_write_batch_impl(
 
     // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
     // Skipped for dry-run, which returns before any embedding or write happens.
-    let embeddings: Vec<Option<Vec<f32>>> = if dry_run {
+    let embeddings: Vec<Option<crate::llm::embeddings::Vector>> = if dry_run {
         vec![None; entries.len()]
     } else {
         let embed_texts: Vec<String> = entries
@@ -1863,10 +2186,11 @@ pub async fn memory_write_batch_impl(
             .zip(resolved.iter())
             .map(|(e, (content, _))| format!("{} {}", e.title, content))
             .collect();
-        tokio::task::spawn_blocking(move || match crate::llm::get_cached_service() {
+        let model = handle.config.embedding.model;
+        tokio::task::spawn_blocking(move || match crate::llm::service_for(model, false) {
             Ok(svc) => embed_texts
                 .iter()
-                .map(|text| svc.embed_query(text).ok())
+                .map(|text| svc.query(text).ok())
                 .collect(),
             Err(_) => vec![None; embed_texts.len()],
         })
@@ -1900,7 +2224,7 @@ pub async fn memory_write_batch_impl(
                     triggers: entry.triggers.as_deref(),
                     ttl: entry.ttl,
                     due_in: entry.due_in,
-                    embedding: embedding.as_deref(),
+                    embedding: embedding.as_ref(),
                     // Batch-embedded off the lock above, for the same reason.
                     embed_when_missing: false,
                     source_path: source_path.as_deref(),
@@ -1953,9 +2277,8 @@ pub async fn memory_list_impl(
     let sort_order: memory::MemorySortOrder = sort.parse().map_err(mcp_error)?;
     let limit = limit.min(MEMORY_LIST_MAX_LIMIT);
 
-    ensure_handle_context(handle).await?;
-
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("memory_list_impl");
     let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory list", |ctx| {
         memory::list_entries_sorted(
@@ -2021,8 +2344,6 @@ pub async fn search_impl(
     handle: &RepoHandle,
     params: &SearchParams,
 ) -> Result<(String, usize), McpError> {
-    ensure_handle_context(handle).await?;
-
     let scope = params
         .scope
         .as_deref()
@@ -2064,8 +2385,8 @@ pub async fn search_impl(
     {
         return Err(mcp_error("path is not supported for this corpus"));
     }
-    if params.path.is_some() && params.file.is_some() {
-        return Err(mcp_error("Choose path or legacy file, not both"));
+    if params.file.is_some() {
+        return Err(mcp_error(crate::core::search_contract::REMOVED_FILE_FILTER));
     }
     if params
         .contract
@@ -2126,8 +2447,10 @@ pub async fn search_impl(
             Ok((output, count))
         }
         Some(crate::mcp::tools::SearchScope::Knowledge) => {
-            let query_embedding = embed_query_off_lock(&params.query).await;
-            let mut ctx_guard = handle.ctx.lock().await;
+            let query_embedding =
+                embed_query_off_lock(&params.query, handle.config.embedding.model).await;
+            let mut store = hook_store(handle).await?;
+            let mut ctx_guard = store.slot();
             let (docs, memories) =
                 crate::core::run_guarded_read(&mut ctx_guard, "knowledge search", |ctx| {
                     let docs = handle_hybrid_search(
@@ -2137,10 +2460,10 @@ pub async fn search_impl(
                         params.collection.as_deref(),
                         params.include_superseded,
                     )?;
-                    let memories = memory::search_entries_recall(
+                    let memories = memory::search_entries_recall_labelled(
                         &ctx.conn,
                         &params.query,
-                        query_embedding.as_deref(),
+                        query_embedding.as_ref(),
                         limit.saturating_add(1),
                         None,
                         &handle.config.search.memory,
@@ -2168,7 +2491,8 @@ pub async fn search_impl(
             Ok((output.to_string(), doc_count + memory_count))
         }
         Some(crate::mcp::tools::SearchScope::Docs) => {
-            let mut ctx_guard = handle.ctx.lock().await;
+            let mut store = hook_store(handle).await?;
+            let mut ctx_guard = store.slot();
             let _hold = crate::core::SlotHold::start("search_impl");
             let results = crate::core::run_guarded_read(&mut ctx_guard, "document search", |ctx| {
                 handle_hybrid_search(
@@ -2209,14 +2533,16 @@ pub async fn search_impl(
             Ok((output, results.len()))
         }
         Some(crate::mcp::tools::SearchScope::Memory) => {
-            let query_embedding = embed_query_off_lock(&params.query).await;
-            let mut ctx_guard = handle.ctx.lock().await;
+            let query_embedding =
+                embed_query_off_lock(&params.query, handle.config.embedding.model).await;
+            let mut store = hook_store(handle).await?;
+            let mut ctx_guard = store.slot();
             let _hold = crate::core::SlotHold::start("search_impl");
             let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory search", |ctx| {
-                memory::search_entries_recall(
+                memory::search_entries_recall_labelled(
                     &ctx.conn,
                     &params.query,
-                    query_embedding.as_deref(),
+                    query_embedding.as_ref(),
                     if params.contract.is_some() {
                         limit.saturating_add(1)
                     } else {
@@ -2254,8 +2580,10 @@ pub async fn search_impl(
             Ok((output, entries.len()))
         }
         None => {
-            let query_embedding = embed_query_off_lock(&params.query).await;
-            let mut ctx_guard = handle.ctx.lock().await;
+            let query_embedding =
+                embed_query_off_lock(&params.query, handle.config.embedding.model).await;
+            let mut store = hook_store(handle).await?;
+            let mut ctx_guard = store.slot();
             let _hold = crate::core::SlotHold::start("search_impl");
             let (doc_results, mem_entries) =
                 crate::core::run_guarded_read(&mut ctx_guard, "combined search", |ctx| {
@@ -2266,10 +2594,10 @@ pub async fn search_impl(
                         params.collection.as_deref(),
                         params.include_superseded,
                     )?;
-                    let memories = memory::search_entries_recall(
+                    let memories = memory::search_entries_recall_labelled(
                         &ctx.conn,
                         &params.query,
-                        query_embedding.as_deref(),
+                        query_embedding.as_ref(),
                         limit,
                         None,
                         &handle.config.search.memory,
@@ -2368,7 +2696,7 @@ pub async fn search_impl(
                     facade,
                     &params.query,
                     params.kind.as_deref(),
-                    params.file.as_deref(),
+                    params.path.as_deref(),
                     limit,
                 )
                 .map_err(|e| mcp_error(e.to_string()))?;
@@ -2422,7 +2750,8 @@ pub async fn search_impl(
             // The audit reads the code index off its own read-only connection,
             // so it does not take the code-index guard the other code scopes
             // need. It does take the memory connection, for the ignore-list.
-            let mut ctx_guard = handle.ctx.lock().await;
+            let mut store = hook_store(handle).await?;
+            let mut ctx_guard = store.slot();
             let _hold = crate::core::SlotHold::start("search_impl");
             let report =
                 crate::core::run_guarded_read(&mut ctx_guard, "duplication audit", |ctx| {
@@ -2438,9 +2767,9 @@ pub async fn search_impl(
                             semantic: false,
                             threshold: params.threshold,
                             min_nodes: None,
-                            // An empty query sweeps the repository; `file` is what
-                            // narrows it, matching `mdkb dup --file`.
-                            file: params.file.clone(),
+                            // An empty query sweeps the repository; `path` is what
+                            // narrows it, matching `mdkb code dup --file`.
+                            file: params.path.clone(),
                             since: params.since.clone(),
                         },
                     )
@@ -2687,7 +3016,7 @@ fn format_coverage_list(header: &str, lines: &[String]) -> String {
 
 /// The one line that names every store skipped for being older than this
 /// binary, and the command that fixes all of them. Names, not paths: the path
-/// is one `mdkb daemon status` away, and this line is charged on every
+/// is one `mdkb status` away, and this line is charged on every
 /// fan-out until the stores are migrated.
 fn format_outdated_line(outdated: &[std::path::PathBuf]) -> String {
     let names: Vec<String> = outdated
@@ -2854,7 +3183,7 @@ fn search_one_repo(
     include_sessions: bool,
     limit: usize,
     fts_query: &str,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
 ) -> RepoOutcome {
     // Opened HERE, one root at a time, and dropped when this function
     // returns. The batch open this replaces held a live rusqlite connection
@@ -2875,6 +3204,17 @@ fn search_one_repo(
             };
         }
     };
+    let local_embedding = crate::store::vectors::selected_model(&ctx.conn)
+        .ok()
+        .and_then(|model| {
+            if let Some(vector) = query_embedding.filter(|v| v.model == model) {
+                return Some(vector.clone());
+            }
+            crate::llm::service_for(model, false)
+                .ok()
+                .and_then(|s| s.query(&params.query).ok())
+        });
+    let query_embedding = local_embedding.as_ref();
     // The probe answers "are there documents to search here", which
     // is a question about a document query. For `scope="memory"` an
     // empty document registry says nothing about the answer, so
@@ -2915,7 +3255,7 @@ fn search_one_repo(
 
     if wants_docs {
         {
-            match hybrid_search_fts(
+            match hybrid_search_fts_labelled(
                 &ctx,
                 fts_query,
                 query_embedding,
@@ -2936,7 +3276,7 @@ fn search_one_repo(
                     // `hybrid_search_fts` leaves `claude_sessions` out unless that
                     // collection is named, so `*:all` names it in a second pass.
                     if include_sessions && params.collection.is_none() {
-                        match hybrid_search_fts(
+                        match hybrid_search_fts_labelled(
                             &ctx,
                             fts_query,
                             query_embedding,
@@ -2986,7 +3326,7 @@ fn search_one_repo(
     }
     if wants_memory {
         {
-            match memory::search_entries_recall(
+            match memory::search_entries_recall_labelled(
                 &ctx.conn,
                 &params.query,
                 query_embedding,
@@ -3064,7 +3404,7 @@ fn search_roots_blocking(
     include_sessions: bool,
     limit: usize,
     fts_query: &str,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
 ) -> Vec<RepoOutcome> {
     roots
         .iter()
@@ -3254,7 +3594,8 @@ pub async fn cross_repo_search_impl(
     // `search_entries_recall` both take a pre-computed vector for exactly this
     // reason; `None` degrades both to BM25-only, as it always did.
     let fts_query = search::escape_fts5_query(&params.query);
-    let query_embedding = embed_query_off_lock(&params.query).await;
+    let query_embedding =
+        embed_query_off_lock(&params.query, crate::llm::embeddings::Model::MiniLm).await;
 
     // Off the runtime. Every repo's search is blocking SQLite work, and the
     // runtime this used to occupy also serves the hook socket against a 200 ms
@@ -3274,7 +3615,7 @@ pub async fn cross_repo_search_impl(
                 include_sessions,
                 limit,
                 &fts_query,
-                query_embedding.as_deref(),
+                query_embedding.as_ref(),
             )
         })
         .await
@@ -3389,7 +3730,7 @@ async fn cross_repo_symbols_impl(
                                 &index,
                                 &params.query,
                                 params.kind.as_deref(),
-                                params.file.as_deref(),
+                                params.path.as_deref(),
                                 CROSS_REPO_SYMBOLS_PER_REPO,
                             )
                             .map_err(|e| e.to_string())
@@ -3508,6 +3849,18 @@ fn render_document_content(
     Ok(output)
 }
 
+fn defer_memory_access(slot: &mut Option<Context>, handle: &RepoHandle, id: &str) {
+    let id = id.to_string();
+    let now = chrono::Utc::now().timestamp();
+    slot_write_or_defer(slot, SlotOpener::of(handle), "memory access", move |ctx| {
+        ctx.conn.execute(
+            "UPDATE memory_entries SET access_count=access_count+1,last_accessed=?1 WHERE id=?2",
+            rusqlite::params![now, id],
+        )?;
+        Ok(())
+    });
+}
+
 /// `get` — comma-separated batch retrieval. Returns aggregated text and the
 /// number of items found. Errors when no items resolved.
 const GET_BATCH_MAX_IDS: usize = 50;
@@ -3524,7 +3877,8 @@ async fn get_batch_impl(
         )));
     }
 
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("get_batch_impl");
 
     let mut output = String::new();
@@ -3615,12 +3969,13 @@ async fn get_batch_impl(
             }
         }
 
-        let entry = crate::core::run_guarded_write(&mut ctx_guard, "batch memory get", |ctx| {
-            memory::get_entry(&ctx.conn, id)
+        let entry = crate::core::run_guarded_read(&mut ctx_guard, "batch memory get", |ctx| {
+            memory::get_entry_without_tracking(&ctx.conn, id)
         })
         .ok_or_else(|| mcp_error("Database not initialized"))?
         .map_err(|e| mcp_store_error("Failed to get memory", e))?;
         if let Some(entry) = entry {
+            defer_memory_access(&mut ctx_guard, handle, &entry.id);
             let ttl = format_ttl_info(entry.expires_at);
             output.push_str(&format!(
                 "=== [MEM] {} - {}{} ===\n{}\n\n",
@@ -3651,7 +4006,8 @@ async fn get_glob_impl(
     let max_response_tokens = handle.config.mcp.max_response_tokens;
 
     let (output, result_count) = {
-        let mut ctx_guard = handle.ctx.lock().await;
+        let mut store = hook_store(handle).await?;
+        let mut ctx_guard = store.slot();
         let _hold = crate::core::SlotHold::start("get_glob_impl");
         let results = crate::core::run_guarded_read(&mut ctx_guard, "glob retrieval", |ctx| {
             handle_mget(ctx, pattern, None)
@@ -3715,8 +4071,6 @@ pub async fn get_impl(
     handle: &RepoHandle,
     params: &GetParams,
 ) -> Result<(String, usize, bool), McpError> {
-    ensure_handle_context(handle).await?;
-
     let id = &params.id;
 
     if id.contains(',') {
@@ -3728,7 +4082,8 @@ pub async fn get_impl(
         return get_glob_impl(handle, id).await;
     }
 
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("get_impl");
 
     if let Ok(numeric_id) = id.parse::<i64>() {
@@ -3764,12 +4119,13 @@ pub async fn get_impl(
         }
     }
 
-    let memory_entry = crate::core::run_guarded_write(&mut ctx_guard, "memory get", |ctx| {
-        memory::get_entry(&ctx.conn, id)
+    let memory_entry = crate::core::run_guarded_read(&mut ctx_guard, "memory get", |ctx| {
+        memory::get_entry_without_tracking(&ctx.conn, id)
     })
     .ok_or_else(|| mcp_error("Database not initialized"))?
     .map_err(|e| mcp_store_error("Failed to get memory", e))?;
     if let Some(entry) = memory_entry {
+        defer_memory_access(&mut ctx_guard, handle, &entry.id);
         if params.format.as_deref() == Some("history") {
             let revisions =
                 crate::core::run_guarded_read(&mut ctx_guard, "memory revision history", |ctx| {
@@ -3908,7 +4264,7 @@ pub async fn get_impl(
             } else {
                 entry.tags.join(", ")
             },
-            entry.access_count,
+            entry.access_count.saturating_add(1),
             conf_line,
             rev_line,
             ttl_line,
@@ -4149,7 +4505,10 @@ pub async fn code_find_impl(
     let (results, total) = facade.query_symbols(
         crate::code::storage::NameMatch::Exact(&params.name),
         kind.as_deref(),
-        params.file.as_deref(),
+        params
+            .file
+            .as_deref()
+            .map(crate::code::storage::FileMatch::Contains),
         limit,
     );
 
@@ -4209,8 +4568,8 @@ const GRAPH_MCP_MAX_HOPS: u32 = 6;
 pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<String, McpError> {
     use crate::store::graph;
 
-    ensure_handle_context(handle).await?;
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("graph_impl");
 
     let relation = params.relation.as_deref();
@@ -4703,9 +5062,8 @@ pub async fn usage_impl(
     params: &UsageParams,
     session_id: i64,
 ) -> Result<String, McpError> {
-    ensure_handle_context(handle).await?;
-
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await?;
+    let mut ctx_guard = store.slot();
     let _hold = crate::core::SlotHold::start("usage_impl");
     let (session, session_tool_usage, lifetime, lifetime_tool_usage) =
         crate::core::run_guarded_read(&mut ctx_guard, "usage report", |ctx| {
@@ -5443,11 +5801,17 @@ fn take_present<T>(candidates: Vec<(T, Option<std::path::PathBuf>)>, cap: usize)
         .collect()
 }
 
+/// Entries recall may inject: not disputed, and not superseded. A superseded
+/// entry is rendered like a current one, so injecting it next to its
+/// replacement states both decisions as true; the one-hop expansion already
+/// excludes superseded neighbors for the same reason.
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
     entries
         .into_iter()
         .map(|result| result.entry)
-        .filter(|entry| !entry.is_disputed())
+        .filter(|entry| {
+            !entry.is_disputed() && entry.status != crate::store::memory::EntryStatus::Superseded
+        })
         .collect()
 }
 
@@ -5577,6 +5941,14 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
         return true;
     };
 
+    let refresh_guard = match crate::code::indexing::refresh::try_start(&handle.root) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return true,
+        Err(error) => {
+            tracing::error!("SessionStart code refresh could not start: {error}");
+            return false;
+        }
+    };
     let root = handle.root.clone();
     let code_index = Arc::clone(&handle.code_index);
     let ignore_patterns = handle.code_ignore_patterns.clone();
@@ -5585,6 +5957,7 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
     tokio::spawn(async move {
         // Clears code_reindex_active on ANY exit, including a panic below.
         let _active_guard = active_guard;
+        let _refresh_guard = refresh_guard;
 
         let mut idx_guard = code_index.lock().await;
         if idx_guard.is_none() {
@@ -5737,10 +6110,6 @@ pub struct PhaseTimings {
     last: std::time::Instant,
     phases: Vec<(&'static str, u64)>,
     active: &'static str,
-    /// What a phase decided, where a duration alone does not say it: the
-    /// reranker's `rerank_outcome`. Written into the same object as the
-    /// durations, so a cut run keeps the last note it made.
-    notes: Vec<(&'static str, &'static str)>,
 }
 
 impl PhaseTimings {
@@ -5751,26 +6120,7 @@ impl PhaseTimings {
             last: now,
             phases: Vec::new(),
             active: "prepare",
-            notes: Vec::new(),
         }
-    }
-
-    /// Milliseconds since the run began: what a phase that has a budget of its
-    /// own measures that budget against.
-    fn elapsed_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
-    }
-
-    /// Record `value` under `key`, replacing an earlier note of the same key.
-    fn note(&mut self, key: &'static str, value: &'static str) {
-        match self.notes.iter_mut().find(|(k, _)| *k == key) {
-            Some(slot) => slot.1 = value,
-            None => self.notes.push((key, value)),
-        }
-    }
-
-    fn note_of(&self, key: &str) -> Option<&'static str> {
-        self.notes.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
     }
 
     /// Close the running segment and name it.
@@ -5804,9 +6154,6 @@ impl PhaseTimings {
             "unaccounted_ms".to_string(),
             json!(elapsed_ms.saturating_sub(accounted)),
         );
-        for &(key, value) in &self.notes {
-            fields.insert(key.to_string(), json!(value));
-        }
         if deadline {
             fields.insert("deadline_phase".to_string(), json!(self.active));
         }
@@ -5816,18 +6163,13 @@ impl PhaseTimings {
     /// The split as a JSON object, or `None` when nothing was marked — a hook
     /// with no phases must not write an empty object into every row.
     fn as_json(&self) -> Option<Value> {
-        if self.phases.is_empty() && self.notes.is_empty() {
+        if self.phases.is_empty() {
             return None;
         }
         Some(Value::Object(
             self.phases
                 .iter()
                 .map(|(name, ms)| ((*name).to_string(), json!(ms)))
-                .chain(
-                    self.notes
-                        .iter()
-                        .map(|(key, value)| ((*key).to_string(), json!(value))),
-                )
                 .collect(),
         ))
     }
@@ -6128,10 +6470,12 @@ async fn hook_session_start_inner(
     // Single-flight + best-effort; the ctx lock is already released. Tracked
     // through `dctx` where there is one: the in-process route exits with the
     // hook, and an untracked task dies before it drains.
-    if let Some(task) = spawn_embedding_backfill(Arc::clone(handle))
-        && let Some(dctx) = dctx
+    if let Some(task) =
+        schedule_embedding_backfill_mode(handle, dctx.is_some_and(|d| d.background.is_none()))
     {
-        dctx.adopt(task);
+        if let Some(dctx) = dctx {
+            dctx.adopt(task);
+        }
     }
 
     let bin = std::env::current_exe()
@@ -6174,35 +6518,26 @@ async fn hook_session_start_inner(
         body.push('\n');
     }
 
-    // Check code index staleness. If stale, kick a detached refresh instead of
-    // asking the user to run a manual command from a latency-sensitive hook.
-    let code_db = handle.root.join(".mdkb/code.sqlite");
-    if handle.config.code.enabled && code_db.exists() {
-        if let Ok(conn) = rusqlite::Connection::open_with_flags(
-            &code_db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-            let last = crate::code::storage::schema::last_index_scan_at(&conn).unwrap_or(None);
-            if let Some(ts) = last {
-                let now = chrono::Utc::now().timestamp();
-                let age_days = (now - ts) / 86_400;
-                if age_days >= 7 {
-                    if schedule_code_index_refresh(handle) {
-                        body.push_str(&format!(
-                            "\n**⚠️ Code index is {age_days} days stale; refreshing in background.** Retry code lookups shortly.\n"
-                        ));
-                    } else {
-                        body.push_str(&format!(
-                            "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index` to refresh.\n"
-                        ));
-                    }
-                }
-            }
+    // Every session scans content hashes: a recent scan does not prove that
+    // files have not changed, and an absent index needs its first build.
+    // The in-process fallback exits with the hook, and the host bounds the hook
+    // by a timeout: waiting for the refresh there could get the hook killed.
+    if handle.config.code.enabled {
+        if dctx.is_some_and(|d| d.background.is_some()) {
+            body.push_str(&format!(
+                "\n**Code index: not refreshed (no daemon).** Run `{bin} code index` to refresh.\n"
+            ));
+        } else if schedule_code_index_refresh(handle) {
+            body.push_str(
+                "\n**Code index: refreshing in background.** Retry code lookups shortly.\n",
+            );
+        } else {
+            body.push_str(&format!(
+                "\n**Code index: background refresh could not start.** Run `{bin} code index` to refresh.\n"
+            ));
         }
     }
 
-    // Rendering the body plus the second database this hook opens — `code.sqlite`,
-    // read-only, for its last scan timestamp.
     phases.mark("code_check");
 
     SessionStartOutcome::Fired(json!({
@@ -6228,44 +6563,51 @@ fn expand_recall_neighbors(
     results: &[memory::MemoryEntry],
     seeds: usize,
     max_neighbors: usize,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
 ) -> crate::Result<Vec<String>> {
-    let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
-    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut candidates: Vec<(String, Option<f32>)> = Vec::new();
-    for seed in results.iter().take(seeds) {
-        let edges = memory_graph::outgoing(conn, &seed.id, None)?;
-        for edge in edges {
-            if edge.target_kind != TargetKind::Memory.as_str() {
-                continue;
-            }
-            if seen.contains(edge.target_ref.as_str()) || !emitted.insert(edge.target_ref.clone()) {
-                continue;
-            }
-            if let Some(n) = memory_graph::resolve_active(conn, &edge.target_ref)? {
-                let score = query_embedding.and_then(|query| {
-                    conn.query_row(
-                        "SELECT me.embedding FROM memory_embeddings me
+    documents::with_savepoint(conn, "memory_graph_identity", || {
+        let query_embedding = query_embedding.filter(|v| {
+            crate::store::vectors::require_model(conn, v.model.identity(), false).is_ok()
+        });
+        let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut candidates: Vec<(String, Option<f32>)> = Vec::new();
+        for seed in results.iter().take(seeds) {
+            let edges = memory_graph::outgoing(conn, &seed.id, None)?;
+            for edge in edges {
+                if edge.target_kind != TargetKind::Memory.as_str() {
+                    continue;
+                }
+                if seen.contains(edge.target_ref.as_str())
+                    || !emitted.insert(edge.target_ref.clone())
+                {
+                    continue;
+                }
+                if let Some(n) = memory_graph::resolve_active(conn, &edge.target_ref)? {
+                    let score = query_embedding.and_then(|query| {
+                        conn.query_row(
+                            "SELECT me.embedding FROM memory_embeddings me
                          JOIN memory_entries m ON m.rowid=me.memory_rowid WHERE m.id=?1",
-                        [&n.id],
-                        |row| row.get::<_, Vec<u8>>(0),
-                    )
-                    .ok()
-                    .and_then(|blob| graph_neighbor_cosine(&blob, query))
-                });
-                candidates.push((
-                    format!("- [{}] {} (via {})", n.id, n.title, edge.relation),
-                    score,
-                ));
+                            [&n.id],
+                            |row| row.get::<_, Vec<u8>>(0),
+                        )
+                        .ok()
+                        .and_then(|blob| graph_neighbor_cosine(&blob, query))
+                    });
+                    candidates.push((
+                        format!("- [{}] {} (via {})", n.id, n.title, edge.relation),
+                        score,
+                    ));
+                }
             }
         }
-    }
-    rank_graph_candidates(&mut candidates);
-    Ok(candidates
-        .into_iter()
-        .take(max_neighbors)
-        .map(|(line, _)| line)
-        .collect())
+        rank_graph_candidates(&mut candidates);
+        Ok(candidates
+            .into_iter()
+            .take(max_neighbors)
+            .map(|(line, _)| line)
+            .collect())
+    })
 }
 
 /// Invalid or mismatched stored vectors have no relevance score. Ranking them
@@ -6323,7 +6665,6 @@ enum RecallMode {
 impl RecallMode {
     /// Automatic recall cannot buy semantic relevance with incidental words.
     /// Sigil recall and candidates without vector evidence keep lexical admission;
-    /// successful cross-encoder reranking remains a separate semantic gate.
     fn admit_memories(
         self,
         mut entries: Vec<memory::ScoredMemoryEntry>,
@@ -6363,6 +6704,47 @@ impl RecallMode {
     }
 }
 
+/// The cosine at which two recalled memory entries, or two recalled documents,
+/// count as one item in two languages, so only the higher-ranked one is injected.
+///
+/// Granite, measured 2026-11-21 on the 120 memory entries of the bilingual
+/// benchmark fixture: an English/Italian pair scores 0.84 to 0.95 (median
+/// 0.947), two distinct entries at most 0.904, an old and a new version of one
+/// decision. At 0.91, 52 of 60 pairs merge and no distinct entry does: losing
+/// a superseding decision costs more than one duplicate. MiniLM scores a pair
+/// at 0.26 to 0.47, below many distinct entries, so no threshold exists.
+/// Documents, the 100 of the same fixture: pairs from 0.81 (median 0.943),
+/// distinct documents at most 0.826; at 0.91, 39 of 50 pairs merge.
+fn translation_variant_min_cosine(model: crate::llm::embeddings::Model) -> Option<f32> {
+    match model {
+        crate::llm::embeddings::Model::MiniLm => None,
+        crate::llm::embeddings::Model::Granite107M => Some(0.91),
+    }
+}
+
+/// Drop each item whose stored vector is within `min_cosine` of an item kept
+/// before it. `items` is in injection order; an item without a vector stays.
+fn drop_translation_variants<T, K: std::hash::Hash + Eq>(
+    items: &mut Vec<T>,
+    key: impl Fn(&T) -> &K,
+    vectors: &std::collections::HashMap<K, Vec<f32>>,
+    min_cosine: f32,
+) {
+    let mut kept: Vec<&[f32]> = Vec::new();
+    items.retain(|item| {
+        let Some(vector) = vectors.get(key(item)) else {
+            return true;
+        };
+        let variant = kept
+            .iter()
+            .any(|k| crate::llm::embeddings::cosine_similarity(k, vector) >= min_cosine);
+        if !variant {
+            kept.push(vector);
+        }
+        !variant
+    });
+}
+
 /// Pick the mode for `prompt` and return it with the sigil stripped.
 ///
 /// The `*` (and the whitespace after it) never reaches FTS, the embedder or the
@@ -6393,9 +6775,6 @@ pub struct ShadowRecall {
     related: usize,
     top_cosine: Option<f64>,
     floor: f32,
-    /// What the rerank step did (`phases.rerank_outcome` of a fired row), which
-    /// a shadow row has no `phases` to carry.
-    rerank: Option<&'static str>,
 }
 
 impl ShadowRecall {
@@ -6407,7 +6786,6 @@ impl ShadowRecall {
             "related": self.related,
             "top_cosine": self.top_cosine,
             "floor": self.floor,
-            "rerank": self.rerank,
         })
     }
 }
@@ -6535,10 +6913,7 @@ async fn hook_user_prompt_submit_impl_timed(
     let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     let mut top_cosine: Option<f64> = None;
-    let mut query_embedding: Option<Vec<f32>> = None;
-    // A `*` prompt asked for its answer and keeps the lower cosine floor; the
-    // reranker is for the prompts nobody asked to enrich.
-    let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
+    let mut query_embedding: Option<crate::llm::embeddings::Vector> = None;
     if let Some(ref q) = fts_query {
         phases.begin("context");
         ensure_handle_context_unless_busy(handle);
@@ -6549,7 +6924,7 @@ async fn hook_user_prompt_submit_impl_timed(
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
         phases.begin("embed");
-        query_embedding = embed_query_off_lock(prompt).await;
+        query_embedding = embed_query_off_lock(prompt, handle.config.embedding.model).await;
         phases.mark("embed");
         let limit = cfg.recall_limit.max(1);
         let docs_limit = cfg.recall_docs_limit;
@@ -6564,10 +6939,7 @@ async fn hook_user_prompt_submit_impl_timed(
         let root = handle.root.clone();
         let telemetry = handle.config.telemetry.clone();
         let search_cfg_owned = search_cfg.clone();
-        let rerank_pool_cfg = crate::config::SearchMemoryConfig {
-            min_recall_cosine: 0.0,
-            ..search_cfg.clone()
-        };
+        let model = handle.config.embedding.model;
         phases.begin("lock_wait");
         let Ok(mut store) = hook_store(handle).await else {
             return json!({});
@@ -6576,56 +6948,140 @@ async fn hook_user_prompt_submit_impl_timed(
         phases.begin("search");
         let leg = tokio::task::spawn_blocking(move || {
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
-            let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
             let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
-            let mut doc_candidates: Vec<(crate::domain::SearchResult, Option<std::path::PathBuf>)> =
-                Vec::new();
             let search_t0 = std::time::Instant::now();
-            let search = crate::core::run_guarded_read(store.slot(), "hook memory recall", |ctx| {
-                memory::search_entries_hybrid_fts(
+            // One read snapshot for all three reads, so they share one embedding
+            // identity probe instead of one per semantic read (story 065-9a07).
+            // A corrupt index fails the turn and closes the context; any other
+            // error drops only its optional leg.
+            let legs = crate::core::run_guarded_snapshot_read(store.slot(), "hook recall", |ctx| {
+                fn optional_leg<T>(
+                    what: &str,
+                    result: crate::error::Result<Vec<T>>,
+                ) -> crate::error::Result<Vec<T>> {
+                    match result {
+                        Err(error) if !error.is_index_corrupt() => {
+                            // Degrade silently (hooks must not block) but stay observable.
+                            tracing::debug!("{what} failed: {error}");
+                            Ok(Vec::new())
+                        }
+                        other => other,
+                    }
+                }
+                let scored_results = memory::search_entries_hybrid_fts_labelled(
                     &ctx.conn,
                     &q,
                     // The raw prompt, not `q`: `q` is the OR-expanded FTS
                     // expression, and the lexical admission arm needs the words
                     // as written. It is also what `query_embedding` embedded.
                     &prompt,
-                    query_embedding.as_deref(),
+                    query_embedding.as_ref(),
                     limit,
                     None,
                     &search_cfg,
-                )
+                )?;
+                let variant_vectors = if translation_variant_min_cosine(model).is_some() {
+                    let ids: Vec<&str> = scored_results.iter().map(|e| e.id.as_str()).collect();
+                    match crate::store::vectors::memory_embeddings_by_id(&ctx.conn, &ids, model) {
+                        Err(error) if !error.is_index_corrupt() => {
+                            tracing::debug!("recall variant vectors failed: {error}");
+                            std::collections::HashMap::new()
+                        }
+                        other => other?,
+                    }
+                } else {
+                    std::collections::HashMap::new()
+                };
+
+                // The ledger's view of the same prompt: a second query at the
+                // candidate floor with a wider limit, rather than the injection query
+                // run lower. One query cannot serve both — `limit` sizes the BM25 and
+                // vector pools and the access-recency bonus ranks within the admitted
+                // set, so admitting more would reorder, and change, what is injected.
+                let candidate_cfg = candidate_search_cfg(&search_cfg);
+                let observed = optional_leg(
+                    "recall observation",
+                    memory::search_entries_hybrid_fts_labelled(
+                        &ctx.conn,
+                        &q,
+                        &prompt,
+                        query_embedding.as_ref(),
+                        limit * 3,
+                        None,
+                        &candidate_cfg,
+                    ),
+                )?;
+                let memory_elapsed = search_t0.elapsed();
+
+                // Documents leg — same hybrid engine as `search --scope docs`, reusing
+                // the OR-expanded recall query and the embedding already computed above
+                // (a second embed would double the per-turn CPU cost). RRF
+                // normalization pins the top hit at 1.0 for every prompt, so rank alone
+                // admits nothing worth trusting: each hit must clear
+                // `recall_docs_min_cosine` or be quoted by the prompt
+                // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
+                // (0 = memory only). The pool is wider than the cap because sub-floor
+                // hits are dropped after ranking, and must not crowd out a later one.
+                let doc_candidates = if docs_limit > 0 {
+                    optional_leg(
+                        "recall doc search",
+                        crate::core::search::hybrid_search_fts_scored_labelled(
+                            ctx,
+                            &q,
+                            query_embedding.as_ref(),
+                            docs_limit * DOC_RECALL_POOL_FACTOR,
+                            None,
+                            false,
+                        )
+                        .map(|hits| {
+                            // Admission and ranking happen here, under the guard;
+                            // the files are only resolved, and checked below once
+                            // the guard is gone.
+                            let mut admitted = admit_doc_hits(hits, &prompt, docs_min_cosine);
+                            if let Some(min_cosine) = translation_variant_min_cosine(model) {
+                                let ids: Vec<i64> = admitted.iter().map(|hit| hit.id).collect();
+                                match crate::store::vectors::document_embeddings_by_id(
+                                    &ctx.conn, &ids, model,
+                                ) {
+                                    Ok(vectors) => drop_translation_variants(
+                                        &mut admitted,
+                                        |hit| &hit.id,
+                                        &vectors,
+                                        min_cosine,
+                                    ),
+                                    Err(error) => {
+                                        tracing::debug!("recall document variants failed: {error}")
+                                    }
+                                }
+                            }
+                            with_files(&ctx.conn, &root, admitted, |hit| {
+                                (hit.collection.as_str(), hit.path.as_str())
+                            })
+                        }),
+                    )?
+                } else {
+                    Vec::new()
+                };
+                Ok((
+                    scored_results,
+                    variant_vectors,
+                    observed,
+                    memory_elapsed,
+                    doc_candidates,
+                ))
             });
-            let scored_results = match search {
-                Some(Ok(entries)) => entries,
-                Some(Err(error)) => {
-                    tracing::warn!("hook memory recall failed: {error}");
-                    return None;
-                }
-                None => return None,
-            };
+            let (scored_results, variant_vectors, observed, memory_elapsed, doc_candidates) =
+                match legs {
+                    Some(Ok(legs)) => legs,
+                    Some(Err(error)) => {
+                        tracing::warn!("hook recall failed: {error}");
+                        return None;
+                    }
+                    None => return None,
+                };
 
-            // The ledger's view of the same prompt: a second query at the
-            // candidate floor with a wider limit, rather than the injection query
-            // run lower. One query cannot serve both — `limit` sizes the BM25 and
-            // vector pools and the access-recency bonus ranks within the admitted
-            // set, so admitting more would reorder, and change, what is injected.
-            let candidate_cfg = candidate_search_cfg(&search_cfg);
-            match crate::core::run_guarded_read(store.slot(), "hook recall observation", |ctx| {
-                memory::search_entries_hybrid_fts(
-                    &ctx.conn,
-                    &q,
-                    &prompt,
-                    query_embedding.as_deref(),
-                    limit * 3,
-                    None,
-                    &candidate_cfg,
-                )
-            }) {
-                Some(Ok(entries)) => observed = entries,
-                Some(Err(error)) => tracing::debug!("recall observation failed: {error}"),
-                None => {}
-            }
-
+            // Written after the read snapshot ends: a write inside it could fail
+            // with SQLITE_BUSY_SNAPSHOT.
             // Opt-in, privacy-minimized telemetry: record the recall's shape (HMAC +
             // latency + count) but NEVER the prompt text. Off by default.
             if telemetry.query_events {
@@ -6654,7 +7110,7 @@ async fn hook_user_prompt_submit_impl_timed(
                     query_text: String::new(),
                     search_type: "recall".to_string(),
                     result_count,
-                    latency_ms: search_t0.elapsed().as_millis() as i64,
+                    latency_ms: memory_elapsed.as_millis() as i64,
                     top_score,
                     session_id: None,
                 };
@@ -6665,80 +7121,19 @@ async fn hook_user_prompt_submit_impl_timed(
                     });
                 }
             }
-
-            // Documents leg — same hybrid engine as `search --scope docs`, reusing
-            // the OR-expanded recall query and the embedding already computed above
-            // (a second embed would double the per-turn CPU cost). RRF
-            // normalization pins the top hit at 1.0 for every prompt, so rank alone
-            // admits nothing worth trusting: each hit must clear
-            // `recall_docs_min_cosine` or be quoted by the prompt
-            // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
-            // (0 = memory only). The pool is wider than the cap because sub-floor
-            // hits are dropped after ranking, and must not crowd out a later one.
-            if docs_limit > 0 && store.slot().is_some() {
-                match crate::core::run_guarded_read(store.slot(), "hook document recall", |ctx| {
-                    crate::core::search::hybrid_search_fts_scored(
-                        ctx,
-                        &q,
-                        query_embedding.as_deref(),
-                        docs_limit * DOC_RECALL_POOL_FACTOR,
-                        None,
-                        false,
-                    )
-                    .map(|hits| {
-                        // Admission and ranking happen here, under the guard;
-                        // the files are only resolved, and checked below once
-                        // the guard is gone.
-                        with_files(
-                            &ctx.conn,
-                            &root,
-                            admit_doc_hits(hits, &prompt, docs_min_cosine),
-                            |hit| (hit.collection.as_str(), hit.path.as_str()),
-                        )
-                    })
-                }) {
-                    Some(Ok(admitted)) => doc_candidates = admitted,
-                    Some(Err(error)) => {
-                        // Degrade silently (hooks must not block) but stay observable.
-                        tracing::debug!("recall doc search failed: {error}");
-                    }
-                    None => {}
-                }
-            }
-            // The reranker's candidates: the top of the same hybrid search with
-            // the cosine gate off, because that gate is what it replaces. The
-            // MiniLM-gated `scored_results` stay as the fallback.
-            let mut rerank_pool: Vec<memory::ScoredMemoryEntry> = Vec::new();
-            if rerank_wanted {
-                match crate::core::run_guarded_read(store.slot(), "hook rerank pool", |ctx| {
-                    memory::search_entries_hybrid_fts(
-                        &ctx.conn,
-                        &q,
-                        &prompt,
-                        query_embedding.as_deref(),
-                        recall_rerank::RERANK_POOL_SIZE,
-                        None,
-                        &rerank_pool_cfg,
-                    )
-                }) {
-                    Some(Ok(entries)) => rerank_pool = entries,
-                    Some(Err(error)) => tracing::debug!("recall rerank pool failed: {error}"),
-                    None => {}
-                }
-            }
             drop(store);
             doc_hits.extend(
                 take_present(doc_candidates, docs_limit)
                     .into_iter()
                     .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty()))),
             );
-            Some((scored_results, observed, doc_hits, rerank_pool))
+            Some((scored_results, variant_vectors, observed, doc_hits))
         });
         let joined = leg.await;
         if let Err(error) = &joined {
             tracing::warn!("recall search task failed: {error}");
         }
-        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) = joined
+        let Ok(Some((mut scored_results, variant_vectors, observed_hits, doc_hits_found))) = joined
         else {
             return json!({});
         };
@@ -6756,7 +7151,6 @@ async fn hook_user_prompt_submit_impl_timed(
             };
             scored_results.retain(not_handoff);
             observed.retain(not_handoff);
-            rerank_pool.retain(not_handoff);
         }
 
         // prior-specific gate: only high-confidence priors surface
@@ -6766,7 +7160,6 @@ async fn hook_user_prompt_submit_impl_timed(
                 || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         };
         scored_results.retain(prior_gate);
-        rerank_pool.retain(prior_gate);
         // The best absolute score in the result, read before `injectable` drops
         // it. `score` cannot stand in: it is max-normalized, so the top hit is
         // 1.0 for every prompt including the ones nothing in the store answers.
@@ -6782,36 +7175,14 @@ async fn hook_user_prompt_submit_impl_timed(
             .max_by(f64::total_cmp);
         results = injectable(scored_results);
 
-        if !rerank_wanted {
-            if mode != RecallMode::Sigil {
-                phases.note("rerank_outcome", "off");
-            }
-        } else if rerank_pool.is_empty() {
-            phases.note("rerank_outcome", "no_candidates");
-        } else {
-            // Named before the await, so a run the hook deadline cuts inside
-            // the reranker says where it was.
-            phases.note("rerank_outcome", "cut");
-            phases.begin("rerank");
-            let stage = recall_rerank::rerank_stage(
-                &handle.reranker,
-                cfg,
-                prompt,
-                injectable(rerank_pool),
-                recall_rerank::rerank_budget(cfg, phases.elapsed_ms()),
-            )
-            .await;
-            phases.mark("rerank");
-            phases.note("rerank_outcome", stage.outcome);
-            if let Some(entries) = stage.entries {
-                results = entries;
-            }
-        }
-
         // Global rank: float high-confidence priors to the top WITHOUT
         // scrambling the rest (stable sort on a boolean key preserves the
         // existing relevance order within each group). THEN truncate to limit.
         results.sort_by_key(|e| !is_high_confidence_prior(e, now));
+        // Before the truncation, so a dropped variant frees its slot.
+        if let Some(min_cosine) = translation_variant_min_cosine(model) {
+            drop_translation_variants(&mut results, |e| &e.id, &variant_vectors, min_cosine);
+        }
         results.truncate(limit);
         if let Some((dctx, key)) = recall_dedup {
             dctx.retain_new_hook_memories(key, &mut results);
@@ -6855,7 +7226,7 @@ async fn hook_user_prompt_submit_impl_timed(
                     &results,
                     handle.config.graph.expand_seeds,
                     handle.config.graph.expand_neighbors,
-                    query_embedding.as_deref(),
+                    query_embedding.as_ref(),
                 )?;
                 let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
                 let stale_ids = memory_graph::stale_dependency_ids(&ctx.conn, &ids)?;
@@ -6890,7 +7261,7 @@ async fn hook_user_prompt_submit_impl_timed(
                     "hook document graph neighbors",
                     |ctx| {
                         let found =
-                            doc_graph_neighbors(&ctx.conn, &tokens, &seen, embedding.as_deref())?;
+                            doc_graph_neighbors(&ctx.conn, &tokens, &seen, embedding.as_ref())?;
                         Ok(with_files(
                             &ctx.conn,
                             &root,
@@ -6959,7 +7330,6 @@ async fn hook_user_prompt_submit_impl_timed(
             related: related.len(),
             top_cosine,
             floor: search_cfg.min_recall_cosine,
-            rerank: phases.note_of("rerank_outcome"),
         });
         phases.begin("prior");
         return prompt_prior_response(
@@ -6986,6 +7356,7 @@ async fn hook_user_prompt_submit_impl_timed(
         &related,
         prior_block.as_deref(),
         wants_cg,
+        session,
     );
     while body.len() > RECALL_PAYLOAD_BUDGET_BYTES {
         if related.pop().is_none()
@@ -7003,6 +7374,7 @@ async fn hook_user_prompt_submit_impl_timed(
             &related,
             prior_block.as_deref(),
             wants_cg,
+            session,
         );
     }
     payload_parts.extend(parts);
@@ -7056,6 +7428,10 @@ async fn hook_user_prompt_submit_impl_timed(
 }
 
 /// The UserPromptSubmit body and the byte size of each block in it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "recall blocks share the hook session"
+)]
 fn render_recall_body(
     results: &[memory::MemoryEntry],
     expanded: &[String],
@@ -7064,6 +7440,7 @@ fn render_recall_body(
     related: &[String],
     prior: Option<&str>,
     wants_cg: bool,
+    session: &str,
 ) -> (String, Vec<(&'static str, usize)>) {
     let mut body = String::new();
     let mut parts: Vec<(&'static str, usize)> = Vec::new();
@@ -7094,7 +7471,12 @@ fn render_recall_body(
             body.push_str(line);
             body.push('\n');
         }
-        body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
+        let session_arg = if session == UNKNOWN_SESSION {
+            String::new()
+        } else {
+            format!(" --session '{}'", session.replace('\'', "'\\''"))
+        };
+        body.push_str(&format!("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed{session_arg}` instead of writing a new one.\n"));
         parts.push(("recall_memory", body.len() - start));
     }
 
@@ -7192,6 +7574,12 @@ async fn prompt_prior_block(
     } else {
         Vec::new()
     };
+    if memory_hits.is_empty() && hits.is_empty() {
+        return None;
+    }
+    // Acquire once before any delivery record: the enclosing deadline may
+    // cancel admission, but cannot discard earlier lines at a later await.
+    let (slot, admission) = store.for_write(handle).await.ok()?;
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
     let session_line = format!("mdkb prior session: {session}");
     let mut budget = LineBudget::new(PRIOR_BLOCK_BUDGET_BYTES, &session_line);
@@ -7207,24 +7595,14 @@ async fn prompt_prior_block(
         }
         tried += 1;
         // The write decides whether the line is delivered (once per session), so
-        // it cannot be answered from a snapshot: a bypassed read waits for the
-        // slot here, on the rare prompt that matches a trigger.
-        let recorded = match store.for_write(handle).await {
-            Ok(slot) => {
-                crate::core::run_guarded_write(slot, "prompt memory trigger telemetry", |ctx| {
-                    crate::store::memory::record_trigger_injection_once(
-                        &ctx.conn, &id, session, now,
-                    )
-                })
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "prompt memory trigger telemetry: no store: {}",
-                    error.message
-                );
-                None
-            }
-        };
+        // it cannot be answered from a snapshot. Contention omits this line;
+        // a later hook can retry the authoritative once-per-session write.
+        let recorded = crate::core::run_admitted_write(
+            slot,
+            "prompt memory trigger telemetry",
+            &admission,
+            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
+        );
         match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
@@ -7242,19 +7620,12 @@ async fn prompt_prior_block(
             continue;
         }
         let prior_id = c.id.clone();
-        match store.for_write(handle).await {
-            Ok(slot) => {
-                if let Some(Err(error)) =
-                    crate::core::run_guarded_write(slot, "prompt prior telemetry", |ctx| {
-                        record_injection(&ctx.conn, &prior_id, session, now)
-                    })
-                {
-                    tracing::warn!("record prompt prior injection: {error}");
-                }
-            }
-            Err(error) => {
-                tracing::warn!("record prompt prior injection: no store: {}", error.message);
-            }
+        let recorded =
+            crate::core::run_admitted_write(slot, "prompt prior telemetry", &admission, |ctx| {
+                record_injection(&ctx.conn, &prior_id, session, now)
+            });
+        if !matches!(recorded, Some(Ok(()))) {
+            continue;
         }
         if let Some((dctx, key)) = dedup {
             dctx.record_hook_prior(key, &c.id);
@@ -7280,50 +7651,55 @@ fn doc_graph_neighbors(
     conn: &rusqlite::Connection,
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
-    query_embedding: Option<&[f32]>,
+    query_embedding: Option<&crate::llm::embeddings::Vector>,
 ) -> crate::Result<Vec<(String, String, String)>> {
-    use crate::store::graph;
-    let mut candidates: Vec<((String, String, String), Option<f32>)> = Vec::new();
-    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for tok in tokens {
-        let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
-            continue;
-        };
-        let edges = graph::get_outgoing(conn, doc_id, None)?;
-        for edge in edges {
-            if edge.source_kind != graph::KIND_FRONTMATTER {
-                continue;
-            }
-            // Only emit targets that resolve to an actual indexed document, with
-            // their canonical path (so `[[b]]`, `b`, and `b.md` collapse to one
-            // node). Frontmatter also carries entity relations (owner, themes, …)
-            // whose targets are tags, not navigable docs. Keep the resolved id
-            // for the vector lookup: two collections can share a relative path.
-            let Some(target_id) = graph::resolve_ref_to_doc(conn, &edge.target_ref)? else {
+    documents::with_savepoint(conn, "doc_graph_identity", || {
+        let query_embedding = query_embedding.filter(|v| {
+            crate::store::vectors::require_model(conn, v.model.identity(), false).is_ok()
+        });
+        use crate::store::graph;
+        let mut candidates: Vec<((String, String, String), Option<f32>)> = Vec::new();
+        let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for tok in tokens {
+            let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
                 continue;
             };
-            let (path, collection): (String, String) = conn.query_row(
-                "SELECT relative_path, collection FROM documents WHERE id=?1",
-                [target_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            if seen.contains(&path) || !emitted.insert(path.clone()) {
-                continue;
-            }
-            let score = query_embedding.and_then(|query| {
-                conn.query_row(
-                    "SELECT embedding FROM embeddings WHERE document_id=?1",
+            let edges = graph::get_outgoing(conn, doc_id, None)?;
+            for edge in edges {
+                if edge.source_kind != graph::KIND_FRONTMATTER {
+                    continue;
+                }
+                // Only emit targets that resolve to an actual indexed document, with
+                // their canonical path (so `[[b]]`, `b`, and `b.md` collapse to one
+                // node). Frontmatter also carries entity relations (owner, themes, …)
+                // whose targets are tags, not navigable docs. Keep the resolved id
+                // for the vector lookup: two collections can share a relative path.
+                let Some(target_id) = graph::resolve_ref_to_doc(conn, &edge.target_ref)? else {
+                    continue;
+                };
+                let (path, collection): (String, String) = conn.query_row(
+                    "SELECT relative_path, collection FROM documents WHERE id=?1",
                     [target_id],
-                    |row| row.get::<_, Vec<u8>>(0),
-                )
-                .ok()
-                .and_then(|blob| graph_neighbor_cosine(&blob, query))
-            });
-            candidates.push(((path, edge.relation, collection), score));
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if seen.contains(&path) || !emitted.insert(path.clone()) {
+                    continue;
+                }
+                let score = query_embedding.and_then(|query| {
+                    conn.query_row(
+                        "SELECT embedding FROM embeddings WHERE document_id=?1",
+                        [target_id],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .ok()
+                    .and_then(|blob| graph_neighbor_cosine(&blob, query))
+                });
+                candidates.push(((path, edge.relation, collection), score));
+            }
         }
-    }
-    rank_graph_candidates(&mut candidates);
-    Ok(candidates.into_iter().map(|(item, _)| item).collect())
+        rank_graph_candidates(&mut candidates);
+        Ok(candidates.into_iter().map(|(item, _)| item).collect())
+    })
 }
 
 /// Number of trailing transcript lines that form the mined episode window.
@@ -7393,7 +7769,7 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
     // this process exits as soon as the hook returns, and a task nobody holds
     // dies with it — the entries written this session would keep their missing
     // embeddings forever.
-    if let Some(task) = spawn_embedding_backfill(Arc::clone(&handle)) {
+    if let Some(task) = schedule_embedding_backfill_mode(&handle, dctx.background.is_none()) {
         dctx.adopt(task);
     }
 
@@ -7696,7 +8072,11 @@ async fn mine_episode_inner(
     // integrate_distilled can merge semantically-equivalent clusters. Best-effort:
     // a missing embedder just falls back to exact-trigger-key clustering.
     let lesson = distilled.lesson.clone();
+    let minilm = handle.config.embedding.model == crate::llm::embeddings::Model::MiniLm;
     let lesson_embedding = tokio::task::spawn_blocking(move || {
+        if !minilm {
+            return None;
+        }
         crate::llm::get_cached_service()
             .ok()
             .and_then(|s| s.embed_query(&lesson).ok())
@@ -7712,14 +8092,18 @@ async fn mine_episode_inner(
     let ctx = Arc::clone(&handle.ctx);
     let integrated = tokio::task::spawn_blocking(move || {
         crate::core::run_mutation(&ctx, "prior mining", |ctx| {
-            integrate_distilled(
+            let promoted = integrate_distilled(
                 &ctx.conn,
                 &distilled,
                 &session,
                 now,
                 lesson_embedding.as_deref(),
                 error_signature.as_deref(),
-            )
+            )?;
+            if let Some(id) = &promoted {
+                crate::core::memory_sync::project_after_write(ctx, id, now);
+            }
+            Ok(promoted)
         })
     })
     .await;
@@ -8042,6 +8426,12 @@ async fn tool_prior_block(
     } else {
         Vec::new()
     };
+    if memory_hits.is_empty() && hits.is_empty() {
+        return None;
+    }
+    // Acquire once before any delivery record: the enclosing deadline may
+    // cancel admission, but cannot discard earlier lines at a later await.
+    let (slot, admission) = store.for_write(handle).await.ok()?;
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
     let session_line = format!("mdkb prior session: {session}");
     let mut budget = LineBudget::new(room, &session_line);
@@ -8057,23 +8447,13 @@ async fn tool_prior_block(
         }
         tried += 1;
         // The write decides whether the line is delivered (once per session), so
-        // a bypassed read waits for the slot here, on the rare call that matches.
-        let recorded = match store.for_write(handle).await {
-            Ok(slot) => {
-                crate::core::run_guarded_write(slot, "tool memory trigger telemetry", |ctx| {
-                    crate::store::memory::record_trigger_injection_once(
-                        &ctx.conn, &id, session, now,
-                    )
-                })
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "{label} memory trigger telemetry: no store: {}",
-                    error.message
-                );
-                None
-            }
-        };
+        // contention must omit the line, leaving it eligible for a later call.
+        let recorded = crate::core::run_admitted_write(
+            slot,
+            "tool memory trigger telemetry",
+            &admission,
+            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
+        );
         match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
@@ -8086,15 +8466,10 @@ async fn tool_prior_block(
             continue;
         }
         let prior_id = c.id.clone();
-        let recorded = match store.for_write(handle).await {
-            Ok(slot) => crate::core::run_guarded_write(slot, "tool prior telemetry", |ctx| {
+        let recorded =
+            crate::core::run_admitted_write(slot, "tool prior telemetry", &admission, |ctx| {
                 record_tool_injection_once(&ctx.conn, &prior_id, session, now)
-            }),
-            Err(error) => {
-                tracing::warn!("{label} prior telemetry: no store: {}", error.message);
-                None
-            }
-        };
+            });
         match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
@@ -8194,32 +8569,33 @@ async fn record_hook_call(handle: &RepoHandle, method: &str) {
     // taken behind it instead, off the hook's path (#209-bc4b). An in-process
     // hook finds the slot free, so it is still written before the process exits.
     if let Ok(guard) = Arc::clone(&handle.ctx).try_lock_owned() {
-        write_hook_call(guard, event).await;
+        write_hook_call(guard, SlotOpener::of(handle), event).await;
     } else {
-        let ctx = Arc::clone(&handle.ctx);
-        tokio::spawn(async move { write_hook_call(ctx.lock_owned().await, event).await });
+        let opener = SlotOpener::of(handle);
+        write_behind_slot(opener, "hook telemetry", move |ctx| {
+            let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
+            stats::record_call(&ctx.conn, sid, &event, 0, 0, false)
+        });
     }
 }
 
 async fn write_hook_call(
     mut ctx_guard: tokio::sync::OwnedMutexGuard<Option<Context>>,
+    opener: SlotOpener,
     event: String,
 ) {
-    if ctx_guard.is_none() {
-        return;
-    }
     // The write is synchronous SQLite. Run inline it would occupy the runtime
     // thread for as long as the store is slow, and a hook answering at its
     // deadline needs that thread to fire the deadline's timer.
     let written = tokio::task::spawn_blocking(move || {
-        crate::core::run_guarded_write(&mut ctx_guard, "hook telemetry", |ctx| {
+        slot_write_or_defer(&mut ctx_guard, opener, "hook telemetry", move |ctx| {
             let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
             stats::record_call(&ctx.conn, sid, &event, 0, 0, false)
         })
     })
     .await;
     match written {
-        Ok(outcome) => log_slot_write("hook telemetry", outcome),
+        Ok(()) => {}
         Err(error) => tracing::warn!("hook telemetry task failed: {error}"),
     }
 }
@@ -8311,8 +8687,39 @@ async fn cli_mutate_impl(
                 code_bytes,
             })
         }
+        CliMutation::Embed {
+            collection: None,
+            reembed: true,
+        } => {
+            ensure_handle_context(handle).await?;
+            let db_path = handle
+                .ctx
+                .lock()
+                .await
+                .as_ref()
+                .map(|ctx| ctx.db_path.clone())
+                .ok_or_else(|| mcp_error("store context unavailable"))?;
+            let root = handle.root.clone();
+            let report = tokio::task::spawn_blocking(move || {
+                let report = regenerate_in_child(&root, &db_path);
+                crate::store::heal::verify_and_mark_unadmitted(&db_path).and(report)
+            })
+            .await
+            .map_err(|e| mcp_error(format!("embedding regeneration task failed: {e}")))?
+            .map_err(|e| mcp_store_error("CLI mutation failed", e))?;
+            // Regeneration writes the archive through a separate semantic
+            // store, including when its model stays unchanged.
+            // DEFERRED (2026-11-15) — a concurrent no-op background refresh
+            // can restore its same-model facade; closing that rare stale-symbol
+            // window needs generation coordination outside this change.
+            *handle.code_index.lock().await = None;
+            Ok(CliMutationResult::Embed {
+                generated: report.generated,
+                skipped: report.skipped,
+                errors: report.errors,
+            })
+        }
         mutation => {
-            let is_embed = matches!(mutation, CliMutation::Embed { .. });
             ensure_handle_context(handle).await?;
             // No outer wrap: `run_handle_memory_mutation` already returns an
             // `McpError`, so re-wrapping stringified one error inside another and
@@ -8320,29 +8727,11 @@ async fn cli_mutate_impl(
             // operator needs to the end of the line. It also flattened the code
             // the inner error had earned, which is what tells the CLI whether the
             // write started.
-            let outcome = run_handle_memory_mutation(&handle.ctx, "cli mutation", |ctx| {
+            run_handle_memory_mutation(&handle.ctx, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
             })
-            .await;
-            // The reranker weights are 280 MB: fetch them after the embedding,
-            // so an offline machine still gets its vectors, and after the store
-            // lock is released, or every hook for this repo waits at `lock_wait`
-            // for the download.
-            if is_embed && outcome.is_ok() {
-                let hooks = handle.config.hooks.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::core::ops::fetch_reranker_weights(&hooks)
-                })
-                .await
-                .map_err(|e| {
-                    mcp_error(format!(
-                        "embeddings are done, but the reranker weights fetch aborted: {e}"
-                    ))
-                })?
-                .map_err(|e| mcp_error(e.to_string()))?;
-            }
-            outcome
+            .await
         }
     }
 }
@@ -8358,18 +8747,36 @@ pub async fn dispatch_call(
     handle: Arc<RepoHandle>,
     dctx: &DispatchContext,
 ) -> Result<Value, McpError> {
+    struct Encounter<'a>(&'a RepoHandle, &'a DispatchContext, bool);
+    impl Drop for Encounter<'_> {
+        fn drop(&mut self) {
+            if self.1.background.is_none() {
+                schedule_daemon_embedding_encounter(self.0);
+            } else if self.2 {
+                self.1
+                    .spawn_background(settle_deferred_writes(Arc::as_ptr(&self.0.ctx) as usize));
+            }
+        }
+    }
+    let _encounter = Encounter(&handle, dctx, tool_name != "hook.user_prompt_submit");
     match tool_name {
         "external.upsert" | "external.delete" | "external.list" => {
             let request = crate::store::external::Request::parse(tool_name, params)
                 .map_err(|error| McpError::invalid_params(error, None))?;
-            ensure_handle_context(&handle).await?;
-            let mut slot = handle.ctx.lock().await;
-            let operation = |ctx: &Context| request.execute(&ctx.conn);
-            let outcome = if request.is_write() {
-                crate::core::run_guarded_write(&mut slot, tool_name, operation)
-            } else {
-                crate::core::run_guarded_read(&mut slot, tool_name, operation)
-            };
+            if request.is_write() {
+                ensure_handle_context(&handle).await?;
+                return run_handle_memory_mutation(&handle.ctx, tool_name, |ctx| {
+                    request
+                        .execute(&ctx.conn)
+                        .map_err(|e| mcp_store_error(tool_name, e))
+                })
+                .await;
+            }
+            let mut store = hook_store(&handle).await?;
+            let mut slot = store.slot();
+            let outcome = crate::core::run_guarded_read(&mut slot, tool_name, |ctx| {
+                request.execute(&ctx.conn)
+            });
             outcome
                 .ok_or_else(|| mcp_error("Database not initialized"))?
                 .map_err(|error| mcp_store_error(tool_name, error))
@@ -8606,7 +9013,7 @@ pub async fn dispatch_call(
                         return;
                     }
                     let guard = Arc::clone(&telemetry_handle.ctx).lock_owned().await;
-                    write_hook_call(guard, event).await;
+                    write_hook_call(guard, SlotOpener::of(&telemetry_handle), event).await;
                 });
             } else {
                 record_hook_call(&handle, tool_name).await;
@@ -9180,12 +9587,40 @@ mod tests {
     /// loaded-box recall.
     const CONTENT_TEST_DEADLINE_MS: u64 = 60_000;
 
+    /// Point regeneration children at the built `mdkb` binary: a lib test's own
+    /// executable is the test harness, which rejects `embed --reembed`. The
+    /// binary sits beside `deps/` in the target directory; it exists only after
+    /// `cargo build --bin mdkb` (a plain `cargo nextest run` builds it). Tests
+    /// that regenerate call `require_embed_worker` to fail with that hint.
+    fn use_built_mdkb_as_embed_worker() {
+        static WORKER: std::sync::Once = std::sync::Once::new();
+        WORKER.call_once(|| {
+            let exe = std::env::current_exe().unwrap();
+            let bin = exe
+                .parent()
+                .and_then(|deps| deps.parent())
+                .map(|dir| dir.join(format!("mdkb{}", std::env::consts::EXE_SUFFIX)));
+            if let Some(bin) = bin.filter(|b| b.is_file()) {
+                // SAFETY: runs once, before any regeneration child reads it.
+                unsafe { std::env::set_var(EMBED_WORKER_ENV, bin) };
+            }
+        });
+    }
+
+    fn require_embed_worker() {
+        assert!(
+            std::env::var_os(EMBED_WORKER_ENV).is_some(),
+            "no built mdkb binary beside the test executable: run `cargo build --bin mdkb` first"
+        );
+    }
+
     /// The one `RepoHandle::from_shared` in these tests.
     ///
     /// Every handle a test builds differs only in its root and in a line or
     /// two of config, so the seven-argument constructor lives here once and
     /// the callers say what is different about theirs.
     fn handle_at(root: std::path::PathBuf, tweak: impl FnOnce(&mut Config)) -> Arc<RepoHandle> {
+        use_built_mdkb_as_embed_worker();
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
         let mut config = Config::default();
         // Tests that check what a prompt returns must not inherit the
@@ -9193,7 +9628,7 @@ mod tests {
         // is empty (story 208). A test about the deadline sets its own below.
         config.hooks.user_prompt_submit_deadline_ms = CONTENT_TEST_DEADLINE_MS;
         tweak(&mut config);
-        let mut handle = RepoHandle::from_shared(
+        let handle = RepoHandle::from_shared(
             root,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
@@ -9202,144 +9637,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         );
-        // Not the process-wide model: a developer machine that has run
-        // `mdkb embed` would otherwise load a 280 MB reranker into every test
-        // that sends a prompt, and their recall assertions would move with it.
-        handle.reranker = Arc::new(StubReranker::NotCached);
         Arc::new(handle)
-    }
-
-    /// A reranker that answers as scripted, so the hook's budget and gate can
-    /// be tested without the model.
-    #[derive(Debug)]
-    enum StubReranker {
-        /// The weights are not on disk: no rerank happens.
-        NotCached,
-        /// Sleep `delay`, then score every document `score`.
-        Scores {
-            delay: std::time::Duration,
-            score: f32,
-        },
-        /// Count calls at the model-load boundary without loading weights.
-        Counted(Arc<std::sync::atomic::AtomicUsize>),
-        /// The model ran and errored.
-        Fails,
-    }
-
-    impl crate::llm::rerank::Reranker for StubReranker {
-        fn score(
-            &self,
-            _query: &str,
-            docs: &[String],
-        ) -> Result<Vec<f32>, crate::llm::rerank::RerankError> {
-            use crate::llm::rerank::RerankError;
-            match self {
-                StubReranker::NotCached => Err(RerankError::NotCached("stub".into())),
-                StubReranker::Scores { delay, score } => {
-                    std::thread::sleep(*delay);
-                    Ok(vec![*score; docs.len()])
-                }
-                StubReranker::Counted(calls) => {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(vec![3.0; docs.len()])
-                }
-                StubReranker::Fails => Err(RerankError::Failed("stub".into())),
-            }
-        }
-    }
-
-    /// A handle whose recall reranks with `reranker`.
-    fn make_reranked_handle(
-        tmp: &TempDir,
-        tweak: impl FnOnce(&mut Config),
-        reranker: StubReranker,
-    ) -> Arc<RepoHandle> {
-        let mut handle = handle_at(tmp.path().to_path_buf(), |config| {
-            config.hooks.user_prompt_submit_require_sigil = false;
-            // Both languages explicitly opt in; these tests exercise the stage.
-            config.hooks.recall_rerank_languages = vec!["it".into(), "en".into()];
-            tweak(config);
-        });
-        Arc::get_mut(&mut handle)
-            .expect("a fresh handle has one owner")
-            .reranker = Arc::new(reranker);
-        handle
-    }
-
-    fn counted_rerank_handle(
-        tmp: &TempDir,
-        tweak: impl FnOnce(&mut Config),
-    ) -> (Arc<RepoHandle>, Arc<std::sync::atomic::AtomicUsize>) {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut handle = handle_at(tmp.path().to_path_buf(), tweak);
-        Arc::get_mut(&mut handle).unwrap().reranker =
-            Arc::new(StubReranker::Counted(Arc::clone(&calls)));
-        (handle, calls)
-    }
-
-    #[tokio::test]
-    async fn default_config_never_calls_the_reranker_model_load_boundary() {
-        // Catches an opt-out default or unconditional score call loading the
-        // cross-encoder even though the user never selected a language.
-        for (prompt, session) in [
-            (RECALL_PROMPT, "default-en"),
-            ("perche il topic non funziona", "default-it"),
-        ] {
-            // hook_event_row returns the first matching row, so each request
-            // needs its own log to assert that request's telemetry.
-            let tmp = TempDir::new().unwrap();
-            let (handle, calls) = counted_rerank_handle(&tmp, |_| {});
-            seed_memory_entry(&handle, "default-minilm").await;
-            let (result, row) = prompt_row(&handle, prompt, session).await;
-            if prompt == RECALL_PROMPT {
-                assert!(
-                    additional_context(&result).contains("default-minilm"),
-                    "{result}"
-                );
-            }
-            assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn italian_opt_in_scores_italian_but_never_loads_for_english() {
-        // Catches treating a nonempty list as a global rerank switch.
-        let tmp = TempDir::new().unwrap();
-        let (handle, calls) = counted_rerank_handle(&tmp, |cfg| {
-            cfg.hooks.recall_rerank_languages = vec!["it".into()];
-        });
-        seed_memory_entry(&handle, "opted-in").await;
-        let (result, row) = prompt_row(&handle, "perche il topic non funziona", "opt-in-it").await;
-        assert!(additional_context(&result).contains("opted-in"), "{result}");
-        assert_eq!(row["phases"]["rerank_outcome"], "ok", "{row}");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        // Separate log: prompt_row reads the first event for each root.
-        let english_tmp = TempDir::new().unwrap();
-        let (english_handle, english_calls) = counted_rerank_handle(&english_tmp, |cfg| {
-            cfg.hooks.recall_rerank_languages = vec!["it".into()];
-        });
-        seed_memory_entry(&english_handle, "opted-in").await;
-        let (result, row) = prompt_row(&english_handle, RECALL_PROMPT, "opt-in-en").await;
-        assert!(additional_context(&result).contains("opted-in"), "{result}");
-        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-        assert_eq!(english_calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// One prompt through the dispatcher, with the row it logged.
-    async fn prompt_row(handle: &Arc<RepoHandle>, prompt: &str, session: &str) -> (Value, Value) {
-        let result = dispatch_call(
-            "hook.user_prompt_submit",
-            json!({"prompt": prompt, "session_id": session}),
-            Arc::clone(handle),
-            &make_dctx(),
-        )
-        .await
-        .expect("hook");
-        (
-            result,
-            hook_event_row(&handle.root, "user_prompt_submit").await,
-        )
     }
 
     /// A handle rooted at `tmp`, with the config the caller asks for.
@@ -9357,7 +9655,7 @@ mod tests {
         let mut config = handle.config.clone();
         config.hooks.user_prompt_submit_deadline_ms = CONTENT_TEST_DEADLINE_MS;
         tweak(&mut config);
-        let mut shared = RepoHandle::from_shared(
+        let shared = RepoHandle::from_shared(
             handle.root.clone(),
             Arc::clone(&handle.ctx),
             Arc::clone(&handle.code_index),
@@ -9366,7 +9664,6 @@ mod tests {
             Arc::clone(&handle.doc_reindex_active),
             Arc::clone(&handle.code_reindex_active),
         );
-        shared.reranker = Arc::clone(&handle.reranker);
         Arc::new(shared)
     }
 
@@ -9503,6 +9800,20 @@ mod tests {
         );
     }
 
+    /// Catches dropping the higher-ranked variant instead of the later one, a
+    /// distinct item, or an item that has no stored vector.
+    #[test]
+    fn translation_variants_keep_the_first_of_a_pair_and_every_distinct_item() {
+        let vectors = std::collections::HashMap::from([
+            (1, vec![1.0, 0.0]),
+            (2, vec![0.6, 0.8]),
+            (3, vec![0.99, 0.141]),
+        ]);
+        let mut items = vec![1, 2, 3, 4];
+        drop_translation_variants(&mut items, |i| i, &vectors, 0.91);
+        assert_eq!(items, [1, 2, 4]);
+    }
+
     /// Build a warmup entry tagged for `project` (empty = cross-cutting).
     fn tagged_entry(
         id: &str,
@@ -9618,6 +9929,1073 @@ mod tests {
         let ranked = rank_warmup_entries(build(), 10, 0.0, now, Some("evoke"));
         let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["riscosity-hot", "cross-cutting", "lattice-cold"]);
+    }
+
+    // REALITY: consumers read real SQLite state through dispatch while a real
+    // OS writer lock is held; release must persist the queued mutation and all
+    // accounting. Native filesystem locking is exercised, not mocked.
+    // Catches: a warm/cold opener or queued writer retaining the serving slot
+    // while waiting for admission, or accounting being discarded on contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn admission_waiters_allow_reads_and_eventually_persist_warm_and_cold() {
+        for cold in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            ensure_handle_context(&handle).await.unwrap();
+            let (db, sid) = {
+                let slot = handle.ctx.lock().await;
+                let ctx = slot.as_ref().unwrap();
+                ctx.conn.execute_batch("INSERT INTO memory_entries(id,title,content,entry_type,tags,status,created_at,updated_at) VALUES('accounted','Accounting','persisted read','topic','[]','active',0,0)").unwrap();
+                (
+                    ctx.db_path.clone(),
+                    stats::create_session(&ctx.conn).unwrap(),
+                )
+            };
+            if cold {
+                *handle.ctx.lock().await = None;
+            }
+            let writer =
+                crate::store::mutation_lock::acquire_writer(&db, "held migration").unwrap();
+            let dctx = make_dctx();
+            dctx.session_id.store(sid, Ordering::Relaxed);
+            let mutation_handle = Arc::clone(&handle);
+            let mutation = tokio::spawn(async move {
+                dispatch_call("memory_write", json!({"id":"queued", "title":"Queued", "content":"required write", "entry_type":"topic"}), mutation_handle, &make_dctx()).await
+            });
+            // Exercise the actual cold opener and deferred drain as well as
+            // required memory mutation admission.
+            warm_slot_in_background(&handle);
+            record_hook_call(&handle, "hook.stop").await;
+            dctx.record_persistent_call(&handle, "get", 7, 1, false)
+                .await;
+            let read = async {
+                if cold {
+                    let result = dispatch_call(
+                        "hook.session_start",
+                        json!({"session_id":"cold-admission"}),
+                        Arc::clone(&handle),
+                        &make_dctx(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        result.to_string().contains("Accounting"),
+                        "cold hook lost its readable memory: {result}"
+                    );
+                    assert!(
+                        handle.ctx.try_lock().is_ok(),
+                        "cold opener retained the slot while waiting for admission"
+                    );
+                } else {
+                    let result = dispatch_call(
+                        "get",
+                        json!({"id":"accounted"}),
+                        Arc::clone(&handle),
+                        &make_dctx(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(result.to_string().contains("persisted read"));
+                    assert!(
+                        result.to_string().contains("Accessed: 1 times"),
+                        "get must include its own access while accounting waits: {result}"
+                    );
+                    let batch = dispatch_call(
+                        "get",
+                        json!({"id":"accounted,accounted"}),
+                        Arc::clone(&handle),
+                        &make_dctx(),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(batch.to_string().contains("persisted read"));
+                }
+            };
+            let read_result = tokio::time::timeout(std::time::Duration::from_secs(10), read).await;
+            drop(writer);
+            read_result.expect("read waited for writer admission");
+            mutation.await.unwrap().unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let slot = handle.ctx.lock().await;
+                    let conn = &slot.as_ref().unwrap().conn;
+                    let calls: i64 = conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM call_log WHERE tool_name IN ('stop','get')",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    let accesses: i64 = conn
+                        .query_row(
+                            "SELECT access_count FROM memory_entries WHERE id='accounted'",
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap();
+                    assert!(
+                        memory::get_entry_without_tracking(conn, "queued")
+                            .unwrap()
+                            .is_some()
+                    );
+                    if calls == 2 && (cold || accesses == 3) {
+                        break;
+                    }
+                    drop(slot);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued accounting did not persist");
+        }
+    }
+
+    // Catches: the cold get/search routes waiting for writable initialization
+    // behind a rebuild, although their WAL snapshot is already readable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cold_get_and_search_read_before_writer_releases() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "cold-readable").await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        *handle.ctx.lock().await = None;
+        let writer = crate::store::mutation_lock::acquire_writer(&db, "held migration").unwrap();
+        let read = async {
+            let get = dispatch_call(
+                "get",
+                json!({"id":"cold-readable"}),
+                handle.clone(),
+                &make_dctx(),
+            )
+            .await
+            .unwrap();
+            assert!(get.to_string().contains("recall_gate_fixture"), "{get}");
+            let search = dispatch_call(
+                "search",
+                json!({"query":"recall_gate_fixture", "scope":"memory"}),
+                handle.clone(),
+                &make_dctx(),
+            )
+            .await
+            .unwrap();
+            assert!(search.to_string().contains("cold-readable"), "{search}");
+            for (method, params, expected) in [
+                ("status", json!({}), "Index Status"),
+                ("memory_list", json!({}), "cold-readable"),
+                (
+                    "graph",
+                    json!({"entity":"cold-readable", "scope":"memory"}),
+                    "cold-readable",
+                ),
+                (
+                    "memory_delete",
+                    json!({"id":"cold-readable", "dry_run":true}),
+                    "would delete",
+                ),
+                ("usage", json!({"session_only":false}), "lifetime"),
+                ("external.list", json!({"source":"test-cold"}), "documents"),
+            ] {
+                let result = dispatch_call(method, params, handle.clone(), &make_dctx())
+                    .await
+                    .unwrap();
+                assert!(result.to_string().contains(expected), "{method}: {result}");
+            }
+            assert!(handle.ctx.try_lock().unwrap().is_none());
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), read).await;
+        drop(writer);
+        result.expect("cold lexical consumers waited for writer release");
+        ensure_handle_context(&handle).await.unwrap();
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        let slot = handle.ctx.lock().await;
+        assert!(
+            memory::get_entry_without_tracking(&slot.as_ref().unwrap().conn, "cold-readable")
+                .unwrap()
+                .is_some(),
+            "dry run removed source memory"
+        );
+        assert_eq!(
+            slot.as_ref()
+                .unwrap()
+                .conn
+                .query_row(
+                    "SELECT access_count FROM memory_entries WHERE id='cold-readable'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
+    // Catches: the initializing flag being checked only after writer admission.
+    #[tokio::test]
+    async fn initializing_slot_refuses_before_writer_admission() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        *handle.ctx.lock().await = None;
+        let writer = crate::store::mutation_lock::acquire_writer(&db, "initial indexing").unwrap();
+        handle.doc_reindex_active.store(true, Ordering::Release);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            ensure_handle_context(&handle),
+        )
+        .await;
+        drop(writer);
+        assert!(
+            result
+                .expect("initializing opener waited for writer")
+                .unwrap_err()
+                .message
+                .contains("initializing")
+        );
+        assert!(handle.ctx.lock().await.is_none());
+    }
+
+    // Catches: authoritative prior/trigger accounting blocking a prompt/tool
+    // during rebuilding, or an omitted line being certified as delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn contended_injections_omit_then_retry_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"admission"}"#,
+            "Prompt lesson.",
+        )
+        .await;
+        seed_promoted_prior(&handle, "pre_tool", r#"{"tool":"Bash"}"#, "Tool lesson.").await;
+        seed_trigger_memory(
+            &handle,
+            "try-rule",
+            "Try admission.",
+            r#"[{"prompt_contains":"admission"},{"tool":"Bash"}]"#,
+        )
+        .await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer = crate::store::mutation_lock::acquire_writer(&db, "held migration").unwrap();
+        let dctx = make_dctx();
+        let dedup = (&dctx, "try-session".to_string());
+        let input = json!({"command":"ls"});
+        let prompt = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            prompt_prior_block(&handle, "admission", "try-session", Some(&dedup)),
+        )
+        .await;
+        let tool = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            tool_prior_block(&handle, "Bash", &input, false, None, "try-session", 2048),
+        )
+        .await;
+        let slot = handle.ctx.lock().await;
+        let recorded: i64 = slot
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM prior_injections", [], |r| r.get(0))
+            .unwrap();
+        drop(slot);
+        drop(writer);
+        assert!(
+            prompt
+                .expect("prompt injection waited for writer")
+                .is_none()
+        );
+        assert!(tool.expect("tool injection waited for writer").is_none());
+        assert_eq!(recorded, 0, "omitted prior was recorded as delivered");
+        assert_eq!(recorded_trigger_injections(&handle).await, 0);
+        let prompt = prompt_prior_block(&handle, "admission", "try-session", Some(&dedup))
+            .await
+            .unwrap();
+        assert!(
+            prompt.contains("Prompt lesson.") && prompt.contains("try-rule"),
+            "{prompt}"
+        );
+        assert!(
+            prompt_prior_block(&handle, "admission", "try-session", Some(&dedup))
+                .await
+                .is_none()
+        );
+        let tool = tool_prior_block(&handle, "Bash", &input, false, None, "try-session", 2048)
+            .await
+            .unwrap();
+        assert!(tool.contains("Tool lesson."), "{tool}");
+        assert!(
+            tool_prior_block(&handle, "Bash", &input, false, None, "try-session", 2048)
+                .await
+                .is_none()
+        );
+        assert_eq!(recorded_trigger_injections(&handle).await, 1);
+    }
+
+    // Catches: a joined one-shot non-prompt hook returning while its existing
+    // deferred accounting task can be abandoned on runtime shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn joined_non_prompt_settles_deferred_accounting() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer = crate::store::mutation_lock::acquire_writer(&db, "held migration").unwrap();
+        let mut dctx = make_dctx();
+        dctx.background = Some(Arc::new(StdMutex::new(Vec::new())));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatch_call(
+                "hook.pre_tool_use",
+                json!({"tool_name":"Bash", "tool_input":{"command":"ls"}}),
+                handle.clone(),
+                &dctx,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let join = tokio::spawn(async move {
+            dctx.join_background().await;
+        });
+        let mut join = join;
+        let prematurely_done =
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut join)
+                .await
+                .is_ok();
+        drop(writer);
+        assert!(
+            !prematurely_done,
+            "one-shot join ignored its deferred telemetry"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), join)
+            .await
+            .unwrap()
+            .unwrap();
+        let slot = handle.ctx.lock().await;
+        let calls: i64 = slot
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM call_log WHERE tool_name='pre_tool_use'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(calls, 1);
+    }
+
+    // Catches: ordinary short writer/deferred-accounting contention silently
+    // losing a matching prior even though its authoritative write can finish.
+    #[tokio::test(start_paused = true)]
+    async fn short_admission_wait_delivers_and_outer_deadline_cancels() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"short-writer"}"#,
+            "Short writer lesson.",
+        )
+        .await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "ordinary accounting").unwrap();
+        record_hook_call(&handle, "hook.pre_tool_use").await;
+        let prior_handle = handle.clone();
+        let prior = tokio::spawn(async move {
+            prompt_prior_block(&prior_handle, "short-writer", "short-session", None).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(
+            !prior.is_finished(),
+            "control did not encounter the held real writer"
+        );
+        drop(writer);
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        // Actual SQLite/deferred work finishes on the blocking pool. Keep the
+        // virtual admission budget fixed while waiting for real I/O, rather
+        // than making the oracle depend on machine scheduling under load.
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        wait_until_blocking("ordinary deferred telemetry drained", || {
+            !deferred_writes().contains_key(&key)
+        })
+        .await;
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        wait_until_blocking("short admission delivered", || prior.is_finished()).await;
+        assert!(
+            prior
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("Short writer lesson.")
+        );
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM prior_injections WHERE session='short-session'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "beyond enclosing deadline").unwrap();
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(5),
+            prompt_prior_block(&handle, "short-writer", "cut-session", None),
+        )
+        .await;
+        assert!(cut.is_err(), "outer deadline did not cancel admission");
+        assert!(
+            handle.ctx.try_lock().is_ok(),
+            "cancelled admission retained slot"
+        );
+        drop(writer);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM prior_injections WHERE session='cut-session'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    // Catches: a durable tool/session row becoming an unintended persistent
+    // prompt dedup gate, or session_start failing to reset prompt-only dedup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prompt_priors_reset_and_ignore_existing_tool_record() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let id = seed_promoted_prior_with_signature(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"reset-prior"}"#,
+            "Resettable lesson.",
+            None,
+        )
+        .await;
+        let params = json!({"session_id":"same-session"});
+        let dctx = make_dctx();
+        let key = hook_session_key(&handle, &params);
+        {
+            let slot = handle.ctx.lock().await;
+            assert!(
+                crate::store::priors::record_tool_injection_once(
+                    &slot.as_ref().unwrap().conn,
+                    &id,
+                    "same-session",
+                    chrono::Utc::now().timestamp()
+                )
+                .unwrap()
+            );
+        }
+        let dedup = (&dctx, key.clone());
+        let first = prompt_prior_block(&handle, "reset-prior", "same-session", Some(&dedup))
+            .await
+            .unwrap();
+        assert!(first.contains("Resettable lesson."));
+        assert!(
+            prompt_prior_block(&handle, "reset-prior", "same-session", Some(&dedup))
+                .await
+                .is_none()
+        );
+        dispatch_call("hook.session_start", params, handle.clone(), &dctx)
+            .await
+            .unwrap();
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        settle_background_slot_users(&handle).await;
+        let after_reset = prompt_prior_block(&handle, "reset-prior", "same-session", Some(&dedup))
+            .await
+            .unwrap();
+        assert!(after_reset.contains("Resettable lesson."));
+        let slot = handle.ctx.lock().await;
+        let conn = &slot.as_ref().unwrap().conn;
+        assert_eq!(
+            conn.query_row(
+                "SELECT injected_count FROM prior_clusters WHERE id=?1",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            3
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM prior_injections WHERE cluster_id=?1",
+                [&id],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    // Catches: startup beginning after the drain's first flag check, while
+    // admission is pending, dropping the queued batch on the cold-open error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn initialization_flip_preserves_required_deferred_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        *handle.ctx.lock().await = None;
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "before initialization").unwrap();
+        write_behind_slot(
+            SlotOpener::of(&handle),
+            "required row during startup",
+            |ctx| {
+                ctx.conn.execute("INSERT INTO memory_entries(id,title,content,entry_type,tags,status,created_at,updated_at) VALUES('retained-startup','Retained','required row','topic','[]','active',0,0)", [])?;
+                Ok(())
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        handle.doc_reindex_active.store(true, Ordering::Release);
+        drop(writer);
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        assert!(
+            deferred_writes().contains_key(&key),
+            "initialization discarded queued row"
+        );
+        assert!(handle.ctx.try_lock().unwrap().is_none());
+        handle.doc_reindex_active.store(false, Ordering::Release);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            settle_deferred_writes(key),
+        )
+        .await
+        .unwrap();
+        let conn = rusqlite::Connection::open(db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM memory_entries WHERE id='retained-startup'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    // Catches: every cold read retaining a writer poller throughout a rebuild,
+    // so expired encounters unexpectedly open the slot after the writer exits.
+    #[tokio::test(start_paused = true)]
+    async fn cold_warmers_expire_and_next_encounter_can_warm() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warm-next").await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        *handle.ctx.lock().await = None;
+        let writer = crate::store::mutation_lock::acquire_writer(&db, "held rebuild").unwrap();
+        for _ in 0..8 {
+            let (body, count) = memory_list_impl(&handle, 10, "recent").await.unwrap();
+            assert_eq!(count, 1);
+            assert!(body.contains("warm-next"));
+        }
+        // Let every spawned warmer reach its admission wait before advancing
+        // the shared clock. No queue/task registry is needed in production.
+        for _ in 0..9 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(std::time::Duration::from_millis(60)).await;
+        for _ in 0..9 {
+            tokio::task::yield_now().await;
+        }
+        assert!(handle.ctx.try_lock().unwrap().is_none());
+        drop(writer);
+        tokio::time::advance(std::time::Duration::from_millis(100)).await;
+        settle_blocking().await;
+        assert!(
+            handle.ctx.try_lock().unwrap().is_none(),
+            "expired warmer opened after release"
+        );
+        let (body, count) = memory_list_impl(&handle, 10, "recent").await.unwrap();
+        assert_eq!(count, 1);
+        assert!(body.contains("warm-next"));
+        wait_until_blocking("fresh encounter warmed the slot", || {
+            handle.ctx.try_lock().is_ok_and(|slot| slot.is_some())
+        })
+        .await;
+    }
+
+    // Catches: recording one injection then awaiting another admission, so an
+    // enclosing deadline can discard all output with a ghost delivered record.
+    #[tokio::test(start_paused = true)]
+    async fn multiline_admission_cancellation_and_records_agree() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "multi-trigger",
+            "Multiline memory.",
+            r#"[{"prompt_contains":"multi-event"},{"tool":"Bash"}]"#,
+        )
+        .await;
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"multi-event"}"#,
+            "Prompt multiline.",
+        )
+        .await;
+        seed_promoted_prior(&handle, "pre_tool", r#"{"tool":"Bash"}"#, "Tool multiline.").await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "deadline before block admission")
+                .unwrap();
+        let input = json!({"command":"ls"});
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                prompt_prior_block(&handle, "multi-event", "multi-prompt", None)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                tool_prior_block(&handle, "Bash", &input, false, None, "multi-tool", 2048)
+            )
+            .await
+            .is_err()
+        );
+        drop(writer);
+        assert_eq!(recorded_trigger_injections(&handle).await, 0);
+        {
+            let slot = handle.ctx.lock().await;
+            assert_eq!(
+                slot.as_ref()
+                    .unwrap()
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM prior_injections", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+        let prompt = prompt_prior_block(&handle, "multi-event", "multi-prompt", None)
+            .await
+            .unwrap();
+        let tool = tool_prior_block(&handle, "Bash", &input, false, None, "multi-tool", 2048)
+            .await
+            .unwrap();
+        for (body, prior) in [(&prompt, "Prompt multiline."), (&tool, "Tool multiline.")] {
+            assert_eq!(
+                body.matches("mdkb memory [multi-trigger]").count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(body.matches("mdkb prior [").count(), 1, "{body}");
+            assert!(body.contains(prior), "{body}");
+        }
+        assert_eq!(recorded_trigger_injections(&handle).await, 2);
+        let slot = handle.ctx.lock().await;
+        assert_eq!(slot.as_ref().unwrap().conn.query_row("SELECT COUNT(*) FROM prior_injections WHERE session IN ('multi-prompt','multi-tool')", [], |r|r.get::<_,i64>(0)).unwrap(), 2);
+    }
+
+    // Catches: making the lock sidecar directory before open bypasses init,
+    // leaving a first writable encounter without config or memory projection.
+    #[tokio::test]
+    async fn admitted_cold_open_initializes_the_complete_store_layout() {
+        let tmp = TempDir::new().unwrap();
+        let handle =
+            RepoHandle::open(tmp.path(), &crate::daemon::config::DaemonConfig::default()).unwrap();
+        ensure_handle_context(&handle).await.unwrap();
+        for path in [
+            ".mdkb/config.toml",
+            ".mdkb/.gitignore",
+            ".mdkb/memory/entries",
+            ".mdkb/memory/archive",
+        ] {
+            assert!(tmp.path().join(path).exists(), "cold open omitted {path}");
+        }
+    }
+
+    async fn migration_fixture(tmp: &TempDir) -> Arc<RepoHandle> {
+        let handle = make_handle(tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let slot = handle.ctx.lock().await;
+        let ctx = slot.as_ref().unwrap();
+        ctx.conn.execute_batch("INSERT INTO collections(name,path,pattern,created_at,updated_at) VALUES('notes','.','*.md',0,0); INSERT INTO content(hash,body,created_at) VALUES('hash','sqlite recovery instructions',0); INSERT INTO documents(id,collection,relative_path,hash,file_modified_at,indexed_at) VALUES(1,'notes','recovery.md','hash',0,0)").unwrap();
+        crate::store::vectors::store_embedding(
+            &ctx.conn,
+            1,
+            &[0.25; 384],
+            crate::llm::embeddings::Model::MiniLm.identity(),
+        )
+        .unwrap();
+        std::fs::write(&ctx.config_path, "[embedding]\nmodel='granite107m'\n").unwrap();
+        drop(slot);
+        handle
+    }
+
+    // Catches: removing process-wide serialization lets a second store finish
+    // its failing migration while the first migration is still admitted.
+    // The observer reports actual worker entry, not the flag before spawning.
+    // Catches: an Ok backfill with a still-pending row immediately reopening
+    // and rebuilding on every encounter. Real inference and a SQLite trigger
+    // make a row refuse its persisted embedding without stubbing the model.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached MiniLM weights"]
+    async fn incomplete_backfill_uses_retry_memo() {
+        let tmp = TempDir::new().unwrap();
+        use_built_mdkb_as_embed_worker();
+        require_embed_worker();
+        let handle = migration_fixture(&tmp).await;
+        std::fs::write(
+            handle.root.join(".mdkb/config.toml"),
+            "[embedding]\nmodel='minilm'\n",
+        )
+        .unwrap();
+        {
+            let slot = handle.ctx.lock().await;
+            slot.as_ref().unwrap().conn.execute_batch("INSERT INTO memory_entries(id,title,content,entry_type,tags,status,created_at,updated_at) VALUES('poison','Retry','poison row','topic','[]','active',0,0); CREATE TRIGGER refuse_embedding AFTER INSERT ON memory_embeddings BEGIN DELETE FROM memory_embeddings WHERE memory_rowid=NEW.memory_rowid; END;").unwrap();
+        }
+        assert_eq!(
+            spawn_embedding_backfill(handle.clone())
+                .unwrap()
+                .await
+                .unwrap(),
+            1
+        );
+        let slot = handle.ctx.lock().await;
+        assert_eq!(
+            memory::count_pending_embeddings(&slot.as_ref().unwrap().conn).unwrap(),
+            1
+        );
+        drop(slot);
+        assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
+        for _ in 0..3 {
+            assert!(
+                spawn_embedding_backfill(handle.clone()).is_none(),
+                "incomplete success escaped backoff"
+            );
+        }
+        // An actual same-config later attempt still gets a chance to repair.
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        handle
+            .ctx
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .conn
+            .execute_batch("DROP TRIGGER refuse_embedding")
+            .unwrap();
+        assert_eq!(
+            spawn_embedding_backfill(handle.clone())
+                .unwrap()
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            memory::count_pending_embeddings(&handle.ctx.lock().await.as_ref().unwrap().conn)
+                .unwrap(),
+            0
+        );
+        assert!(handle.embedding_retry.lock().unwrap().is_none());
+    }
+
+    // Catches: cancellation before the worker starts leaving an expired retry
+    // deadline, so repeated same-config encounters schedule again immediately.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_unpolled_embedding_job_preserves_retry_suppression() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let config_path = handle.root.join(".mdkb/config.toml");
+
+        // No await between spawn and abort: the current-thread runtime cannot
+        // poll the generation worker before cancellation is requested.
+        let job = spawn_embedding_backfill(handle.clone()).unwrap();
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+        for _ in 0..3 {
+            assert!(
+                spawn_embedding_backfill(handle.clone()).is_none(),
+                "cancelled job allowed an immediate same-config retry"
+            );
+        }
+
+        let mut config = std::fs::read_to_string(&config_path).unwrap();
+        config.push_str("\n# Changed configuration permits a new attempt.\n");
+        std::fs::write(config_path, config).unwrap();
+        let changed = spawn_embedding_backfill(handle.clone())
+            .expect("a real config change must bypass the cancelled attempt's suppression");
+        changed.abort();
+        assert!(changed.await.unwrap_err().is_cancelled());
+        assert!(
+            spawn_embedding_backfill(handle).is_none(),
+            "the changed-config cancelled attempt also needs retry suppression"
+        );
+    }
+
+    // Catches: unwind releasing the flight without recording retry suppression,
+    // or removing the healthy marker before any generation write happened.
+    /// Regeneration runs in a child `mdkb`; this test harness is not one. Use the
+    /// binary cargo builds beside it (`target/<profile>/mdkb`).
+    fn use_built_worker() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let exe = std::env::current_exe().unwrap();
+            let worker = exe.parent().unwrap().parent().unwrap().join("mdkb");
+            assert!(
+                worker.is_file(),
+                "build the binary first: cargo build --bin mdkb"
+            );
+            // SAFETY: set once, before any regeneration child reads it.
+            unsafe { std::env::set_var(EMBED_WORKER_ENV, worker) };
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached Granite weights"]
+    async fn panicked_worker_backs_off_without_invalidating_health() {
+        use_built_worker();
+        let tmp = TempDir::new().unwrap();
+        let handle = migration_fixture(&tmp).await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        crate::store::heal::verify_and_mark_unadmitted(&db).unwrap();
+        let marker = std::path::PathBuf::from(format!("{}.integrity-ok", db.display()));
+        let before = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        MIGRATION_STARTED.lock().unwrap().insert(
+            handle.root.clone(),
+            Box::new(|| panic!("isolated worker panic")),
+        );
+        assert_eq!(
+            spawn_embedding_backfill(handle.clone())
+                .unwrap()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
+        assert!(spawn_embedding_backfill(handle.clone()).is_none());
+        assert_eq!(
+            std::fs::metadata(marker).unwrap().modified().unwrap(),
+            before
+        );
+        let slot = handle.ctx.lock().await;
+        assert!(
+            crate::store::vectors::identity_status(&slot.as_ref().unwrap().conn)
+                .unwrap()
+                .pending_model
+                .is_none()
+        );
+    }
+
+    // Catches: a changed code archive retaining its old facade when the fresh
+    // postwrite database probe fails. The probe sees a real damaged isolated DB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached Granite and MiniLM weights"]
+    async fn archive_refresh_survives_postwrite_probe_error() {
+        use_built_worker();
+        use crate::code::semantic::SemanticSearch;
+        use crate::llm::embeddings::Model;
+        let tmp = TempDir::new().unwrap();
+        let handle = migration_fixture(&tmp).await;
+        std::fs::write(
+            handle.root.join(".mdkb/config.toml"),
+            "[embedding]\nmodel='minilm'\n",
+        )
+        .unwrap();
+        let facade = IndexFacade::create(&handle.root.join(".mdkb/code.sqlite")).unwrap();
+        let file = facade
+            .db()
+            .insert_file(
+                "recovery.rs",
+                "recovery.rs",
+                "hash",
+                Some("rust"),
+                None,
+                None,
+            )
+            .unwrap();
+        let symbol = facade
+            .db()
+            .insert_symbol(
+                "recovery",
+                "function",
+                file,
+                "recovery.rs",
+                0,
+                None,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        SemanticSearch::reembed_at(
+            handle.root.join(".mdkb/vectors.bin"),
+            Model::MiniLm,
+            &[(symbol as u32, "function recovery".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            facade.semantic_search("recovery", 5, -1.0).unwrap().len(),
+            1
+        );
+        *handle.code_index.lock().await = Some(facade);
+        std::fs::write(
+            handle.root.join(".mdkb/config.toml"),
+            "[embedding]\nmodel='granite107m'\n",
+        )
+        .unwrap();
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        MIGRATION_BEFORE_VERIFY.lock().unwrap().insert(
+            handle.root.clone(),
+            Box::new(move || {
+                std::fs::write(db, b"damaged during postwrite verification").unwrap();
+            }),
+        );
+        assert_eq!(
+            spawn_embedding_backfill(handle.clone())
+                .unwrap()
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            !crate::code::semantic::identity_status(
+                &handle.root.join(".mdkb/vectors.bin"),
+                Model::Granite107M
+            )
+            .stale,
+            "archive never actually changed"
+        );
+        assert!(
+            handle.embedding_retry.lock().unwrap().is_some(),
+            "probe error was not observed"
+        );
+        assert!(
+            handle.code_index.lock().await.is_none(),
+            "old facade survived failed verification"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached Granite weights"]
+    async fn automatic_migrations_serialize_actual_workers_across_stores() {
+        use_built_worker();
+        let first_tmp = TempDir::new().unwrap();
+        let first = migration_fixture(&first_tmp).await;
+        let second_tmp = TempDir::new().unwrap();
+        let second = migration_fixture(&second_tmp).await;
+        std::fs::write(second.root.join(".mdkb/vectors.bin"), b"orphan").unwrap();
+        let db = first.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "hold first migration").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        MIGRATION_STARTED.lock().unwrap().insert(
+            first.root.clone(),
+            Box::new(move || {
+                let _ = entered_tx.send(());
+            }),
+        );
+        let first_task = spawn_embedding_backfill(first.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        let (second_done_tx, second_done_rx) = std::sync::mpsc::channel();
+        let release = std::thread::spawn(move || {
+            let overlapped = second_done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            drop(writer);
+            overlapped
+        });
+        let second_task = spawn_embedding_backfill(second.clone()).unwrap();
+        assert_eq!(second_task.await.unwrap(), 0);
+        let _ = second_done_tx.send(());
+        assert!(
+            !release.join().unwrap(),
+            "second worker completed before the first released admission"
+        );
+        assert_eq!(first_task.await.unwrap(), 1);
+        let slot = first.ctx.lock().await;
+        assert_eq!(
+            crate::store::vectors::identity_status(&slot.as_ref().unwrap().conn)
+                .unwrap()
+                .current_model
+                .as_deref(),
+            Some(crate::llm::embeddings::Model::Granite107M.identity())
+        );
+    }
+
+    // Catches: the worker certifying its captured encoder after config changed
+    // during its real writer-admission wait; a changed config must retry now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached Granite weights"]
+    async fn automatic_migration_config_change_during_worker_refuses_wrong_generation() {
+        use_built_worker();
+        let tmp = TempDir::new().unwrap();
+        let handle = migration_fixture(&tmp).await;
+        let db = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&db, "hold migration for config edit")
+                .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        MIGRATION_STARTED.lock().unwrap().insert(
+            handle.root.clone(),
+            Box::new(move || {
+                let _ = entered_tx.send(());
+            }),
+        );
+        let task = spawn_embedding_backfill(handle.clone()).unwrap();
+        tokio::task::spawn_blocking(move || {
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        std::fs::write(
+            handle.root.join(".mdkb/config.toml"),
+            "[embedding]\nmodel='minilm'\n",
+        )
+        .unwrap();
+        drop(writer);
+        assert_eq!(task.await.unwrap(), 0);
+        let slot = handle.ctx.lock().await;
+        let conn = &slot.as_ref().unwrap().conn;
+        let state = crate::store::vectors::identity_status(conn).unwrap();
+        assert_eq!(
+            state.current_model.as_deref(),
+            Some(crate::llm::embeddings::Model::MiniLm.identity())
+        );
+        assert!(state.pending_model.is_none());
+        assert_eq!(
+            crate::store::vectors::get_embedding(conn, 1)
+                .unwrap()
+                .unwrap(),
+            vec![0.25; 384]
+        );
+        drop(slot);
+        // A different invalid selection bypasses the just-recorded failure
+        // memo, proving immediate eligibility without starting inference.
+        std::fs::write(
+            handle.root.join(".mdkb/config.toml"),
+            "[embedding]\nmodel='granite107m'\n# changed\n",
+        )
+        .unwrap();
+        std::fs::write(handle.root.join(".mdkb/vectors.bin"), b"orphan").unwrap();
+        assert_eq!(spawn_embedding_backfill(handle).unwrap().await.unwrap(), 0);
     }
 
     fn make_dctx() -> DispatchContext {
@@ -9866,6 +11244,73 @@ mod tests {
         assert!(
             body.contains("pending-relevant-memory"),
             "embedding a peer must not erase the pending memory's lexical fallback: {body}"
+        );
+    }
+
+    /// Catches: a daemon-side same-model `embed --reembed` leaves the shared code
+    /// facade serving the vectors it cached before the regeneration, so a symbol
+    /// the repaired archive now holds stays absent from code search (R1).
+    #[tokio::test]
+    #[ignore = "requires the cached production ONNX embedding model"]
+    async fn same_model_reembed_refreshes_daemon_code_search_cache() {
+        let tmp = TempDir::new().unwrap();
+        use_built_mdkb_as_embed_worker();
+        require_embed_worker();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "/// Parse the widget inventory ledger.\npub fn parse_widget_inventory() {}\n",
+        )
+        .unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.expect("init ctx");
+        cli_mutate_impl(
+            &handle,
+            CliMutation::CodeIndex {
+                paths: Vec::new(),
+                force: false,
+            },
+        )
+        .await
+        .expect("index code");
+        // The partial archive an interrupted regeneration leaves: same model, no vectors.
+        crate::code::semantic::VectorStore::open_for_model(
+            tmp.path().join(".mdkb/vectors.bin"),
+            crate::llm::embeddings::Model::MiniLm,
+        )
+        .and_then(|store| store.clear())
+        .expect("empty the archive");
+        let hits = |guard: &Option<IndexFacade>| {
+            guard
+                .as_ref()
+                .expect("code facade")
+                .semantic_search("widget inventory ledger", 5, -1.0)
+                .expect("semantic search")
+                .into_iter()
+                .map(|(symbol, _)| symbol.name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            hits(&*handle.code_index.lock().await).is_empty(),
+            "precondition: the daemon facade cached the empty archive"
+        );
+
+        cli_mutate_impl(
+            &handle,
+            CliMutation::Embed {
+                reembed: true,
+                collection: None,
+            },
+        )
+        .await
+        .expect("same-model regeneration");
+
+        let index = acquire_handle_code_index(&handle)
+            .await
+            .expect("code index");
+        let names = hits(&*index);
+        assert!(
+            names.iter().any(|name| name == "parse_widget_inventory"),
+            "code search after regeneration must read the regenerated archive: {names:?}"
         );
     }
 
@@ -10203,6 +11648,75 @@ mod tests {
             ungated.contains("shares-one-word"),
             "the BM25 leg must have found the entry for the gate to be what \
              rejected it, yet with no floor nothing was injected either: {ungated}"
+        );
+    }
+
+    /// Catches: hook recall reading outside one read snapshot, so each semantic
+    /// read repeats the embedding identity probe (story 065-9a07). Measured:
+    /// 37047 steps per turn against a 29805-step probe; 186090 (6.2 probes) with
+    /// `run_guarded_read` in place of `run_guarded_snapshot_read`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires cached MiniLM weights"]
+    async fn hook_recall_pays_one_identity_probe_per_turn() {
+        use crate::store::{chunks::Chunk, vectors};
+        use_built_mdkb_as_embed_worker();
+        require_embed_worker();
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |c| {
+            c.hooks.user_prompt_submit_require_sigil = false;
+            c.hooks.user_prompt_submit_deadline_ms = 60_000;
+            c.hooks.recall_docs_limit = 3;
+        });
+        ensure_handle_context(&handle).await.unwrap();
+        let steps = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe = {
+            // 40 documents of 50 labelled chunk vectors: the probe dominates a turn.
+            let slot = handle.ctx.lock().await;
+            let conn = &slot.as_ref().unwrap().conn;
+            conn.execute_batch("INSERT INTO collections(name,path,pattern,created_at,updated_at) VALUES('notes','.','*.md',0,0); INSERT INTO content(hash,body,created_at) VALUES('hash','body',0);").unwrap();
+            for id in 1..=40_i64 {
+                conn.execute("INSERT INTO documents(id,collection,relative_path,hash,file_modified_at,indexed_at) VALUES(?1,'notes',?1 || '.md','hash',0,0)", [id]).unwrap();
+                let chunks: Vec<Chunk> = (0..50)
+                    .map(|index| Chunk {
+                        index,
+                        content: format!("{} {index}", "chunk body text ".repeat(64)),
+                        heading_path: None,
+                    })
+                    .collect();
+                vectors::store_chunk_embeddings(
+                    conn,
+                    id,
+                    &chunks,
+                    &vec![vec![0.25; 384]; 50],
+                    "AllMiniLML6V2",
+                )
+                .unwrap();
+                vectors::store_embedding(conn, id, &[0.25; 384], "AllMiniLML6V2").unwrap();
+            }
+            let seen = Arc::clone(&steps);
+            conn.progress_handler(
+                1,
+                Some(move || seen.fetch_add(1, Ordering::Relaxed) == u64::MAX),
+            )
+            .unwrap();
+            vectors::identity_status(conn).unwrap();
+            steps.swap(0, Ordering::Relaxed)
+        };
+        const PROMPT: &str = "how does the chunk body text get indexed";
+        hook_user_prompt_submit_impl(&handle, PROMPT).await; // warm model and cache
+        steps.store(0, Ordering::Relaxed);
+        hook_user_prompt_submit_impl(&handle, PROMPT).await;
+        let recall = steps.load(Ordering::Relaxed);
+        // A turn that returns early or fails closed runs no probe and would pass
+        // the ceiling below as a cost win.
+        assert!(
+            recall > probe / 2,
+            "a recall turn cost {recall} VM steps, less than one probe of {probe}: recall did not run"
+        );
+        assert!(
+            recall < probe * 3,
+            "a recall turn cost {recall} VM steps, {:.1} probes of {probe}",
+            recall as f64 / probe as f64
         );
     }
 
@@ -10816,6 +12330,8 @@ mod tests {
         );
         assert!(!memory_only.contains("mdkb prior session"), "{memory_only}");
 
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        settle_background_slot_users(&handle).await;
         let matcher = r#"{"prompt_contains":"ripgrep"}"#;
         let key = crate::store::priors::canonical_trigger_key("prompt", matcher);
         let cluster_id = crate::store::priors::cluster_id_for_key(&key);
@@ -11784,7 +13300,7 @@ mod tests {
                     &ctx.conn,
                     rowid,
                     &query_vector,
-                    "fixture",
+                    "AllMiniLML6V2",
                 )
                 .unwrap();
             }
@@ -12657,15 +14173,21 @@ mod tests {
         .await;
         let dctx = make_dctx();
         let (release, held) = hold_slot_like_a_reindex(&handle).await;
-        // The write that records the injection has to wait for the slot, so the
-        // reindex ends shortly after the prompt starts.
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            release.send(()).unwrap();
-        });
-        let first = prompt_body(&dctx, &handle, "zzagent please", "bypass-session").await;
-        releaser.join().unwrap();
+        // No line can be certified from the bypass alone. Omission must be
+        // prompt while the slot is held, and must leave the session eligible.
+        let during = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            prompt_body(&dctx, &handle, "zzagent please", "bypass-session"),
+        )
+        .await;
+        release.send(()).unwrap();
         held.await.unwrap();
+        let during = during.expect("trigger injection waited for the reindex");
+        assert!(!during.contains("agent-rule"), "{during}");
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        settle_background_slot_users(&handle).await;
+        assert_eq!(recorded_trigger_injections(&handle).await, 0);
+        let first = prompt_body(&dctx, &handle, "zzagent after rebuilding", "bypass-session").await;
         let repeat = prompt_body(&dctx, &handle, "zzagent again", "bypass-session").await;
 
         assert!(
@@ -12673,6 +14195,7 @@ mod tests {
             "{first}"
         );
         assert!(!repeat.contains("agent-rule"), "{repeat}");
+        assert_eq!(recorded_trigger_injections(&handle).await, 1);
     }
 
     #[test]
@@ -12970,7 +14493,7 @@ mod tests {
                 .collect::<Vec<_>>();
             conn.execute(
                 "INSERT INTO memory_embeddings (memory_rowid, embedding, model, created_at)
-                 SELECT rowid, ?1, 'fixture', 1 FROM memory_entries WHERE id=?2",
+                 SELECT rowid, ?1, 'AllMiniLML6V2', 1 FROM memory_entries WHERE id=?2",
                 rusqlite::params![bytes, format!("n{j}")],
             )
             .unwrap();
@@ -12979,7 +14502,14 @@ mod tests {
         let mut samples = Vec::with_capacity(100);
         for _ in 0..100 {
             let t = std::time::Instant::now();
-            let out = expand_recall_neighbors(conn, &seeds, 2, 3, Some(&[1.0, 0.0])).unwrap();
+            let out = expand_recall_neighbors(
+                conn,
+                &seeds,
+                2,
+                3,
+                Some(&crate::llm::embeddings::Vector::minilm(&[1.0, 0.0])),
+            )
+            .unwrap();
             samples.push(t.elapsed().as_micros());
             assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
         }
@@ -13197,7 +14727,7 @@ mod tests {
                 .collect::<Vec<_>>();
             conn.execute(
                 "INSERT INTO memory_embeddings (memory_rowid, embedding, model, created_at)
-                 SELECT rowid, ?1, 'fixture', 1 FROM memory_entries WHERE id=?2",
+                 SELECT rowid, ?1, 'AllMiniLML6V2', 1 FROM memory_entries WHERE id=?2",
                 rusqlite::params![bytes, id],
             )
             .unwrap();
@@ -13208,7 +14738,14 @@ mod tests {
                 .unwrap(),
         ];
 
-        let out = expand_recall_neighbors(&conn, &seeds, 1, 1, Some(&[1.0, 0.0])).unwrap();
+        let out = expand_recall_neighbors(
+            &conn,
+            &seeds,
+            1,
+            1,
+            Some(&crate::llm::embeddings::Vector::minilm(&[1.0, 0.0])),
+        )
+        .unwrap();
         assert_eq!(
             out,
             ["- [relevant] relevant (via supports)"],
@@ -13227,7 +14764,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            expand_recall_neighbors(&conn, &seeds, 1, 1, Some(&[1.0, 0.0])).unwrap(),
+            expand_recall_neighbors(
+                &conn,
+                &seeds,
+                1,
+                1,
+                Some(&crate::llm::embeddings::Vector::minilm(&[1.0, 0.0]))
+            )
+            .unwrap(),
             ["- [relevant] relevant (via supports)"],
             "malformed newer vector cannot outrank a measured match"
         );
@@ -13248,13 +14792,103 @@ mod tests {
             conn,
             &["seed.md".into()],
             &std::collections::HashSet::new(),
-            query,
+            query.map(crate::llm::embeddings::Vector::minilm).as_ref(),
         )
         .unwrap()
         .into_iter()
         .take(1)
         .map(|(path, relation, _)| (path, relation))
         .collect()
+    }
+
+    #[test]
+    fn graph_neighbor_cosine_scores_only_comparable_nonzero_vectors() {
+        let bytes = |v: &[f32]| {
+            v.iter()
+                .copied()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        // A zero prompt vector carries no relevance; it must not read as a measured 0.0.
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[1.0, 0.0]), &[0.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[0.0, 0.0]), &[1.0, 0.0]),
+            None
+        );
+        // Dimension mismatch and empty prompt vectors are unscored.
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[1.0, 0.0, 0.0]), &[1.0, 0.0]),
+            None
+        );
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[1.0, 0.0]), &[1.0, 0.0, 0.0]),
+            None
+        );
+        assert_eq!(graph_neighbor_cosine(&[], &[]), None);
+        // A non-finite component is not a score.
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[f32::NAN, 1.0]), &[1.0, 0.0]),
+            None
+        );
+        // Hand-computed cosines: identical 1, orthogonal 0, opposite -1, 45 degrees 1/sqrt(2).
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[2.0, 0.0]), &[1.0, 0.0]),
+            Some(1.0)
+        );
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[0.0, 1.0]), &[1.0, 0.0]),
+            Some(0.0)
+        );
+        assert_eq!(
+            graph_neighbor_cosine(&bytes(&[-1.0, 0.0]), &[1.0, 0.0]),
+            Some(-1.0)
+        );
+        let diagonal = graph_neighbor_cosine(&bytes(&[1.0, 1.0]), &[1.0, 0.0]).unwrap();
+        assert!((diagonal - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn memory_expansion_skips_recalled_entries_and_lists_a_shared_target_once() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for id in ["seed-a", "seed-b", "shared"] {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, ?1, 'body', 'topic', 1, 1)",
+                [id],
+            )
+            .unwrap();
+        }
+        for (from, to) in [
+            ("seed-a", "seed-b"),
+            ("seed-a", "shared"),
+            ("seed-b", "shared"),
+        ] {
+            memory_graph::add_edge(
+                &conn,
+                from,
+                to,
+                TargetKind::Memory,
+                MemoryRelation::Supports,
+            )
+            .unwrap();
+        }
+        let seeds: Vec<_> = ["seed-a", "seed-b"]
+            .iter()
+            .map(|id| {
+                memory::get_entry_without_tracking(&conn, id)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 2, 5, None).unwrap(),
+            ["- [shared] shared (via supports)"],
+            "seed-b is already in the results and shared is reachable from both seeds"
+        );
     }
 
     #[test]
@@ -13289,11 +14923,12 @@ mod tests {
         let unrelated_duplicate = conn.last_insert_rowid();
         let orthogonal = [0.0_f32, 1.0]
             .into_iter()
+            .chain(std::iter::repeat_n(0.0, 382))
             .flat_map(f32::to_le_bytes)
             .collect::<Vec<_>>();
         conn.execute(
             "INSERT INTO embeddings (document_id, embedding, model, created_at)
-             VALUES (?1, ?2, 'fixture', 1)",
+             VALUES (?1, ?2, 'AllMiniLML6V2', 1)",
             rusqlite::params![unrelated_duplicate, orthogonal],
         )
         .unwrap();
@@ -13347,18 +14982,23 @@ mod tests {
             .unwrap();
             let bytes = vector
                 .into_iter()
+                .chain(std::iter::repeat_n(0.0, 382))
                 .flat_map(f32::to_le_bytes)
                 .collect::<Vec<_>>();
             conn.execute(
                 "INSERT INTO embeddings (document_id, embedding, model, created_at)
-                 SELECT id, ?1, 'fixture', 1 FROM documents
+                 SELECT id, ?1, 'AllMiniLML6V2', 1 FROM documents
                  WHERE collection='docs' AND relative_path=?2",
                 rusqlite::params![bytes, path],
             )
             .unwrap();
         }
 
-        let out = top_neighbor(&conn, Some(&[1.0, 0.0]));
+        // Retrieval fixtures use the supported model width and identity; the
+        // first two coordinates still provide the independent cosine oracle.
+        let mut query = vec![0.0; 384];
+        query[0] = 1.0;
+        let out = top_neighbor(&conn, Some(&query));
         assert_eq!(
             out,
             [("relevant.md".into(), "related".into())],
@@ -13367,10 +15007,71 @@ mod tests {
 
         let cold = top_neighbor(&conn, None);
         assert_eq!(cold, [("newer-b.md".into(), "related".into())]);
+        query[0] = f32::NAN;
         assert_eq!(
-            top_neighbor(&conn, Some(&[f32::NAN, 0.0])),
+            top_neighbor(&conn, Some(&query)),
             cold,
             "non-finite query scores fall back to stable edge order"
+        );
+    }
+
+    /// A neighbour already among the injected ids, or reached by two edges,
+    /// is listed at most once and never when it was already shown.
+    #[test]
+    fn document_expansion_skips_shown_paths_and_lists_a_target_once() {
+        crate::store::vectors::init_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        crate::store::vectors::init_vector_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', '.', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        for id in ["seed", "shown", "fresh"] {
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+                 VALUES ('docs', ?1, 'h', 1, 1)",
+                [format!("{id}.md")],
+            )
+            .unwrap();
+        }
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (target, relation) in [
+            ("shown.md", "related"),
+            ("fresh.md", "related"),
+            ("fresh.md", "cites"),
+        ] {
+            crate::store::graph::add_edge(
+                &conn,
+                seed_id,
+                target,
+                relation,
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+
+        let shown = std::collections::HashSet::from(["shown.md".to_string()]);
+        let out = doc_graph_neighbors(&conn, &["seed.md".into()], &shown, None).unwrap();
+        let paths: Vec<&str> = out.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["fresh.md"],
+            "shown.md was injected already; fresh.md has two edges"
         );
     }
 
@@ -14732,7 +16433,7 @@ mod tests {
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(&emb),
+                embedding: Some(&crate::llm::embeddings::Vector::minilm(&emb)),
                 embed_when_missing: false,
                 source_path: None,
                 relates: &[],
@@ -14758,7 +16459,7 @@ mod tests {
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(&emb),
+                embedding: Some(&crate::llm::embeddings::Vector::minilm(&emb)),
                 embed_when_missing: false,
                 source_path: None,
                 relates: &[],
@@ -14790,7 +16491,7 @@ mod tests {
                 tags: &[],
                 ttl: None,
                 due_in: None,
-                embedding: Some(&emb),
+                embedding: Some(&crate::llm::embeddings::Vector::minilm(&emb)),
                 embed_when_missing: false,
                 source_path: None,
                 relates: &[],
@@ -15641,6 +17342,39 @@ mod tests {
         assert!(scan_at > old, "scan marker was not refreshed");
     }
 
+    // Catches missing/recent indexes being skipped and duplicate hits on repeated sessions.
+    #[tokio::test]
+    async fn hook_session_start_refreshes_missing_recent_and_unchanged_code() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warmup-entry").await;
+        let source = tmp.path().join("example.rs");
+        std::fs::write(&source, "fn example() { let value = \"first-marker\"; }\n").unwrap();
+        for marker in ["first-marker", "second-marker", "second-marker"] {
+            std::fs::write(
+                &source,
+                format!("fn example() {{ let value = \"{marker}\"; }}\n"),
+            )
+            .unwrap();
+            let result = hook_session_start_impl(&handle, None).await;
+            let body = result["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap();
+            assert!(body.contains("refreshing in background"), "{body}");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while handle.code_reindex_active.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let result = crate::core::text_search::search(tmp.path(), marker, false, None, 10)
+                .unwrap()
+                .expect("session must create the literal index");
+            assert_eq!(result.hits.len(), 1, "{marker}");
+        }
+    }
+
     #[tokio::test]
     async fn hook_session_start_disabled_returns_empty() {
         let tmp = TempDir::new().unwrap();
@@ -15883,6 +17617,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn skipped_prompt_does_not_wait_for_embedding_encounter_sql() {
+        // Catches: an encounter probes SQLite on the response thread or retains
+        // the serving slot while its background SQL waits for another writer.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db = {
+            let slot = handle.ctx.lock().await;
+            let ctx = slot.as_ref().unwrap();
+            let mode: String = ctx
+                .conn
+                .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "delete");
+            ctx.db_path.clone()
+        };
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let writer_db = db.clone();
+        let writer = std::thread::spawn(move || {
+            let conn = rusqlite::Connection::open(writer_db).unwrap();
+            conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            let _ = started.send(());
+            let _ = released.recv_timeout(std::time::Duration::from_secs(10));
+            conn.execute_batch("ROLLBACK").unwrap();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+            .await
+            .expect("the real SQLite writer must acquire its lock")
+            .unwrap();
+        // Verify the external fixture against SQLite, not a hand-set busy flag.
+        let reader =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let blocked =
+            reader
+                .query_row::<i32, _, _>("SELECT version FROM schema_version", [], |row| row.get(0));
+        assert!(matches!(
+            blocked,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        drop(reader);
+        // Start the release timer only after the actual lock is witnessed.
+        let release_timer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let _ = release.send(());
+        });
+        let t0 = std::time::Instant::now();
+        let result = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": "", "session_id": "skipped-probe"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await;
+        let waited = t0.elapsed();
+        let slot_free = handle.ctx.try_lock().is_ok();
+        tokio::task::spawn_blocking(move || {
+            release_timer.join().unwrap();
+            writer.join().unwrap();
+        })
+        .await
+        .unwrap();
+        settle_background_slot_users(&handle).await;
+        assert_eq!(result.unwrap(), json!({}));
+        assert!(
+            waited < std::time::Duration::from_millis(700),
+            "skipped prompt waited for encounter SQL: {waited:?}"
+        );
+        assert!(
+            slot_free,
+            "encounter SQL retained the serving slot after reply"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_prompts_share_one_deadline_instead_of_queueing() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle_with(&tmp, |config| {
@@ -16006,218 +17818,6 @@ mod tests {
         }
     }
 
-    // ── Recall reranker ──────────────────────────────────────────────────────
-
-    fn ms(millis: u64) -> std::time::Duration {
-        std::time::Duration::from_millis(millis)
-    }
-
-    #[tokio::test]
-    async fn a_reranker_slower_than_its_budget_leaves_the_minilm_result_not_a_deadline() {
-        // Catches: the reranker holding its own 700 ms while the hook deadline
-        // is shorter, so the hook is cut at the deadline and the prompt gets no
-        // recall at all instead of the MiniLM result it already had.
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |config| config.hooks.user_prompt_submit_deadline_ms = 500,
-            StubReranker::Scores {
-                delay: ms(2000),
-                score: -9.0,
-            },
-        );
-        seed_memory_entry(&handle, "slow-rerank").await;
-
-        // The first embed of a process loads the model, which takes 230-490 ms
-        // on the rb box and would eat the 500 ms hook deadline
-        // before the reranker starts. Pay it here so the deadline measures the
-        // reranker.
-        let _ = embed_query_off_lock(RECALL_PROMPT).await;
-
-        let t0 = std::time::Instant::now();
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "slow").await;
-
-        assert!(
-            t0.elapsed() < ms(1500),
-            "the hook waited {:?} for a reranker it had no budget for",
-            t0.elapsed()
-        );
-        assert!(
-            additional_context(&result).contains("slow-rerank"),
-            "the MiniLM result must survive a rerank that did not finish: {result} / {row}"
-        );
-        assert_eq!(row["outcome"], "fired", "{row}");
-        assert!(
-            ["timeout", "no_budget"].contains(&row["phases"]["rerank_outcome"].as_str().unwrap()),
-            "{row}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failing_reranker_leaves_the_minilm_result_and_says_so() {
-        // Catches: an error in the reranker dropping the recall the MiniLM gate
-        // had admitted, or going unlogged.
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(&tmp, |_| {}, StubReranker::Fails);
-        seed_memory_entry(&handle, "failing-rerank").await;
-
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "fails").await;
-
-        assert!(additional_context(&result).contains("failing-rerank"));
-        assert_eq!(row["phases"]["rerank_outcome"], "failed", "{row}");
-        assert!(row["phases"]["rerank"].is_u64(), "{row}");
-    }
-
-    #[tokio::test]
-    async fn rerank_score_below_the_floor_injects_nothing_even_when_minilm_admitted_it() {
-        // Catches: the reranker only ever adding entries, so a prompt whose
-        // candidates it scores as unrelated still injects what the cosine gate
-        // let through. The gate is the reranker's top score.
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |_| {},
-            StubReranker::Scores {
-                delay: ms(0),
-                score: -6.0,
-            },
-        );
-        seed_memory_entry(&handle, "gated-out").await;
-
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "below").await;
-
-        assert_eq!(result, json!({}));
-        assert_eq!(row["outcome"], "skipped", "{row}");
-        assert_eq!(row["phases"]["rerank_outcome"], "below_gate", "{row}");
-    }
-
-    #[tokio::test]
-    async fn the_reranker_admits_what_the_cosine_gate_rejected() {
-        // Catches: the reranker's candidates being drawn after the cosine gate,
-        // so the Italian prompts the gate refuses never reach it. `topic` alone
-        // is one shared word, which the store's gate does not admit.
-        let tmp = TempDir::new().unwrap();
-        let plain = make_handle(&tmp);
-        seed_memory_entry(&plain, "rescued").await;
-        let (unaided, _) = prompt_row(&plain, "tell me about the topic", "plain").await;
-        assert_eq!(unaided, json!({}), "the fixture must be below the gate");
-
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |_| {},
-            StubReranker::Scores {
-                delay: ms(0),
-                score: 3.0,
-            },
-        );
-        seed_memory_entry(&handle, "rescued").await;
-        let (result, row) = prompt_row(&handle, "tell me about the topic", "rescue").await;
-
-        assert!(additional_context(&result).contains("rescued"), "{result}");
-        assert_eq!(row["phases"]["rerank_outcome"], "ok", "{row}");
-    }
-
-    #[tokio::test]
-    async fn rerank_italian_and_english_prompts_are_held_to_their_own_floor() {
-        // Catches: one threshold for both languages. -1.5 clears the English
-        // floor (-1.95) and not the Italian one (-1.05), which the Italian
-        // negatives of the fit set need.
-        let score = StubReranker::Scores {
-            delay: ms(0),
-            score: -1.5,
-        };
-        let tmp = TempDir::new().unwrap();
-        let en = make_reranked_handle(&tmp, |_| {}, score);
-        seed_memory_entry(&en, "floor-en").await;
-        let (result, _) = prompt_row(&en, "why does the topic not work as it should", "en").await;
-        assert!(additional_context(&result).contains("floor-en"), "{result}");
-
-        let tmp = TempDir::new().unwrap();
-        let it = make_reranked_handle(
-            &tmp,
-            |_| {},
-            StubReranker::Scores {
-                delay: ms(0),
-                score: -1.5,
-            },
-        );
-        seed_memory_entry(&it, "floor-it").await;
-        let (result, row) =
-            prompt_row(&it, "perche il topic non funziona come dovrebbe", "it").await;
-        assert_eq!(result, json!({}), "{row}");
-        assert_eq!(row["phases"]["rerank_outcome"], "below_gate", "{row}");
-    }
-
-    #[tokio::test]
-    async fn rerank_english_prompts_keep_the_minilm_result_by_default() {
-        // Catches: the unfit English floor gating English prompts: a score of
-        // -9 would drop what MiniLM admitted.
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |config| config.hooks.recall_rerank_languages = vec!["it".into()],
-            StubReranker::Scores {
-                delay: ms(0),
-                score: -9.0,
-            },
-        );
-        seed_memory_entry(&handle, "english-minilm").await;
-
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "en-off").await;
-
-        assert!(
-            additional_context(&result).contains("english-minilm"),
-            "{result}"
-        );
-        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-    }
-
-    #[tokio::test]
-    async fn a_sigil_prompt_is_not_reranked() {
-        // Catches: the reranker gating a prompt that asked for its answer. `*`
-        // keeps the lower MiniLM floor, and a low rerank score must not undo it.
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |_| {},
-            StubReranker::Scores {
-                delay: ms(0),
-                score: -9.0,
-            },
-        );
-        seed_memory_entry(&handle, "asked-for").await;
-
-        let (result, row) = prompt_row(&handle, &format!("* {RECALL_PROMPT}"), "sigil").await;
-
-        assert!(
-            additional_context(&result).contains("asked-for"),
-            "{result}"
-        );
-        assert!(row["phases"].get("rerank_outcome").is_none(), "{row}");
-    }
-
-    #[tokio::test]
-    async fn the_config_key_turns_the_reranker_off() {
-        let tmp = TempDir::new().unwrap();
-        let handle = make_reranked_handle(
-            &tmp,
-            |config| {
-                config.hooks.recall_rerank_languages.clear();
-            },
-            StubReranker::Scores {
-                delay: ms(0),
-                score: -9.0,
-            },
-        );
-        seed_memory_entry(&handle, "rerank-off").await;
-
-        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "off").await;
-
-        assert!(additional_context(&result).contains("rerank-off"));
-        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
-    }
-
     #[tokio::test]
     async fn deadline_zero_disables_the_cut() {
         let tmp = TempDir::new().unwrap();
@@ -16303,7 +17903,7 @@ mod tests {
     #[tokio::test]
     async fn shadow_run_cut_by_the_deadline_is_logged_as_deadline() {
         // Catches: the shadow row arm hardcodes outcome "shadow", so a run cut
-        // after the shadow recall is set is invisible to `mdkb stats` deadline
+        // after the shadow recall is set is invisible to `mdkb status` deadline
         // hits. The number of store acquisitions before the shadow recall is
         // set is not something to hard-code, so stall later and later until the
         // cut lands after it: the first row carrying a shadow object is that one.
@@ -16397,6 +17997,9 @@ mod tests {
     async fn prompt_log_attributes_call_graph_hint_without_recall_hits() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
+        // This checks payload attribution on an empty store, not whether a
+        // background first-open wins a race with the hook's read-only path.
+        ensure_handle_context(&handle).await.unwrap();
         let result = dispatch_call(
             "hook.user_prompt_submit",
             json!({"prompt":"* who calls nonexistentHandler","session_id":"graph-hint"}),
@@ -16406,11 +18009,11 @@ mod tests {
         .await
         .unwrap();
         let context = additional_context(&result);
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert!(
             context.contains("call-graph query"),
-            "fixture must emit hint: {result}"
+            "fixture must emit hint: {result}; event: {row}"
         );
-        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert_eq!(row["payload_bytes"], context.len());
         assert_eq!(row["payload_blocks"]["call_graph_hint"], context.len());
     }
@@ -16612,6 +18215,10 @@ mod tests {
             "{repeated}"
         );
 
+        // Delivery is best effort under admission contention; this control
+        // tests a fresh session after the earlier hook's writes have settled.
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        settle_background_slot_users(&handle).await;
         let fresh = dispatch_call(
             "hook.user_prompt_submit",
             json!({"prompt":"start a subagent","session_id":"fresh-session"}),
@@ -17560,7 +19167,7 @@ mod tests {
     /// sessions and gets promoted — that is the point at which it starts being
     /// injected. Folding promotion into `distilled` would hide the difference
     /// between "the pipeline works" and "the pipeline works and taught the model
-    /// something", which is the whole question `mdkb stats` is asked.
+    /// something", which is the whole question `mdkb status` is asked.
     #[tokio::test]
     async fn mine_episode_records_promotion_separately_from_distillation() {
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
@@ -17819,6 +19426,57 @@ mod tests {
         assert_eq!(cluster.distinct_sessions, 1);
     }
 
+    /// Catches: re-mining a lesson whose promoted prior already expired writes
+    /// the archived row's file back into `entries/`, so doctor reports the
+    /// projection drift this projection step was meant to remove and the next
+    /// sync revives the expired prior.
+    #[tokio::test]
+    async fn mine_episode_does_not_reproject_an_expired_promoted_prior() {
+        let tmp = TempDir::new().unwrap();
+        drop(Context::init(tmp.path()).unwrap());
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
+        let (program, args) = Stub {
+            stdout: distilled,
+            ..Default::default()
+        }
+        .build(tmp.path());
+        let mine = |session: &str| {
+            mine_episode(
+                Arc::clone(&handle),
+                transcript.to_string_lossy().into_owned(),
+                session.to_string(),
+                program.clone(),
+                args.clone(),
+            )
+        };
+        mine("sess-1").await;
+        mine("sess-2").await;
+        {
+            // The prior TTL lapses: the same sweep `mdkb update` runs.
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            let later = chrono::Utc::now().timestamp() + 10 * 365 * 86_400;
+            let expired = crate::store::memory::archive_expired(&ctx.conn, later).unwrap();
+            assert_eq!(expired.len(), 1, "the promoted prior must expire");
+            crate::store::memory_file::dispose_projections(&ctx.conn, &expired);
+            assert_eq!(
+                crate::core::memory_sync::projection_file_and_row_counts(ctx).unwrap(),
+                (0, 0)
+            );
+        }
+        mine("sess-3").await;
+        let guard = handle.ctx.lock().await;
+        let ctx = guard.as_ref().unwrap();
+        assert_eq!(
+            crate::core::memory_sync::projection_file_and_row_counts(ctx).unwrap(),
+            (0, 0),
+            "an archived prior must stay out of entries/"
+        );
+    }
+
     /// The full flagship loop: two independent sessions distill the same lesson,
     /// the cluster crosses the promotion gate, and a trigger-matching PreToolUse
     /// injects it. This lives in-module (not a `tests/` binary) on purpose: the
@@ -17831,6 +19489,8 @@ mod tests {
         use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, get_cluster};
 
         let tmp = TempDir::new().unwrap();
+        // Use the real store layout: make_handle alone creates only .mdkb.
+        drop(Context::init(tmp.path()).unwrap());
         let handle = make_handle(&tmp);
 
         let transcript = tmp.path().join("transcript.jsonl");
@@ -17847,7 +19507,7 @@ mod tests {
         }
         .build(tmp.path());
 
-        for session in ["sess-1", "sess-2"] {
+        for session in ["sess-1", "sess-2", "sess-2"] {
             mine_episode(
                 Arc::clone(&handle),
                 transcript.to_string_lossy().into_owned(),
@@ -17856,6 +19516,15 @@ mod tests {
                 args.clone(),
             )
             .await;
+            // Catches: automatic promotion commits a memory row without its file.
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            let expected = usize::from(session != "sess-1");
+            assert_eq!(
+                crate::core::memory_sync::projection_file_and_row_counts(ctx).unwrap(),
+                (expected, expected),
+                "projection counts after mining {session}"
+            );
         }
 
         // Two distinct sessions crossed the gate: the cluster is promoted and has
@@ -18467,7 +20136,11 @@ mod tests {
         // calls before locking must complete (never hang/panic) whether or not
         // an ONNX model is present. With a model it yields a non-empty vector;
         // without one it degrades to None (BM25 fallback).
-        let out = embed_query_off_lock("hook dispatcher architecture").await;
+        let out = embed_query_off_lock(
+            "hook dispatcher architecture",
+            crate::llm::embeddings::Model::MiniLm,
+        )
+        .await;
         if let Some(v) = out {
             assert!(!v.is_empty(), "an embedding vector must be non-empty");
         }
@@ -18483,13 +20156,21 @@ mod tests {
         // serialize and this margin would collapse.
         crate::llm::release_cached_service();
         let single_t0 = std::time::Instant::now();
-        embed_query_off_lock("warm up the model").await;
+        embed_query_off_lock("warm up the model", crate::llm::embeddings::Model::MiniLm).await;
         let single = single_t0.elapsed();
 
         const N: usize = 8;
         let all_t0 = std::time::Instant::now();
         let handles: Vec<_> = (0..N)
-            .map(|i| tokio::spawn(async move { embed_query_off_lock(&format!("query {i}")).await }))
+            .map(|i| {
+                tokio::spawn(async move {
+                    embed_query_off_lock(
+                        &format!("query {i}"),
+                        crate::llm::embeddings::Model::MiniLm,
+                    )
+                    .await
+                })
+            })
             .collect();
         for h in handles {
             h.await.unwrap();
@@ -18805,6 +20486,8 @@ mod tests {
         release.send(()).unwrap();
         held.await.unwrap();
         let during = during.expect("the prompt waited for the mutation");
+        settle_deferred_writes(Arc::as_ptr(&handle.ctx) as usize).await;
+        settle_background_slot_users(&handle).await;
         let after = prompt_body(&dctx, &handle, "zzhalf please", "half-session-2").await;
 
         assert!(!during.contains("Half applied rule."), "{during}");
@@ -18938,41 +20621,44 @@ mod tests {
         }
     }
 
-    /// Catches (#209-bc4b): a queued write that polls the startup reindex past
-    /// its cap and then opens the store under the flag (a second context over a
-    /// store being rebuilt), or wedges holding the slot lock. At the cap the
-    /// write is given up: it never runs, the slot stays empty and unlocked.
+    /// Catches: initialization beyond the former 600s cap losing required rows
+    /// or opening a second context while the initializer still owns the store.
     #[tokio::test(start_paused = true)]
-    async fn a_queued_write_is_given_up_at_the_reindex_cap() {
+    async fn a_queued_write_survives_the_former_reindex_cap() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         ensure_handle_context(&handle).await.unwrap();
         *handle.ctx.lock().await = None;
         handle.doc_reindex_active.store(true, Ordering::Relaxed);
-
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = Arc::clone(&ran);
-        write_behind_slot(SlotOpener::of(&handle), "cap test", move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        });
-        // The waiter starts its cap clock on its first poll: let it, or the
-        // jump below moves the clock before the cap starts counting.
+        write_behind_slot(
+            SlotOpener::of(&handle),
+            "retained cap test",
+            counting_write(&ran),
+        );
         settle_blocking().await;
-        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
-        let key = Arc::as_ptr(&handle.ctx) as usize;
-        wait_until_blocking("the capped queue retired", || {
-            !deferred_writes().contains_key(&key)
-        })
-        .await;
-
+        tokio::time::advance(std::time::Duration::from_secs(601)).await;
+        settle_blocking().await;
         assert_eq!(
             ran.load(Ordering::SeqCst),
             0,
-            "the write ran under the flag"
+            "write ran under initialization"
         );
-        let guard = handle.ctx.try_lock().expect("the slot lock was left held");
-        assert!(guard.is_none(), "the store was opened under the flag");
+        let key = Arc::as_ptr(&handle.ctx) as usize;
+        assert!(
+            deferred_writes().contains_key(&key),
+            "initialization lost queued write"
+        );
+        assert!(
+            handle.ctx.try_lock().unwrap().is_none(),
+            "store opened under initialization"
+        );
+        handle.doc_reindex_active.store(false, Ordering::Release);
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        wait_until_blocking("retained write drained", || {
+            ran.load(Ordering::SeqCst) == 1 && !deferred_writes().contains_key(&key)
+        })
+        .await;
     }
 
     /// Catches (#209-bc4b): the wait for the reindex being a fixed delay or the
@@ -19447,46 +21133,32 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), (0..20).collect::<Vec<_>>());
     }
 
-    /// Catches (#209-bc4b): the cap path leaving its queue entry marked as
-    /// owned by a waiter that is gone, so every later write joins a queue
-    /// nobody drains; or replaying the writes it gave up on once the reindex is
-    /// over. Three writes are given up at the cap; one queued afterwards runs
-    /// alone.
+    /// Catches: writes retained past startup's former cap being stranded or
+    /// replayed twice when a fresh enqueue arrives after initialization.
     #[tokio::test(start_paused = true)]
-    async fn after_the_cap_the_queue_is_clear_and_later_writes_run_alone() {
+    async fn retained_reindex_writes_and_fresh_writes_all_run_once() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         ensure_handle_context(&handle).await.unwrap();
         *handle.ctx.lock().await = None;
-        handle.doc_reindex_active.store(true, Ordering::Relaxed);
+        handle.doc_reindex_active.store(true, Ordering::Release);
         let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for _ in 0..3 {
-            write_behind_slot(SlotOpener::of(&handle), "capped", counting_write(&ran));
+            write_behind_slot(SlotOpener::of(&handle), "retained", counting_write(&ran));
         }
-        // The waiter starts its cap clock on its first poll: let it, or the
-        // jump below moves the clock before the cap starts counting.
         settle_blocking().await;
-        tokio::time::advance(WRITE_BEHIND_REINDEX_WAIT + std::time::Duration::from_secs(1)).await;
+        tokio::time::advance(std::time::Duration::from_secs(601)).await;
+        settle_blocking().await;
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
         let key = Arc::as_ptr(&handle.ctx) as usize;
-        wait_until_blocking("the capped queue retired", || {
-            !deferred_writes().contains_key(&key)
+        assert_eq!(deferred_writes().get(&key).unwrap().writes.len(), 3);
+        handle.doc_reindex_active.store(false, Ordering::Release);
+        write_behind_slot(SlotOpener::of(&handle), "fresh", counting_write(&ran));
+        tokio::time::advance(std::time::Duration::from_millis(200)).await;
+        wait_until_blocking("all retained and fresh writes drained once", || {
+            ran.load(Ordering::SeqCst) == 4 && !deferred_writes().contains_key(&key)
         })
         .await;
-        assert_eq!(ran.load(Ordering::SeqCst), 0);
-        assert!(
-            !deferred_writes().contains_key(&key),
-            "the cap left a queue entry behind"
-        );
-
-        handle.doc_reindex_active.store(false, Ordering::Relaxed);
-        write_behind_slot(SlotOpener::of(&handle), "after", counting_write(&ran));
-        tokio::time::advance(std::time::Duration::from_millis(200)).await;
-        wait_until_blocking("the later write ran", || ran.load(Ordering::SeqCst) == 1).await;
-        assert_eq!(
-            ran.load(Ordering::SeqCst),
-            1,
-            "lost, or the capped writes came back"
-        );
     }
 
     /// Catches (#209-bc4b): a waiter cancelled with its runtime (shutdown, or
@@ -19650,24 +21322,34 @@ mod tests {
         let handle = make_handle(&tmp);
         seed_trigger_memory(&handle, "bash-rule", "Use rg.", r#"[{"tool":"Bash"}]"#).await;
         let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
-        let releaser = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            release.send(()).unwrap();
-        });
         let event =
             json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "twice"});
+        let during = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                hook_post_tool_use_impl(&handle, &event),
+                hook_post_tool_use_impl(&handle, &event)
+            )
+        })
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let (a, b) = during.expect("contended hooks waited for the serving slot");
+        assert!(!additional_context(&a).contains("bash-rule"), "{a}");
+        assert!(!additional_context(&b).contains("bash-rule"), "{b}");
+        assert_eq!(recorded_trigger_injections(&handle).await, 0);
+        // Both omitted snapshots remain eligible. Racing authoritative retries
+        // must still produce exactly one delivery and one persisted injection.
         let (a, b) = tokio::join!(
             hook_post_tool_use_impl(&handle, &event),
             hook_post_tool_use_impl(&handle, &event)
         );
-        releaser.join().unwrap();
-        held.await.unwrap();
 
         let delivered = [&a, &b]
             .iter()
             .filter(|out| additional_context(out).contains("bash-rule"))
             .count();
         assert_eq!(delivered, 1, "a: {a} b: {b}");
+        assert_eq!(recorded_trigger_injections(&handle).await, 1);
     }
 
     /// Catches (#209-bc4b): the query-event row a prompt writes while the slot is
@@ -20651,7 +22333,7 @@ mod tests {
     }
 
     /// Waits until the drain for `handle` has retired its queue.
-    fn critic_r6_wait_retired(handle: &RepoHandle) {
+    fn wait_retired(handle: &RepoHandle) {
         let key = Arc::as_ptr(&handle.ctx) as usize;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while deferred_writes().contains_key(&key) {
@@ -20664,7 +22346,7 @@ mod tests {
     }
 
     /// True when no process holds the project writer lock.
-    fn critic_r6_writer_lock_free(db_path: &std::path::Path) -> bool {
+    fn writer_lock_free(db_path: &std::path::Path) -> bool {
         let lock = crate::store::mutation_lock::writer_lock_path(db_path);
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -20681,7 +22363,7 @@ mod tests {
     /// lock. A runtime that has already shut down drops the future inside
     /// `spawn`, so a blocking thread of a shutting-down daemon deadlocks itself.
     #[test]
-    fn critic_r6_enqueue_on_a_shut_down_runtime_does_not_deadlock() {
+    fn enqueue_on_a_shut_down_runtime_does_not_deadlock() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -20705,7 +22387,7 @@ mod tests {
     /// entered the map or while holding its lock, poisoning the map or leaving a
     /// queue that pins the slot.
     #[test]
-    fn critic_r6_enqueue_without_a_runtime_leaves_no_queue() {
+    fn enqueue_without_a_runtime_leaves_no_queue() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let key = Arc::as_ptr(&handle.ctx) as usize;
@@ -20721,7 +22403,7 @@ mod tests {
     /// corrupt row, so another process's writer waits forever; corruption not
     /// closing the slot; rows after a corrupt row running against a closed slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn critic_r6_batch_with_panic_and_corruption_releases_admission_and_closes_slot() {
+    async fn batch_with_panic_and_corruption_releases_admission_and_closes_slot() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         ensure_handle_context(&handle).await.unwrap();
@@ -20760,7 +22442,7 @@ mod tests {
         });
         drop(held);
         let probe = Arc::clone(&handle);
-        tokio::task::spawn_blocking(move || critic_r6_wait_retired(&probe))
+        tokio::task::spawn_blocking(move || wait_retired(&probe))
             .await
             .unwrap();
         assert_eq!(*ran.lock().unwrap(), ["panics", "survives", "corrupt"]);
@@ -20770,7 +22452,7 @@ mod tests {
                 probe.ctx.try_lock().unwrap().is_none(),
                 "corruption left the slot open"
             );
-            critic_r6_writer_lock_free(&db_path)
+            writer_lock_free(&db_path)
         })
         .await
         .unwrap();
@@ -20780,7 +22462,7 @@ mod tests {
     /// Catches (critic r6): a batch dropped, instead of waiting, when another
     /// writer holds the project lock (a non-blocking or timed-out admission).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn critic_r6_batch_waits_for_a_foreign_writer_instead_of_dropping_rows() {
+    async fn batch_waits_for_a_foreign_writer_instead_of_dropping_rows() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         ensure_handle_context(&handle).await.unwrap();
@@ -20800,8 +22482,8 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
-            handle.ctx.try_lock().is_err(),
-            "the drain does not hold the slot while it waits"
+            handle.ctx.try_lock().is_ok(),
+            "the drain must release the slot while it waits"
         );
         drop(foreign);
         tokio::time::timeout(std::time::Duration::from_secs(10), written)

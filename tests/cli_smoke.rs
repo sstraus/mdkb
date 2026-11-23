@@ -16,6 +16,8 @@ use std::process::{Output, Stdio};
 
 #[path = "common/cli.rs"]
 mod cli;
+#[path = "common/recall.rs"]
+mod recall;
 use cli::run;
 
 fn run_env(args: &[&str], cwd: &Path, env: &[(&str, &str)]) -> Output {
@@ -421,7 +423,10 @@ fn smoke_namespaced_hook_logs_telemetry_into_its_own_store() {
 #[test]
 fn smoke_session_start_reports_doctor_findings_and_is_silent_when_healthy() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index"], &repo.root), "healthy code index");
+    assert_ok(
+        &run(&["update", "--code"], &repo.root),
+        "healthy code index",
+    );
     let env = [("MDKB_NO_DAEMON", "1")];
     assert_ok(
         &run(&["setup", "hooks", "claude"], &repo.root),
@@ -583,7 +588,10 @@ fn smoke_update() {
 #[test]
 fn smoke_update_failed_code_reindex_exits_nonzero() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index"], &repo.root), "initial code index");
+    assert_ok(
+        &run(&["update", "--code"], &repo.root),
+        "initial code index",
+    );
     let conn = rusqlite::Connection::open(repo.root.join(".mdkb/code.sqlite")).unwrap();
     conn.execute_batch(
         "CREATE TRIGGER reject_code_symbol BEFORE INSERT ON code_symbols BEGIN
@@ -617,7 +625,10 @@ fn smoke_doctor_reports_empty_code_index_and_clears_after_indexing() {
             .iter()
             .any(|f| f["id"] == "code.index")
     );
-    assert_ok(&run(&["code", "index"], &repo.root), "populate code index");
+    assert_ok(
+        &run(&["update", "--code"], &repo.root),
+        "populate code index",
+    );
     let out = run(&["--format", "json", "doctor"], &repo.root);
     let findings: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
     assert!(
@@ -692,56 +703,38 @@ fn smoke_update_machine_formats_emit_a_single_document() {
 #[test]
 fn smoke_embed() {
     let repo = Repo::new();
-    // Default/empty language list keeps embed MiniLM-only, with no reranker fetch.
+    // The default embedding model is also selectable explicitly.
     std::fs::write(
         repo.root.join(".mdkb/config.toml"),
-        "[hooks]\nrecall_rerank_languages = []\n",
+        "[embedding]\nmodel = \"minilm\"\n",
     )
     .unwrap();
     run(&["update"], &repo.root);
-    let out = run(&["embed"], &repo.root);
-    assert_ok(&out, "embed");
+    // Real inference needs the pinned MiniLM weights. An uncached model made
+    // `embed` fetch them from huggingface.co, which fails behind a TLS-intercepting
+    // proxy and reaches the network from a test. Name the missing prerequisite and
+    // keep the fetch pointed at a closed port so this test can never download.
+    recall::require_production_model();
+    let out = run_env(
+        &["update", "--reembed"],
+        &repo.root,
+        &[("HF_ENDPOINT", "http://127.0.0.1:9")],
+    );
+    assert_ok(&out, "update --reembed");
 }
 
-/// An offline machine with the reranker on: the vectors must still be written,
-/// and the missing reranker weights are their own non-zero exit.
-#[cfg(unix)]
 #[test]
-fn embed_still_embeds_when_the_reranker_download_fails() {
-    // Catches: the weights fetched before the embedding, so a failed download
-    // aborts `mdkb embed` with no vectors written.
+fn embed_rejects_removed_rerank_configuration() {
+    // Catches silently accepting retired model controls during an explicit embed.
     let repo = Repo::new();
     std::fs::write(
         repo.root.join(".mdkb/config.toml"),
         "[hooks]\nrecall_rerank_languages = [\"it\"]\n",
     )
     .unwrap();
-    run(&["update"], &repo.root);
-    // A model cache that holds MiniLM but not the reranker, and an endpoint
-    // nothing listens on.
-    let cache = tempfile::tempdir().expect("tempdir");
-    let minilm = "models--Qdrant--all-MiniLM-L6-v2-onnx";
-    std::os::unix::fs::symlink(
-        cli::model_cache_dir().join(minilm),
-        cache.path().join(minilm),
-    )
-    .expect("link the MiniLM cache");
-    let cache_dir = cache.path().to_str().unwrap();
-    let out = run_env(
-        &["embed"],
-        &repo.root,
-        &[
-            ("FASTEMBED_CACHE_DIR", cache_dir),
-            ("HF_ENDPOINT", "http://127.0.0.1:1"),
-        ],
-    );
-    assert!(
-        !out.status.success(),
-        "a failed reranker fetch must exit non-zero"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("embeddings are done"), "{stderr}");
-    assert!(stdout(&out).contains("Generated:"), "{}", stdout(&out));
+    let out = run(&["update", "--reembed"], &repo.root);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("removed"));
 }
 
 #[test]
@@ -761,7 +754,7 @@ fn empty_collection_store_is_explicit_for_search_graph_and_stats() {
     for (args, succeeds) in [
         (&["search", "nothing"][..], true),
         (&["graph", "links", "missing"][..], false),
-        (&["stats"][..], true),
+        (&["status"][..], true),
     ] {
         let out = run(args, root);
         assert_eq!(
@@ -799,12 +792,12 @@ fn smoke_search_scope_memory() {
 #[test]
 fn smoke_dup_without_a_code_index() {
     let repo = Repo::new();
-    let out = run(&["dup"], &repo.root);
+    let out = run(&["code", "dup"], &repo.root);
     assert_ok(&out, "dup without a code index");
     let text = stdout(&out);
     assert!(text.contains("No code index"), "dup said: {text}");
     assert!(
-        text.contains("mdkb code index"),
+        text.contains("mdkb update --code"),
         "and must say what to run: {text}"
     );
 }
@@ -820,9 +813,12 @@ fn smoke_dup_without_a_code_index() {
 #[test]
 fn smoke_dup_since_an_unknown_ref_fails_rather_than_reporting_nothing() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
-    let out = run(&["dup", "--since", "no-such-ref-anywhere"], &repo.root);
+    let out = run(
+        &["code", "dup", "--since", "no-such-ref-anywhere"],
+        &repo.root,
+    );
 
     assert!(
         !out.status.success(),
@@ -839,7 +835,10 @@ fn smoke_dup_since_an_unknown_ref_fails_rather_than_reporting_nothing() {
 #[test]
 fn smoke_dup_since_rejects_an_option_like_ref() {
     let repo = Repo::new();
-    let out = run(&["dup", "--since", "--upload-pack=evil"], &repo.root);
+    let out = run(
+        &["code", "dup", "--since", "--upload-pack=evil"],
+        &repo.root,
+    );
     assert!(!out.status.success(), "must refuse: {}", stdout(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -863,7 +862,7 @@ fn smoke_dup_since_rejects_an_option_like_ref() {
 #[test]
 fn smoke_dup_semantic_pass_is_opt_in() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     let cache_dir = repo.root.join("fastembed-empty");
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -877,7 +876,7 @@ fn smoke_dup_semantic_pass_is_opt_in() {
     ];
     const REACHED_FOR_A_MODEL: &str = "duplication model unavailable";
 
-    let plain = run_env(&["dup"], &repo.root, &offline);
+    let plain = run_env(&["code", "dup"], &repo.root, &offline);
     assert_ok(&plain, "dup");
     let stderr = String::from_utf8_lossy(&plain.stderr);
     assert!(
@@ -886,8 +885,8 @@ fn smoke_dup_semantic_pass_is_opt_in() {
     );
 
     for args in [
-        ["dup", "--semantic"].as_slice(),
-        ["dup", "--threshold", "0.8"].as_slice(),
+        ["code", "dup", "--semantic"].as_slice(),
+        ["code", "dup", "--threshold", "0.8"].as_slice(),
     ] {
         let label = args.join(" ");
         let out = run_env(args, &repo.root, &offline);
@@ -913,7 +912,7 @@ fn smoke_dup_semantic_pass_is_opt_in() {
 #[test]
 fn smoke_coupling_without_a_code_index() {
     let repo = Repo::new();
-    let out = run(&["coupling"], &repo.root);
+    let out = run(&["code", "coupling"], &repo.root);
     assert_ok(&out, "coupling without a code index");
     let text = stdout(&out);
     assert!(text.contains("Hidden Coupling"), "coupling said: {text}");
@@ -931,6 +930,7 @@ fn smoke_coupling_accepts_its_overrides() {
     let repo = Repo::new();
     let out = run(
         &[
+            "code",
             "coupling",
             "--min-cochanges",
             "3",
@@ -951,40 +951,40 @@ fn smoke_coupling_accepts_its_overrides() {
 #[test]
 fn smoke_dup_honours_the_global_format_flag() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
-    let json = stdout(&run(&["dup", "--format", "json"], &repo.root));
+    let json = stdout(&run(&["code", "dup", "--format", "json"], &repo.root));
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .unwrap_or_else(|e| panic!("`dup --format json` must emit JSON ({e}), got: {json}"));
     assert!(value["findings"].is_array(), "{value}");
     assert!(value["clusters"].is_number(), "{value}");
 
-    let csv = stdout(&run(&["dup", "--format", "csv"], &repo.root));
+    let csv = stdout(&run(&["code", "dup", "--format", "csv"], &repo.root));
     assert!(
         csv.starts_with("cluster_hash,cluster_name,"),
         "`dup --format csv` must emit a CSV header, got: {csv}"
     );
 
     // text and markdown stay the prose report, which is markdown already.
-    let text = stdout(&run(&["dup"], &repo.root));
+    let text = stdout(&run(&["code", "dup"], &repo.root));
     assert!(text.starts_with("# Duplication"), "{text}");
     assert_eq!(
         text,
-        stdout(&run(&["dup", "--format", "markdown"], &repo.root))
+        stdout(&run(&["code", "dup", "--format", "markdown"], &repo.root))
     );
 }
 
 #[test]
 fn smoke_coupling_honours_the_global_format_flag() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index", "src"], &repo.root), "code index");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
-    let json = stdout(&run(&["coupling", "--format", "json"], &repo.root));
+    let json = stdout(&run(&["code", "coupling", "--format", "json"], &repo.root));
     let value: serde_json::Value = serde_json::from_str(json.trim())
         .unwrap_or_else(|e| panic!("`coupling --format json` must emit JSON ({e}), got: {json}"));
     assert!(value["findings"].is_array(), "{value}");
 
-    let csv = stdout(&run(&["coupling", "--format", "csv"], &repo.root));
+    let csv = stdout(&run(&["code", "coupling", "--format", "csv"], &repo.root));
     assert!(
         csv.starts_with("file_a,file_b,cochanges"),
         "`coupling --format csv` must emit a CSV header, got: {csv}"
@@ -998,7 +998,7 @@ fn smoke_coupling_honours_the_global_format_flag() {
 fn smoke_dup_format_json_without_an_index_says_so_rather_than_returning_an_empty_list() {
     let repo = Repo::new();
 
-    let out = run(&["dup", "--format", "json"], &repo.root);
+    let out = run(&["code", "dup", "--format", "json"], &repo.root);
 
     assert_ok(&out, "dup --format json without a code index");
     let text = stdout(&out);
@@ -1018,7 +1018,7 @@ fn smoke_search_scope_duplicates_matches_dup() {
     assert_ok(&scoped, "search --scope duplicates");
     assert_eq!(
         stdout(&scoped),
-        stdout(&run(&["dup"], &repo.root)),
+        stdout(&run(&["code", "dup"], &repo.root)),
         "the two spellings must not drift"
     );
 }
@@ -1068,17 +1068,44 @@ fn smoke_get_with_lines() {
 }
 
 #[test]
-fn smoke_mget() {
+fn smoke_get_glob_with_collection() {
     let repo = Repo::new();
     run(&["update"], &repo.root);
-    let out = run(&["mget", "docs/*.md"], &repo.root);
-    assert_ok(&out, "mget");
+    let out = run(&["get", "docs/*.md", "--collection", "docs"], &repo.root);
+    assert_ok(&out, "get GLOB --collection");
+}
+
+/// A removed command or flag fails as a usage error (exit 2) that names the
+/// command that works. The renamed top-level commands (`mget`, `history`, ...)
+/// are rows of the error table in `tests/cli_errors.rs`.
+#[test]
+fn smoke_removed_commands_name_their_replacement() {
+    let repo = Repo::new();
+    for (args, needle) in [
+        (&["hook", "status", "--root", "."][..], "was removed"),
+        (&["code", "find", "greet", "--file", "lib"], "--path"),
+        (&["code", "search", "greet", "-f", "lib"], "--path"),
+    ] {
+        let out = run(args, &repo.root);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "`mdkb {}`: {stderr}",
+            args.join(" ")
+        );
+        assert!(
+            stderr.contains(needle) && stderr.contains("Run: mdkb "),
+            "`mdkb {}` must say `{needle}` and name a command: {stderr}",
+            args.join(" ")
+        );
+    }
 }
 
 #[test]
 fn smoke_stats() {
     let repo = Repo::new();
-    let out = run(&["stats", "--no-color"], &repo.root);
+    let out = run(&["status", "--no-color"], &repo.root);
     assert_ok(&out, "stats");
 }
 
@@ -1088,7 +1115,7 @@ fn smoke_stats_json() {
     // Story 188-a540: the dashboard reads doctor findings from `stats`,
     // because TUICommander's execCli drops stdout on a non-zero exit and
     // `mdkb doctor` exits 1 exactly when there is something to show.
-    let out = run(&["--format", "json", "stats"], &repo.root);
+    let out = run(&["--format", "json", "status"], &repo.root);
     assert_ok(&out, "stats --format json with doctor findings");
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("stats json");
     let ids: Vec<&str> = v["doctor"]
@@ -1102,7 +1129,7 @@ fn smoke_stats_json() {
         "unregistered hooks in a fresh repo: {ids:?}"
     );
 
-    let out = run(&["--format", "json", "stats", "--no-color"], &repo.root);
+    let out = run(&["--format", "json", "status", "--no-color"], &repo.root);
     assert_ok(&out, "stats --format json");
     let s = stdout(&out);
     if !s.trim().is_empty() {
@@ -1401,6 +1428,17 @@ fn smoke_memory_lifecycle() {
 
     let out = run(&["memory", "search", "smoke test"], &repo.root);
     assert_ok(&out, "memory search");
+
+    // `memory search` is an alias: same results as `search --scope memory`.
+    let aliased = run(&["memory", "search", "smoke test"], &repo.root);
+    let canonical = run(&["search", "smoke test", "--scope", "memory"], &repo.root);
+    assert_ok(&canonical, "search --scope memory");
+    assert!(
+        stdout(&canonical).contains("smoke-test-entry"),
+        "the canonical form must find the entry: {}",
+        stdout(&canonical)
+    );
+    assert_eq!(stdout(&aliased), stdout(&canonical));
 
     let out = run(&["memory", "warmup"], &repo.root);
     assert_ok(&out, "memory warmup");
@@ -1787,8 +1825,9 @@ fn smoke_evolve_and_history() {
     let out = run(
         &[
             "evolve",
-            "supersedes",
+            "link",
             "v2.md",
+            "supersedes",
             "guide.md",
             "-r",
             "newer version",
@@ -1797,14 +1836,14 @@ fn smoke_evolve_and_history() {
     );
     assert_ok(&out, "evolve supersedes");
 
-    let out = run(&["history", "guide.md"], &repo.root);
-    assert_ok(&out, "history");
+    let out = run(&["evolve", "history", "guide.md"], &repo.root);
+    assert_ok(&out, "evolve history");
 
-    let out = run(&["current", "guide.md"], &repo.root);
-    assert_ok(&out, "current");
+    let out = run(&["evolve", "current", "guide.md"], &repo.root);
+    assert_ok(&out, "evolve current");
 
-    let out = run(&["superseded-by", "guide.md"], &repo.root);
-    assert_ok(&out, "superseded-by");
+    let out = run(&["evolve", "superseded-by", "guide.md"], &repo.root);
+    assert_ok(&out, "evolve superseded-by");
 }
 
 // ── Knowledge graph ─────────────────────────────────────────────────
@@ -2030,17 +2069,29 @@ fn smoke_graph_collection_prefixed_ref() {
 fn smoke_code_lifecycle() {
     let repo = Repo::new();
 
-    let out = run(&["code", "init"], &repo.root);
-    assert_ok(&out, "code init");
+    let out = run(&["update", "--code"], &repo.root);
+    assert_ok(&out, "update --code");
 
-    let out = run(&["code", "index", "src/"], &repo.root);
-    assert_ok(&out, "code index");
-
-    let out = run(&["code", "info"], &repo.root);
-    assert_ok(&out, "code info");
+    let out = run(&["--format", "json", "status"], &repo.root);
+    assert_ok(&out, "status");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(status["code"]["symbols"].as_u64().unwrap() > 0, "{status}");
 
     let out = run(&["code", "search", "greet"], &repo.root);
     assert_ok(&out, "code search");
+
+    // `--path` is a prefix: a directory prefix keeps the hit, a substring of
+    // the file name alone does not.
+    let out = run(&["code", "search", "greet", "--path", "src/"], &repo.root);
+    assert_ok(&out, "code search --path src/");
+    assert!(stdout(&out).contains("greet"), "{}", stdout(&out));
+    let out = run(&["code", "search", "greet", "--path", "lib"], &repo.root);
+    assert_ok(&out, "code search --path lib");
+    assert!(
+        !stdout(&out).contains("greet"),
+        "`lib` is not a prefix of src/lib.rs: {}",
+        stdout(&out)
+    );
 
     let out = run(&["code", "find", "greet"], &repo.root);
     assert_ok(&out, "code find");
@@ -2087,8 +2138,8 @@ fn smoke_code_impact_separates_the_ambiguous_frontier_and_says_where_it_stopped(
     )
     .unwrap();
 
-    assert_ok(&run(&["code", "init"], &repo.root), "code init");
-    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code init");
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     let out = run(&["code", "impact", "target", "--depth", "2"], &repo.root);
     assert_ok(&out, "code impact");
@@ -2133,7 +2184,7 @@ fn smoke_code_find_caps_output_and_reports_total() {
     let repo = Repo::new();
 
     // A boilerplate name matches once per file. An uncapped list is what makes
-    // `search --scope symbols tests` dump hundreds of lines into a context
+    // `code search tests` dump hundreds of lines into a context
     // window, so the cap must hold — and the dropped matches must still be
     // reported, or a capped list reads as the complete set.
     for n in 0..5 {
@@ -2143,8 +2194,8 @@ fn smoke_code_find_caps_output_and_reports_total() {
         )
         .unwrap();
     }
-    run(&["code", "init"], &repo.root);
-    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+    run(&["update", "--code"], &repo.root);
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     let out = run(&["code", "find", "tests", "--limit", "2"], &repo.root);
     assert_ok(&out, "code find --limit");
@@ -2200,8 +2251,8 @@ fn smoke_kind_filter_fills_the_limit() {
     }
     std::fs::write(repo.root.join("src/probes.rs"), source).unwrap();
 
-    run(&["code", "init"], &repo.root);
-    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+    run(&["update", "--code"], &repo.root);
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     let out = run(
         &[
@@ -2225,8 +2276,8 @@ fn smoke_kind_filter_fills_the_limit() {
 #[test]
 fn smoke_search_scope_symbols_is_fuzzy() {
     let repo = Repo::new();
-    run(&["code", "init"], &repo.root);
-    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+    run(&["update", "--code"], &repo.root);
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     // The MCP server answers scope=symbols with a substring match. The CLI used
     // to answer the same scope with exact name equality, so an agent got
@@ -2243,8 +2294,8 @@ fn smoke_search_scope_symbols_is_fuzzy() {
 #[test]
 fn smoke_search_scope_code_is_semantic() {
     let repo = Repo::new();
-    run(&["code", "init"], &repo.root);
-    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+    run(&["update", "--code"], &repo.root);
+    assert_ok(&run(&["update", "--code"], &repo.root), "code index");
 
     // `--scope code` used to run the same substring search as `--scope symbols`
     // while the help promised semantic search. Disabling semantic search is the
@@ -2268,42 +2319,79 @@ fn smoke_search_scope_code_is_semantic() {
     );
 }
 
-// ── Experiment ──────────────────────────────────────────────────────
+// ── Metrics ─────────────────────────────────────────────────────────
 
+/// Catches: `metrics status` reading only the repo's tracked config.toml and
+/// reporting "disabled" in a repo the daemon.toml opt-in covers (story 083-74c1).
 #[test]
-fn smoke_experiment_lifecycle() {
+fn smoke_metrics_status_reports_the_daemon_toml_opt_in() {
     let repo = Repo::new();
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[graph]\nenabled = true\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
+    std::fs::write(
+        home.path().join(".mdkb/daemon.toml"),
+        "[telemetry]\nquery_events = true\nretention_days = 14\n",
+    )
+    .unwrap();
+    let home_env = [("HOME", home.path().to_str().unwrap())];
 
-    let out = run(
-        &[
-            "experiment",
-            "create",
-            "smoke-exp",
-            "--config-a",
-            r#"{"model":"v1"}"#,
-            "--config-b",
-            r#"{"model":"v2"}"#,
-            "-d",
-            "smoke test experiment",
-        ],
-        &repo.root,
+    let out = run_env(&["--format", "json", "status"], &repo.root, &home_env);
+    assert_ok(&out, "status");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(status["telemetry"]["enabled"], true);
+    assert_eq!(status["telemetry"]["retention_days"], 14);
+
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[telemetry]\nquery_events = false\n",
+    )
+    .unwrap();
+    let out = run_env(&["--format", "json", "status"], &repo.root, &home_env);
+    assert_ok(&out, "status, repo opts out");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        status["telemetry"]["enabled"], false,
+        "explicit repo key wins"
     );
-    assert_ok(&out, "experiment create");
-
-    let out = run(&["experiment", "list"], &repo.root);
-    assert_ok(&out, "experiment list");
-
-    let out = run(&["experiment", "list", "--running"], &repo.root);
-    assert_ok(&out, "experiment list --running");
-
-    let out = run(&["experiment", "status", "smoke-exp"], &repo.root);
-    assert_ok(&out, "experiment status");
-
-    let out = run(&["experiment", "cancel", "smoke-exp"], &repo.root);
-    assert_ok(&out, "experiment cancel");
 }
 
-// ── Metrics ─────────────────────────────────────────────────────────
+/// Catches: `metrics status` failing, or dropping the repo's own opt-in, when
+/// `daemon.toml` carries a `[telemetry]` value the typed layer cannot parse
+/// (a negative `retention_days` for the new `Option<u32>` key).
+#[test]
+fn smoke_metrics_status_survives_an_unparseable_daemon_toml() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[telemetry]\nquery_events = true\nretention_days = 9\n",
+    )
+    .unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
+    std::fs::write(
+        home.path().join(".mdkb/daemon.toml"),
+        "[telemetry]\nquery_events = true\nretention_days = -1\n",
+    )
+    .unwrap();
+
+    let out = run_env(
+        &["--format", "json", "status"],
+        &repo.root,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    assert_ok(&out, "status with a bad daemon.toml");
+    let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        status["telemetry"]["enabled"], true,
+        "repo's own opt-in still reported"
+    );
+    assert_eq!(status["telemetry"]["retention_days"], 9);
+}
 
 #[test]
 fn smoke_metrics() {
@@ -2324,12 +2412,12 @@ fn smoke_metrics() {
     assert!(config.contains("retention_days = 14"));
     assert!(repo.root.join(".mdkb/telemetry.key").is_file());
 
-    let out = run(&["--format", "json", "metrics", "status"], &repo.root);
-    assert_ok(&out, "metrics status");
+    let out = run(&["--format", "json", "status"], &repo.root);
+    assert_ok(&out, "status");
     let status: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(status["enabled"], true);
-    assert_eq!(status["retention_days"], 14);
-    assert_eq!(status["key_present"], true);
+    assert_eq!(status["telemetry"]["enabled"], true);
+    assert_eq!(status["telemetry"]["retention_days"], 14);
+    assert_eq!(status["telemetry"]["key_present"], true);
 
     let out = run(&["metrics", "show"], &repo.root);
     assert_ok(&out, "metrics show");
@@ -2565,7 +2653,10 @@ fn priors_failing(message: &str) -> String {
 #[test]
 fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
     let repo = Repo::new();
-    assert_ok(&run(&["code", "index"], &repo.root), "healthy code index");
+    assert_ok(
+        &run(&["update", "--code"], &repo.root),
+        "healthy code index",
+    );
 
     let out = run(&["doctor"], &repo.root);
     assert!(!out.status.success(), "unregistered hooks are an error");
@@ -2617,7 +2708,7 @@ fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
     assert_eq!(json["findings"][0]["severity"], "info");
 }
 
-/// `setup check` is the answer to "is the distiller actually working?", which
+/// `doctor --full` is the answer to "is the distiller actually working?", which
 /// until now could only be answered by reading the daemon log that never
 /// recorded it. It runs the configured CLI once and reports what it said.
 #[test]
@@ -2625,7 +2716,7 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     let repo = Repo::new();
     let config = repo.root.join(".mdkb").join("config.toml");
 
-    // `setup check` reports hook drift as well as the distiller, and unregistered
+    // `doctor` reports hook drift as well as the distiller, and unregistered
     // hooks are a nonzero exit — correctly, they mean no event ever fires. This
     // test is about the distiller half, so register the hooks first and leave the
     // exit code free to say something about the distiller alone.
@@ -2634,9 +2725,15 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
         "register hooks so the check has no drift to report",
     );
 
+    // The fixture has source files; an unbuilt code index is an error finding.
+    assert_ok(
+        &run(&["update", "--code"], &repo.root),
+        "build the code index",
+    );
+
     // Nothing configured: a clear "not configured", not a failure.
-    let out = run(&["setup", "check"], &repo.root);
-    assert_ok(&out, "setup check without a distiller");
+    let out = run(&["doctor", "--full"], &repo.root);
+    assert_ok(&out, "doctor --full without a distiller");
     assert!(
         stdout(&out).contains("not configured"),
         "got: {}",
@@ -2658,8 +2755,8 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     // parse error.
     //
     std::fs::write(&config, priors_printing(&answer)).unwrap();
-    let out = run(&["setup", "check"], &repo.root);
-    assert_ok(&out, "setup check with a working distiller");
+    let out = run(&["doctor", "--full"], &repo.root);
+    assert_ok(&out, "doctor --full with a working distiller");
     assert!(
         stdout(&out).contains("Do not edit generated files"),
         "the lesson proves the round-trip, got: {}",
@@ -2669,7 +2766,7 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     // A broken distiller: non-zero exit, and the reason it gave on stderr is
     // quoted back. This is the case that was invisible for six weeks.
     std::fs::write(&config, priors_failing("unexpected status 400 Bad Request")).unwrap();
-    let out = run(&["setup", "check"], &repo.root);
+    let out = run(&["doctor", "--full"], &repo.root);
     assert!(
         !out.status.success(),
         "a broken distiller must exit non-zero so a script can act on it"
@@ -2687,10 +2784,10 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     let wrong_shape = repo.root.join("wrong-shape.json");
     std::fs::write(&wrong_shape, r#"{"answer":"nothing useful here"}"#).unwrap();
     std::fs::write(&config, priors_printing(&wrong_shape)).unwrap();
-    let out = run(&["setup", "check"], &repo.root);
+    let out = run(&["doctor", "--full"], &repo.root);
     let combined = stdout(&out) + &String::from_utf8_lossy(&out.stderr);
     assert!(
-        combined.contains("FAILED") && combined.contains("nothing useful here"),
+        combined.contains("distiller ran and failed") && combined.contains("nothing useful here"),
         "a schema-blind model must be reported with its own output, got: {combined}"
     );
 }
@@ -2707,10 +2804,16 @@ fn smoke_journal_import_dry_run() {
     )
     .unwrap();
     let out = run(
-        &["journal", "import", journal.to_str().unwrap(), "--dry-run"],
+        &[
+            "memory",
+            "import",
+            "--journal",
+            journal.to_str().unwrap(),
+            "--dry-run",
+        ],
         &repo.root,
     );
-    assert_ok(&out, "journal import --dry-run");
+    assert_ok(&out, "memory import --journal FILE --dry-run");
 }
 
 #[test]
@@ -2721,15 +2824,15 @@ fn smoke_journal_import_all_dry_run() {
     std::fs::write(journal_dir.join("entry1.md"), "# Entry\n\nSome content.\n").unwrap();
     let out = run(
         &[
-            "journal",
-            "import-all",
-            "--dir",
+            "memory",
+            "import",
+            "--journal",
             journal_dir.to_str().unwrap(),
-            "-n",
+            "--dry-run",
         ],
         &repo.root,
     );
-    assert_ok(&out, "journal import-all --dry-run");
+    assert_ok(&out, "memory import --journal DIR --dry-run");
 }
 
 // ── Session ─────────────────────────────────────────────────────────
@@ -2741,36 +2844,17 @@ fn smoke_session_index_no_sessions() {
     std::fs::create_dir_all(&fake_sessions).unwrap();
     let out = run(
         &[
-            "session",
-            "index",
+            "update",
+            "--sessions",
             "--sessions-path",
             fake_sessions.to_str().unwrap(),
         ],
         &repo.root,
     );
-    assert_ok(&out, "session index (empty)");
+    assert_ok(&out, "update --sessions (empty)");
 }
 
 // ── Daemon (non-destructive) ────────────────────────────────────────
-
-#[test]
-fn smoke_daemon_status() {
-    let repo = Repo::new();
-    let out = run(&["daemon", "status"], &repo.root);
-    if cfg!(unix) {
-        // daemon status always exits 0 per contract
-        assert_ok(&out, "daemon status");
-    } else {
-        // There is no daemon off Unix — `ipc_server`, `spawn` and `singleton`
-        // are all `#[cfg(unix)]`. Asserting the refusal rather than skipping
-        // the test keeps the command's behaviour pinned on both platforms.
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success() && stderr.contains("require Unix"),
-            "daemon status must refuse clearly off Unix, got: {stderr}"
-        );
-    }
-}
 
 // ── Output format variants ──────────────────────────────────────────
 
@@ -2832,13 +2916,12 @@ fn smoke_help_all_subcommands() {
         &["--help"][..],
         &["init", "--help"],
         &["update", "--help"],
-        &["embed", "--help"],
         &["search", "--help"],
-        &["dup", "--help"],
-        &["coupling", "--help"],
+        &["code", "dup", "--help"],
+        &["code", "coupling", "--help"],
+        &["graph", "coupling", "--help"],
         &["get", "--help"],
-        &["mget", "--help"],
-        &["stats", "--help"],
+        &["status", "--help"],
         &["collection", "--help"],
         &["collection", "add", "--help"],
         &["memory", "--help"],
@@ -2847,34 +2930,27 @@ fn smoke_help_all_subcommands() {
         &["memory", "export", "--help"],
         &["memory", "import", "--help"],
         &["evolve", "--help"],
-        &["evolve", "supersedes", "--help"],
-        &["history", "--help"],
-        &["current", "--help"],
-        &["superseded-by", "--help"],
+        &["evolve", "link", "--help"],
+        &["evolve", "history", "--help"],
+        &["evolve", "current", "--help"],
+        &["evolve", "superseded-by", "--help"],
         &["graph", "--help"],
         &["graph", "links", "--help"],
         &["graph", "neighbors", "--help"],
         &["graph", "path", "--help"],
-        &["experiment", "--help"],
-        &["experiment", "create", "--help"],
         &["metrics", "--help"],
         &["metrics", "show", "--help"],
-        &["journal", "--help"],
-        &["journal", "import", "--help"],
         &["setup", "--help"],
         &["setup", "hooks", "--help"],
         &["setup", "hooks", "claude", "--help"],
         &["setup", "mcp", "--help"],
         &["code", "--help"],
-        &["code", "index", "--help"],
-        &["code", "search", "--help"],
+        &["code", "callers", "--help"],
         &["hook", "--help"],
         &["hook", "session-start", "--help"],
         &["hook", "reindex", "--help"],
         &["hook", "search", "--help"],
         &["hook", "memory-write", "--help"],
-        &["hook", "status", "--help"],
-        &["session", "--help"],
         &["daemon", "--help"],
         &["serve", "--help"],
         &["mcp", "--help"],
@@ -3104,10 +3180,10 @@ fn smoke_lifecycle_hooks_are_silent_where_no_store_may_be_anchored() {
 #[test]
 fn smoke_a_command_a_human_ran_still_refuses_to_anchor_there() {
     // The guard is not weakened, only narrowed: anything invoked on purpose
-    // still says why it did nothing. `hook status` is in this half too — an
+    // still says why it did nothing. `hook search` is in this half too — an
     // agent asked for it, so silence would hide the miss from the caller.
     let tmp = container_of_repos();
-    for args in [["search", "anything"], ["hook", "status"]] {
+    for args in [&["search", "anything"][..], &["hook", "search", "anything"]] {
         let out = run(&args, tmp.path());
         assert!(
             !out.status.success(),
@@ -3252,7 +3328,7 @@ fn smoke_an_unreadable_config_is_reported_by_update_and_stats() {
         "update must carry the parser's reason, got stderr: {err}"
     );
 
-    let out = run(&["stats"], &repo.root);
+    let out = run(&["status"], &repo.root);
     assert_ok(&out, "stats with an unreadable config");
     let err = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(

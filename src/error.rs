@@ -52,6 +52,15 @@ impl Error {
         Self::new(ErrorKind::Mcp(msg.into()))
     }
 
+    /// Create a usage error: the command line was wrong, and `run` is the
+    /// command that works. The CLI exits 2 for it and prints one line.
+    pub fn usage(message: impl Into<String>, run: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Usage {
+            message: message.into(),
+            run: run.into(),
+        })
+    }
+
     /// Create a new generic error.
     pub fn other(msg: impl Into<String>) -> Self {
         Self::new(ErrorKind::Other(msg.into()))
@@ -163,6 +172,18 @@ pub enum ErrorKind {
     CollectionInvalidPath { path: PathBuf },
 
     // Document errors
+    #[error("memory entry not found: {id}")]
+    MemoryNotFound { id: String },
+
+    /// A write that would repeat an existing memory entry. The text names it.
+    #[error("{0}")]
+    DuplicateEntry(String),
+
+    #[error(
+        "evolution cycle: {chain}. Evolution edges run newer -> older; `mdkb evolve history <doc>` lists edge ids and `mdkb evolve unlink <id>` deletes one"
+    )]
+    EvolutionCycle { chain: String },
+
     #[error("document not found: {id}")]
     DocumentNotFound { id: String },
 
@@ -222,6 +243,10 @@ pub enum ErrorKind {
     #[error("TOML serialize error: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
 
+    /// A wrong command line, with the exact command that works.
+    #[error("{message}. Run: {run}")]
+    Usage { message: String, run: String },
+
     // Generic errors
     #[error("{0}")]
     Other(String),
@@ -237,6 +262,7 @@ impl ErrorKind {
                 | Self::DatabaseNotFound { .. }
                 | Self::CollectionNotFound { .. }
                 | Self::DocumentNotFound { .. }
+                | Self::MemoryNotFound { .. }
                 | Self::PathNotFound { .. }
         )
     }
@@ -276,7 +302,16 @@ impl ErrorKind {
     pub fn is_validation_refusal(&self) -> bool {
         matches!(
             self,
-            Self::InvalidEntryId(_) | Self::InvalidEntryField { .. }
+            Self::InvalidEntryId(_)
+                | Self::InvalidEntryField { .. }
+                | Self::InvalidQuery(_)
+                | Self::MemoryNotFound { .. }
+                | Self::DuplicateEntry(_)
+                | Self::CollectionNotFound { .. }
+                | Self::CollectionExists { .. }
+                | Self::CollectionInvalidPath { .. }
+                | Self::DocumentNotFound { .. }
+                | Self::EvolutionCycle { .. }
         )
     }
 }

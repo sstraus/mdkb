@@ -1,0 +1,52 @@
+<svg viewBox="0 0 900 340" role="img" aria-label="One document's frontmatter keys and wikilink become typed edges to four targets; a target with no file yet is still an edge.">
+  <defs>
+    <marker id="garr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--ink)" />
+    </marker>
+  </defs>
+  <g class="t-sub" text-anchor="middle">
+    <text x="175" y="24">what the author wrote</text>
+    <text x="700" y="24">edges after mdkb update</text>
+  </g>
+
+  <rect x="30" y="40" width="290" height="230" rx="8" class="box" />
+  <rect x="30" y="40" width="290" height="34" rx="8" class="box-y" />
+  <text x="175" y="62" text-anchor="middle" class="t-mono" font-weight="700">payments.md</text>
+  <g class="t-mono">
+    <text x="50" y="98" fill="var(--ink-3)">---</text>
+    <text x="50" y="120">owner: alice</text>
+    <text x="50" y="142">related: queues.md</text>
+    <text x="50" y="164">depends_on: billing.md</text>
+    <text x="50" y="186" fill="var(--ink-3)">---</text>
+    <text x="50" y="220">Retries follow</text>
+    <text x="50" y="242">[[auth-v2]].</text>
+  </g>
+
+  <g fill="none" stroke="var(--ink)" stroke-width="1.5" marker-end="url(#garr)">
+    <path id="e-related" d="M320,138 C460,138 460,60 600,60" />
+    <path id="e-depends" d="M320,160 C460,160 460,130 600,130" />
+    <path d="M320,238 C460,238 460,200 600,200" stroke-dasharray="5 5" />
+    <path d="M320,116 C470,116 450,270 600,270" stroke="var(--ink-3)" />
+  </g>
+  <circle r="6" class="dot-y"><animateMotion dur="3s" repeatCount="indefinite"><mpath href="#e-depends" /></animateMotion></circle>
+  <circle r="6" class="dot-y"><animateMotion dur="3s" begin="1.5s" repeatCount="indefinite"><mpath href="#e-related" /></animateMotion></circle>
+
+  <g class="t-sub" text-anchor="end">
+    <text x="592" y="50">related</text>
+    <text x="592" y="120">depends_on</text>
+    <text x="592" y="190">links_to (soft)</text>
+    <text x="592" y="260">owner</text>
+  </g>
+
+  <g class="t-mono" text-anchor="middle">
+    <rect x="600" y="40" width="200" height="40" rx="8" class="box" />
+    <text x="700" y="65">queues.md</text>
+    <rect x="600" y="110" width="200" height="40" rx="8" class="box" />
+    <text x="700" y="135">billing.md</text>
+    <rect x="600" y="180" width="200" height="40" rx="8" class="box" />
+    <text x="700" y="205">auth-v2.md</text>
+    <rect x="600" y="250" width="200" height="40" rx="8" fill="var(--paper-2)" stroke="var(--ink-3)" stroke-width="2" stroke-dasharray="6 4" />
+    <text x="700" y="275" fill="var(--ink-3)">alice</text>
+  </g>
+  <text x="700" y="312" text-anchor="middle" class="t-sub">no file yet: still an edge, resolved when it appears</text>
+</svg>

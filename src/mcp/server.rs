@@ -312,23 +312,7 @@ impl McpServer {
     /// Initialize database context on a RepoHandle (global mode).
     /// Auto-creates `.mdkb/` if it doesn't exist.
     async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
-        let mut ctx_guard = handle.ctx.lock().await;
-        if ctx_guard.is_none() {
-            if handle.doc_reindex_active.load(Ordering::Relaxed) {
-                return Err(mcp_error("Repo initializing, retry shortly"));
-            }
-            let ctx = match Context::open_reusing_process_probe(&handle.root) {
-                Ok(ctx) => ctx,
-                Err(e) if e.is_not_found() => {
-                    tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
-                    Context::init(&handle.root)
-                        .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
-                }
-                Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
-            };
-            *ctx_guard = Some(ctx);
-        }
-        Ok(())
+        super::dispatch::ensure_handle_context(handle).await
     }
 
     /// Query MCP roots from the client peer and register them in the registry.
@@ -428,20 +412,38 @@ impl McpServer {
     /// calls could see ctx=Some with doc_reindex_active=false between
     /// ensure_context() and the flag set, causing flaky test failures on CI.
     async fn init_and_take_for_reindex(&self) -> Result<Option<Context>, McpError> {
+        if self.doc_reindex_active.load(Ordering::Acquire) {
+            return Err(mcp_error("Server initializing, retry shortly"));
+        }
+        let admission = if self.ctx.lock().await.is_none() {
+            Some(
+                super::dispatch::admit_root_writer(&self.root)
+                    .await
+                    .map_err(|e| mcp_error(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let mut ctx_guard = self.ctx.lock().await;
+        if self.doc_reindex_active.load(Ordering::Acquire) {
+            return Err(mcp_error("Server initializing, retry shortly"));
+        }
         if ctx_guard.is_none() {
-            let ctx = match Context::open(&self.root) {
+            let _admission = admission
+                .as_ref()
+                .ok_or_else(|| mcp_error("Context changed during open; retry"))?;
+            let ctx = match Context::open_writer_admitted(&self.root) {
                 Ok(ctx) => ctx,
                 Err(e) if e.is_not_found() => {
                     tracing::info!("Auto-initializing mdkb at {}", self.root.display());
-                    Context::init(&self.root)
+                    Context::init_writer_admitted(&self.root)
                         .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {}", e)))?
                 }
                 Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
             };
-            let _writer_guard =
-                crate::store::mutation_lock::acquire_writer(&ctx.db_path, "server context setup")
-                    .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
+            let _admission = admission
+                .as_ref()
+                .ok_or_else(|| mcp_error("Context changed during open; retry"))?;
             stats::init_stats_schema(&ctx.conn)
                 .map_err(|e| mcp_error(format!("Failed to init stats schema: {}", e)))?;
             self.apply_conventions(&ctx)
@@ -463,25 +465,43 @@ impl McpServer {
     /// Auto-initializes `.mdkb/` if it doesn't exist, so the MCP server
     /// works out of the box without requiring a manual `mdkb init`.
     async fn ensure_context(&self) -> Result<(), McpError> {
+        if self.doc_reindex_active.load(Ordering::Acquire) {
+            return Err(mcp_error("Server initializing, retry shortly"));
+        }
+        let admission = if self.ctx.lock().await.is_none() {
+            Some(
+                super::dispatch::admit_root_writer(&self.root)
+                    .await
+                    .map_err(|e| mcp_error(e.to_string()))?,
+            )
+        } else {
+            None
+        };
         let mut ctx_guard = self.ctx.lock().await;
+        if self.doc_reindex_active.load(Ordering::Acquire) {
+            return Err(mcp_error("Server initializing, retry shortly"));
+        }
         if ctx_guard.is_none() {
             // Startup task has taken ctx out for reindex — don't create a new one
             if self.doc_reindex_active.load(Ordering::Relaxed) {
                 return Err(mcp_error("Server initializing, retry shortly"));
             }
-            let ctx = match Context::open(&self.root) {
+            let _admission = admission
+                .as_ref()
+                .ok_or_else(|| mcp_error("Context changed during open; retry"))?;
+            let ctx = match Context::open_writer_admitted(&self.root) {
                 Ok(ctx) => ctx,
                 Err(e) if e.is_not_found() => {
                     tracing::info!("Auto-initializing mdkb at {}", self.root.display());
-                    Context::init(&self.root)
+                    Context::init_writer_admitted(&self.root)
                         .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {}", e)))?
                 }
                 Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
             };
 
-            let _writer_guard =
-                crate::store::mutation_lock::acquire_writer(&ctx.db_path, "server context setup")
-                    .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
+            let _admission = admission
+                .as_ref()
+                .ok_or_else(|| mcp_error("Context changed during open; retry"))?;
 
             // Initialize stats schema
             stats::init_stats_schema(&ctx.conn)
@@ -569,27 +589,15 @@ impl McpServer {
         results: usize,
         truncated: bool,
     ) {
-        let session_id = self.session_id.load(Ordering::Relaxed);
-        if session_id == 0 {
-            return; // No session yet
-        }
-
-        let mut ctx_guard = self.ctx.lock().await;
-        if ctx_guard.is_none() {
-            return;
-        }
-        let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
-        let interval = self.full_config.db.optimize_interval_calls;
-        let outcome =
-            crate::core::run_guarded_write(&mut ctx_guard, "persistent call telemetry", |ctx| {
-                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)?;
-                if crate::store::maintenance::should_optimize(call_count, interval) {
-                    crate::store::maintenance::run_optimize(&ctx.conn)?;
-                }
-                Ok(())
-            });
-        if let Some(Err(error)) = outcome {
-            tracing::warn!("Failed to record call stats: {error}");
+        if let Some(handle) = &self.standalone_handle {
+            super::dispatch::DispatchContext::new(
+                Arc::clone(&self.metrics),
+                Arc::clone(&self.session_id),
+                Arc::clone(&self.persistent_call_count),
+                self.full_config.db.optimize_interval_calls,
+            )
+            .record_persistent_call(handle, tool_name, tokens, results, truncated)
+            .await;
         }
     }
 
@@ -2481,7 +2489,7 @@ pub fn surface_instructions() -> String {
         let Some(cli) = e.cli_command else { continue };
         out.push_str(&format!("  {} = mdkb {}\n", e.mcp_tool, cli));
     }
-    out.push_str("Full inventory with the differences that matter: `mdkb surface`.\n");
+    out.push_str("Full inventory with the differences that matter: `mdkb cheatsheet` (section MCP <-> CLI).\n");
     out
 }
 
@@ -3936,6 +3944,40 @@ if (require.main === module) {
                 timeout,
                 server.search(Parameters(SearchParams {
                     patterns: None,
+                    path: Some("lib.rs".to_string()),
+                    regex: false,
+                    ignore_case: false,
+                    contract: None,
+                    query: "utility".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: None,
+                    root: None,
+                    min_confidence: None,
+                    since: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols path=lib.rs failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("utility"), "Should find utility: {}", text);
+            assert!(text.contains("lib.rs"), "Should be in lib.rs: {}", text);
+        }
+
+        /// Catches: the removed `file` parameter being silently ignored, which
+        /// would return unfiltered symbols to a caller that asked for a filter.
+        #[tokio::test]
+        async fn test_search_file_parameter_names_its_replacement() {
+            let (_dir, server) = setup_indexed_server();
+            let error = server
+                .search(Parameters(SearchParams {
+                    patterns: None,
                     path: None,
                     regex: false,
                     ignore_case: false,
@@ -3951,15 +3993,14 @@ if (require.main === module) {
                     root: None,
                     min_confidence: None,
                     since: None,
-                })),
-            )
-            .await
-            .expect("timeout")
-            .expect("search scope=symbols file=lib.rs failed");
-
-            let text = extract_text(&result);
-            assert!(text.contains("utility"), "Should find utility: {}", text);
-            assert!(text.contains("lib.rs"), "Should be in lib.rs: {}", text);
+                }))
+                .await
+                .expect_err("file must be refused");
+            assert!(
+                error.message.contains("use `path`"),
+                "the error must name the replacement: {}",
+                error.message
+            );
         }
 
         #[tokio::test]
@@ -5742,6 +5783,44 @@ if (require.main === module) {
             "memory_write must not increment access_count (was {}, now {})",
             count_after_create, entry_after_update.access_count
         );
+    }
+
+    // Catches: standalone startup paths waiting for the indexing writer before
+    // observing that its context is deliberately unavailable.
+    #[tokio::test]
+    async fn standalone_initializing_refuses_before_writer_admission() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = Context::init(tmp.path()).unwrap();
+        let writer =
+            crate::store::mutation_lock::acquire_writer(&ctx.db_path, "startup indexing").unwrap();
+        let server = McpServer::new(tmp.path().to_path_buf());
+        server.doc_reindex_active.store(true, Ordering::Release);
+        let ensure = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            server.ensure_context(),
+        )
+        .await;
+        let take = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            server.init_and_take_for_reindex(),
+        )
+        .await;
+        drop(writer);
+        assert!(
+            ensure
+                .expect("ensure waited for initializing writer")
+                .unwrap_err()
+                .message
+                .contains("initializing")
+        );
+        assert!(
+            take.expect("take waited for initializing writer")
+                .err()
+                .unwrap()
+                .message
+                .contains("initializing")
+        );
+        assert!(server.ctx.lock().await.is_none());
     }
 
     #[tokio::test]

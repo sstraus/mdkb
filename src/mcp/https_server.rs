@@ -1,6 +1,6 @@
 //! HTTPS transport for the MCP server with self-signed certificate generation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum_server::tls_rustls::RustlsConfig;
@@ -77,24 +77,69 @@ pub async fn run_https_server(
     Ok(())
 }
 
-/// Ensure a self-signed certificate exists, generating one if needed.
-///
-/// Certificates are cached in `~/.config/mdkb/certs/`.
-fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
-    let cert_dir = directories::ProjectDirs::from("", "", "mdkb")
-        .map(|dirs| dirs.config_dir().join("certs"))
-        .unwrap_or_else(|| PathBuf::from(".mdkb/certs"));
+/// A cached certificate that expires within this window is replaced on start,
+/// so a running server does not reach its expiry date shortly after start.
+const RENEW_BEFORE_DAYS: i64 = 30;
 
+/// Lifetime of a generated certificate.
+const VALID_DAYS: i64 = 365;
+
+/// Ensure a valid self-signed certificate exists, generating one if needed.
+///
+/// Certificates are cached in `~/.mdkb/certs/`, next to the rest of mdkb's
+/// machine-wide state.
+fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
+    let cert_dir = crate::DaemonConfig::daemon_home().join("certs");
+    ensure_cert_in(&cert_dir, chrono::Utc::now())
+}
+
+/// Reuse the certificate in `cert_dir` while it stays valid past
+/// `now + RENEW_BEFORE_DAYS`; otherwise write a new one.
+fn ensure_cert_in(
+    cert_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<(PathBuf, PathBuf)> {
     let cert_path = cert_dir.join("server.pem");
     let key_path = cert_dir.join("server-key.pem");
 
-    // Return existing cert if it exists and is not expired
-    if cert_path.exists() && key_path.exists() {
-        tracing::info!("Using existing self-signed certificate");
-        return Ok((cert_path, key_path));
+    if key_path.exists() {
+        match cert_not_after(&cert_path) {
+            Some(not_after) if not_after > now + chrono::Duration::days(RENEW_BEFORE_DAYS) => {
+                tracing::info!("Using existing self-signed certificate");
+                return Ok((cert_path, key_path));
+            }
+            Some(not_after) => {
+                tracing::info!("Self-signed certificate expires {not_after}; regenerating");
+            }
+            None if cert_path.exists() => {
+                tracing::warn!("Cannot read {}; regenerating", cert_path.display());
+            }
+            None => {}
+        }
     }
 
-    std::fs::create_dir_all(&cert_dir)
+    write_self_signed_cert(cert_dir, now, now + chrono::Duration::days(VALID_DAYS))?;
+    Ok((cert_path, key_path))
+}
+
+/// Expiry date of the PEM certificate at `path`, or `None` when it is missing
+/// or does not parse.
+fn cert_not_after(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let pem = std::fs::read_to_string(path).ok()?;
+    let params = rcgen::CertificateParams::from_ca_cert_pem(&pem).ok()?;
+    chrono::DateTime::from_timestamp(params.not_after.unix_timestamp(), 0)
+}
+
+/// Write `server.pem` and `server-key.pem` into `cert_dir`.
+fn write_self_signed_cert(
+    cert_dir: &Path,
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
+) -> crate::error::Result<()> {
+    let cert_path = cert_dir.join("server.pem");
+    let key_path = cert_dir.join("server-key.pem");
+
+    std::fs::create_dir_all(cert_dir)
         .map_err(|e| crate::error::Error::mcp(format!("Failed to create cert directory: {e}")))?;
 
     tracing::info!("Generating self-signed certificate...");
@@ -114,11 +159,11 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
             std::net::Ipv6Addr::LOCALHOST,
         )));
 
-    // Valid for 365 days from now
-    let now = chrono::Utc::now();
-    let expiry = now + chrono::Duration::days(365);
-    params.not_after =
-        rcgen::date_time_ymd(expiry.year(), expiry.month() as u8, expiry.day() as u8);
+    let ymd = |d: chrono::DateTime<chrono::Utc>| {
+        rcgen::date_time_ymd(d.year(), d.month() as u8, d.day() as u8)
+    };
+    params.not_before = ymd(not_before);
+    params.not_after = ymd(not_after);
 
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| crate::error::Error::mcp(format!("Failed to generate key pair: {e}")))?;
@@ -150,21 +195,65 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
         cert_dir.display()
     );
 
-    Ok((cert_path, key_path))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn days(n: i64) -> chrono::Duration {
+        chrono::Duration::days(n)
+    }
+
     #[test]
-    fn test_ensure_self_signed_cert() {
-        // This test generates a real cert in the default location.
-        // Skip in CI or if we want to avoid side effects.
-        let result = ensure_self_signed_cert();
-        assert!(result.is_ok());
-        let (cert_path, key_path) = result.unwrap();
-        assert!(cert_path.exists());
-        assert!(key_path.exists());
+    fn expired_cached_certificate_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        write_self_signed_cert(dir.path(), now - days(400), now - days(35)).unwrap();
+
+        let (cert_path, _) = ensure_cert_in(dir.path(), now).unwrap();
+
+        let not_after = cert_not_after(&cert_path).unwrap();
+        assert!(
+            not_after > now + days(360),
+            "expiry {not_after} was not renewed"
+        );
+    }
+
+    #[test]
+    fn certificate_inside_the_renewal_window_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        write_self_signed_cert(dir.path(), now - days(355), now + days(10)).unwrap();
+
+        let (cert_path, _) = ensure_cert_in(dir.path(), now).unwrap();
+
+        assert!(cert_not_after(&cert_path).unwrap() > now + days(360));
+    }
+
+    #[test]
+    fn valid_cached_certificate_is_reused_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = chrono::Utc::now();
+        write_self_signed_cert(dir.path(), now, now + days(200)).unwrap();
+        let cert_before = std::fs::read(dir.path().join("server.pem")).unwrap();
+        let key_before = std::fs::read(dir.path().join("server-key.pem")).unwrap();
+
+        let (cert_path, key_path) = ensure_cert_in(dir.path(), now).unwrap();
+
+        assert_eq!(std::fs::read(cert_path).unwrap(), cert_before);
+        assert_eq!(std::fs::read(key_path).unwrap(), key_before);
+    }
+
+    #[test]
+    fn unreadable_cached_certificate_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.pem"), "not a certificate").unwrap();
+        std::fs::write(dir.path().join("server-key.pem"), "not a key").unwrap();
+
+        let (cert_path, _) = ensure_cert_in(dir.path(), chrono::Utc::now()).unwrap();
+
+        assert!(cert_not_after(&cert_path).is_some());
     }
 }

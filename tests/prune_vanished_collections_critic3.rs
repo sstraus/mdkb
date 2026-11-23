@@ -72,7 +72,7 @@ fn a_manual_collection_neither_joins_the_denominator_nor_gets_pruned() {
 }
 
 /// Catches: the remedy named in the guard message does not work: after
-/// `collection remove archive`, the next update must prune `docs` (now the only
+/// `collection rm archive`, the next update must prune `docs` (now the only
 /// convention collection) and leave no "none pruned" error behind.
 #[test]
 fn the_remedy_in_the_guard_message_clears_the_situation() {
@@ -90,7 +90,7 @@ fn the_remedy_in_the_guard_message_clears_the_situation() {
         .iter()
         .find(|e| e.contains("none pruned"))
         .expect("guard message");
-    assert!(msg.contains("collection remove"), "remedy named: {msg}");
+    assert!(msg.contains("collection rm"), "remedy named: {msg}");
 
     assert!(handle_collection_remove(&ctx, "archive").expect("remove"));
     let result = handle_update(&ctx, &root).expect("update after remedy");
