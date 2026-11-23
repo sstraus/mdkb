@@ -16,6 +16,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # A cold debug build of every test binary can fill the runner disk; the
+      # linker then dies with SIGBUS instead of a disk-full error. Remove
+      # preinstalled SDKs this job does not use, and print the disk use.
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -46,6 +55,10 @@ jobs:
 
       - name: Run tests
         run: cargo test --all-features
+
+      - name: Disk use after tests
+        if: always()
+        run: df -h / && du -sh target
 
       # Retrieval eval (docs/retrieval-eval.md). Without the model the eval
       # prints the embedding and hybrid modes as skipped with the reason.

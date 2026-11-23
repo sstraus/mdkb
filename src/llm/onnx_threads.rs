@@ -16,17 +16,6 @@ pub const DEFAULT_ORT_THREADS: usize = 2;
 /// pool per session, one thread per core.
 pub const ORT_THREADS_ENV: &str = "MDKB_ORT_THREADS";
 
-/// Intra-op threads for a full regeneration child: half the cores, at least
-/// [`DEFAULT_ORT_THREADS`]. Measured 2026-11-21, Granite re-embed of 3,949
-/// vectors on 14 cores: 2 threads 278 s / 550 CPU-s, 4 148 s / 576, 8 98 s / 730,
-/// unbounded (`0`) 131 s / 1,438. An unbounded pool is slower and burns 2.6x
-/// the CPU of 8 threads.
-pub fn regeneration_threads() -> usize {
-    std::thread::available_parallelism()
-        .map_or(DEFAULT_ORT_THREADS, |n| n.get() / 2)
-        .max(DEFAULT_ORT_THREADS)
-}
-
 /// The bound for an [`ORT_THREADS_ENV`] value; `None` means no bound.
 fn threads_from(value: Option<&str>) -> Option<usize> {
     let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {

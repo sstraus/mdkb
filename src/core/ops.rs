@@ -74,13 +74,7 @@ fn handle_embed_inner(
     // Serving can fall back to defaults on unrelated config errors, but a
     // destructive rebuild must not silently replace the configured encoder.
     let config = if reembed {
-        match Config::load(&ctx.config_path) {
-            Ok(config) => config,
-            Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
-                Config::default()
-            }
-            Err(error) => return Err(error),
-        }
+        Config::load_for_reembed(&ctx.config_path)?
     } else {
         Config::load_or_default(&ctx.config_path)
     };

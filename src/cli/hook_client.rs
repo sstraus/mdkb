@@ -269,12 +269,28 @@ fn hook_timeout(method: &str, hooks: &HooksConfig) -> Duration {
 /// On any error the function logs to stderr and returns `Ok(())` — host CLIs
 /// must see exit 0.
 pub async fn call_hook_event(method: &str, event: Value, root: Option<PathBuf>) -> Result<()> {
-    run_hook(method, event, root).await
+    run_hook(method, event, root, &emit_hook_response).await
+}
+
+/// Like [`call_hook_event`], but hands the response to `emit` instead of
+/// printing it, so a host with its own reply format can translate it.
+pub async fn call_hook_event_with(
+    method: &str,
+    event: Value,
+    root: Option<PathBuf>,
+    emit: &(dyn Fn(&Value) + Sync),
+) -> Result<()> {
+    run_hook(method, event, root, emit).await
 }
 
 /// Like `run` but routes through `emit_hook_response` (raw envelope → stdout)
 /// rather than `print_tool_text` (text extraction). Uses per-event timeouts.
-async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
+async fn run_hook(
+    method: &str,
+    mut params: Value,
+    root: Option<PathBuf>,
+    emit: &(dyn Fn(&Value) + Sync),
+) -> Result<()> {
     let Some(root) = resolve_hook_root(&params, root) else {
         tracing::debug!("hook {method}: no directory here may hold a store; skipping");
         return Ok(());
@@ -299,7 +315,7 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
             tracing::warn!("hook {method}: {DAEMON_REQUIRED_BUT_ABSENT}; skipping");
             return Ok(());
         }
-        return run_hook_in_process(method, params, &root).await;
+        return run_hook_in_process(method, params, &root, emit).await;
     }
 
     // Off Unix `daemon_is_reachable_here` is const-false, so this whole block is
@@ -316,14 +332,14 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     .await
     {
         Ok(response) => {
-            emit_hook_response(&hook_response_for_request(&params, &response));
+            emit(&hook_response_for_request(&params, &response));
             Ok(())
         }
         // The request provably never ran in the daemon. Falling back here keeps
         // the host hook exit-zero contract without creating a second writer.
         Err(MutationFailure::Unstarted(e)) if !daemon_required => {
             tracing::warn!("hook {method}: daemon unavailable ({e}); running in-process");
-            run_hook_in_process(method, params, &root).await
+            run_hook_in_process(method, params, &root, emit).await
         }
         Err(MutationFailure::Unstarted(e)) => {
             tracing::warn!("hook {method}: daemon required but unavailable ({e}); skipping");
@@ -450,10 +466,15 @@ async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: imp
 
 /// In-process fallback for lifecycle hooks: the raw envelope goes to stdout
 /// through `emit_hook_response`.
-async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
+async fn run_hook_in_process(
+    method: &str,
+    params: Value,
+    root: &Path,
+    emit: &(dyn Fn(&Value) + Sync),
+) -> Result<()> {
     let request = params.clone();
     dispatch_in_process(method, params, root, |result| {
-        emit_hook_response(&hook_response_for_request(&request, result));
+        emit(&hook_response_for_request(&request, result));
     })
     .await;
     Ok(())

@@ -29,12 +29,12 @@ swallowed — the host CLI is never blocked by mdkb.
 
 ## Find labels and other literal values
 
-Use the CLI literal scope before grep when you know text from the UI:
+Use `code grep --literals` before grep when you know text from the UI:
 
 ```bash
-mdkb search 'Fork from here' --scope text
-mdkb search 'fork from here' --scope text --ignore-case --root tuicommander
-mdkb search 'Fork from here' --scope text --file src/ --limit 30
+mdkb code grep 'Fork from here' --literals
+mdkb code grep 'fork from here' --literals --ignore-case --root tuicommander
+mdkb code grep 'Fork from here' --literals --path src/ --limit 30
 ```
 
 The code-index parser stores AST string literals, JSX text, and JSON values with
@@ -132,8 +132,9 @@ only for `SessionStart`, `UserPromptSubmit`, and `PostToolUse`, with an exact
 `hookEventName` match. `PreToolUse` and `PostToolUseFailure` observations use
 `version = 1`, `decision = "continue"`, and `feedback` instead: ego accepts these
 as evidence, not model context. Internal reindex queue fields are not returned
-to this closed protocol. Empty results produce no stdout. Claude Code and Codex
-keep their existing output contract.
+to this closed protocol. Empty results produce no stdout. Claude Code, Codex and
+Grok keep their existing output contract; Antigravity has its own (see
+[Grok and Antigravity](#grok-and-antigravity)).
 
 Ego's `Stop.transcript` is plain inline text, not a Claude transcript-file path
 or MDKB's `episode_jsonl` format. The Stop hook settles without claiming prior
@@ -318,9 +319,9 @@ The extracted pattern is then classified:
 
 - **Definition search** (e.g. `fn handle_auth`, `struct RepoHandle`) → if the
   symbol is in the code index, injects the real `file:line` hits ("act, not
-  suggest"); otherwise falls back to suggesting `mdkb search --scope symbols`.
+  suggest"); otherwise falls back to suggesting `mdkb code search`.
   Controlled by `code_hits_in_pretooluse` (default `true`).
-- **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb search --scope symbols`
+- **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb code search`
 - **Callsite pattern** (e.g. `handleAuth(`) → suggests `mdkb code callers`
 - **Other patterns** (regex, alternation, single-file) → no suggestion (returns `{}`)
 
@@ -491,7 +492,7 @@ warmup_min_confidence = 0.25
 recall_limit = 5
 
 # Max matching documents injected alongside the memory recall, from
-# the same hybrid engine as `mdkb search --scope docs`. 0 = memory only.
+# the same hybrid engine as `mdkb search --docs`. 0 = memory only.
 recall_docs_limit = 3
 recall_docs_min_cosine = 0.57   # a doc must score this cosine or be quoted by the prompt (Granite default 0.77)
 
@@ -634,7 +635,7 @@ directory.
   produce no tokens and are skipped by design.
 - Nothing cleared the floor. That is the gate working, not a failure: recall is
   absolute, so a store with no answer injects nothing rather than its best
-  guess. `mdkb search --scope memory "<prompt>"` shows what was there.
+  guess. `mdkb search --memory "<prompt>"` shows what was there.
 
 ### Shadow mode
 
@@ -782,3 +783,34 @@ store themselves; for interactive use, prefer `mdkb search`, `memory add`,
 `memory confirm` and `update`. `hook memory-write` takes `--id`, `--title`, `--entry-type`, `--content`,
 `--tags` and `--ttl` (seconds); `hook memory-confirm` takes `--id` and
 `--outcome`.
+
+## Grok and Antigravity
+
+Both run mdkb through the same dispatcher; what reaches the model differs by
+host. Measured on grok 1.0.89 and agy 1.5.10, 2026-11-23.
+
+**Antigravity CLI (`agy`)** has its own hook protocol. `mdkb setup hooks agy`
+adds an `mdkb` group to `~/.gemini/config/hooks.json` whose commands call
+`mdkb hook agy <event>`, which translates agy's input and answers with
+`injectSteps`:
+
+| agy event | mdkb work |
+|---|---|
+| `SessionStart` | memory warmup, injected as a system message |
+| `PreInvocation` | prompt recall, on the first model call of each prompt only (`invocationNum` 0) |
+| `PostToolUse` | reindex of the file a write or replace tool changed |
+| `Stop` | end-of-turn work; no prior mining, because agy's transcript is not the format mining reads |
+
+No `PreToolUse` hook is registered: agy denies a tool call when a pre-tool hook
+answers without a decision. Remove with `mdkb setup remove hooks agy`.
+
+**Grok CLI** uses the Claude Code hook format, and by default it already runs
+the hooks in `~/.claude/settings.json` (`[compat.claude] hooks` in
+`~/.grok/config.toml`) and the MCP servers in `~/.claude.json`. Grok drops the
+context of `SessionStart` and `UserPromptSubmit`, so warmup and prompt recall
+cannot reach a Grok model through hooks; use the mdkb MCP tools there.
+`mdkb setup hooks grok` writes `~/.grok/hooks/mdkb.json` with the events whose
+context Grok delivers (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+`Stop`). It refuses while Grok already runs the mdkb hooks of Claude Code, which
+would run each event twice; set `[compat.claude] hooks = false` or pass
+`--force`.

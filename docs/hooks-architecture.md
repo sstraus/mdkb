@@ -1,6 +1,6 @@
 # Hook System — Architecture & Operations Guide
 
-mdkb hooks inject memory context into Claude Code / Codex CLI sessions
+mdkb hooks inject memory context into Claude Code, Codex, Antigravity, Grok and ego sessions
 automatically, without requiring the assistant to call MCP tools. This
 document covers architecture, data flow, configuration, and improvement
 opportunities.
@@ -304,7 +304,7 @@ From most to least granular:
    config.toml; Stop mining is independently disabled by default under
    `[priors]`.
 3. **Disable at install** — `mdkb setup hooks claude --disable post-tool-use`.
-4. **Uninstall** — `mdkb setup remove hooks claude|codex`, or remove
+4. **Uninstall** — `mdkb setup remove hooks claude|codex|ego|grok|agy`, or remove
    hook entries from settings file manually.
 
 ## Observability

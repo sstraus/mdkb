@@ -7,9 +7,7 @@ pub mod embeddings;
 pub mod onnx_threads;
 
 #[doc(inline)]
-pub use onnx_threads::{
-    DEFAULT_ORT_THREADS, ORT_THREADS_ENV, bound_onnx_threads, regeneration_threads,
-};
+pub use onnx_threads::{DEFAULT_ORT_THREADS, ORT_THREADS_ENV, bound_onnx_threads};
 
 #[doc(inline)]
 pub use embeddings::{

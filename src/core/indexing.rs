@@ -1159,7 +1159,7 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
                 // Both kinds, because this is also the single-file path the
                 // daemon watcher takes on every save, and that path runs in
                 // its own transaction with no whole-corpus pass after it.
-                // `extract_edges_pass` is a superset, not a competitor: it
+                // `extract_edges_pass` is a superset, not a rival pass: it
                 // reaches the documents this loop SKIPPED, which is what makes
                 // an allowlist change apply without `--force`. Both write the
                 // same rows from the same data, so the overlap is idempotent.

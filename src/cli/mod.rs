@@ -8,6 +8,7 @@ pub mod handlers;
 // their work in-process everywhere else (issue #7).
 pub mod hook_client;
 pub mod hook_logic;
+pub mod host_agy;
 pub mod journal;
 #[cfg(unix)]
 pub mod mcp_proxy;
@@ -16,7 +17,9 @@ pub mod priority;
 pub mod repos;
 pub mod retired;
 pub mod setup;
+pub mod setup_agy;
 pub mod setup_ego;
+pub mod setup_grok;
 pub mod stats_render;
 pub mod stats_render_report;
 pub mod stats_report;
@@ -486,6 +489,13 @@ pub enum HookCommand {
 
     /// Lifecycle event: agent stopped (end of episode — feeds prior mining).
     Stop,
+
+    /// Lifecycle event from Antigravity CLI (`agy`), in agy's own hook format.
+    Agy {
+        /// The agy event this hook was registered for.
+        #[arg(value_enum)]
+        event: crate::cli::host_agy::AgyEvent,
+    },
 
     /// Trigger an index refresh via the daemon.
     Reindex {
@@ -1214,6 +1224,20 @@ pub enum SetupMcpCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Register mdkb with the Grok CLI (writes [mcp_servers.mdkb] in ~/.grok/config.toml)
+    Grok {
+        /// Print the merged config.toml to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Register mdkb with Antigravity CLI (writes ~/.gemini/config/mcp_config.json)
+    Agy {
+        /// Print the merged mcp_config.json to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Hooks setup subcommands.
@@ -1266,6 +1290,27 @@ pub enum SetupHooksCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Register tool hooks with the Grok CLI (writes ~/.grok/hooks/mdkb.json).
+    /// Grok drops SessionStart and UserPromptSubmit context, so only the tool
+    /// and stop events are registered
+    Grok {
+        /// Register even when grok already runs the mdkb hooks of ~/.claude/settings.json
+        #[arg(long)]
+        force: bool,
+
+        /// Print hooks/mdkb.json to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Register lifecycle hooks with Antigravity CLI (writes an mdkb group in
+    /// ~/.gemini/config/hooks.json)
+    Agy {
+        /// Print the merged hooks.json to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Removal subcommands.
@@ -1299,6 +1344,12 @@ pub enum RemoveMcpCommand {
 
     /// Remove mdkb from Codex CLI (~/.codex/config.toml)
     Codex,
+
+    /// Remove mdkb from the Grok CLI (~/.grok/config.toml)
+    Grok,
+
+    /// Remove mdkb from Antigravity CLI (~/.gemini/config/mcp_config.json)
+    Agy,
 }
 
 /// Hooks removal subcommands.
@@ -1321,6 +1372,12 @@ pub enum RemoveHooksCommand {
 
     /// Remove mdkb hooks from Codex CLI (~/.codex/hooks.json)
     Codex,
+
+    /// Remove mdkb hooks from the Grok CLI (~/.grok/hooks/mdkb.json)
+    Grok,
+
+    /// Remove the mdkb hook group from Antigravity CLI (~/.gemini/config/hooks.json)
+    Agy,
 }
 
 /// Code intelligence subcommands.

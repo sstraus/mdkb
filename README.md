@@ -6,7 +6,7 @@
 
 **Repository memory for coding agents.**
 
-mdkb gives Claude Code, Codex, and other MCP clients one local retrieval layer
+mdkb gives Claude Code, Codex, Grok, Antigravity, ego and other MCP clients one local retrieval layer
 for the repository: durable project memory, Markdown documentation, source
 symbols, and call relationships.
 
@@ -61,8 +61,8 @@ Five capabilities, each with its own section below.
 
 ### 1. Recall that reaches the agent without a tool call
 
-Lifecycle hooks for Claude Code and Codex inject context at the moments it is
-useful: a ranked **session warmup** with the latest handoff and due reminders at
+Lifecycle hooks for Claude Code, Codex, Antigravity and ego inject context at the
+moments it is useful (Grok runs only the tool hooks, see [docs/hooks.md](docs/hooks.md#grok-and-antigravity)): a ranked **session warmup** with the latest handoff and due reminders at
 SessionStart; **prompt recall** that ranks memory and documents against the
 prompt with the same hybrid BM25-plus-vector score as search, expands one hop
 through typed memory edges, and flags entries whose supporting memory was
@@ -168,6 +168,12 @@ mdkb setup mcp claude --scope user
 
 # Codex CLI (writes ~/.codex/config.toml; --dry-run prints the merged file)
 mdkb setup mcp codex
+
+# Grok CLI (writes [mcp_servers.mdkb] in ~/.grok/config.toml)
+mdkb setup mcp grok
+
+# Antigravity CLI (writes ~/.gemini/config/mcp_config.json)
+mdkb setup mcp agy
 ```
 
 Restart Claude Code after setup. The MCP server auto-indexes on startup and watches for file changes.
@@ -205,6 +211,12 @@ mdkb setup hooks codex
 
 # ego prompt context (writes $EGO_HOME/config.toml or ~/.ego/config.toml)
 mdkb setup hooks ego
+
+# Antigravity CLI (adds an mdkb group to ~/.gemini/config/hooks.json)
+mdkb setup hooks agy
+
+# Grok CLI tool hooks (writes ~/.grok/hooks/mdkb.json; see docs/hooks.md)
+mdkb setup hooks grok
 
 # Preview the merged settings JSON without writing
 mdkb setup hooks claude --scope local --dry-run
@@ -412,8 +424,12 @@ mdkb setup remove claude --scope user    # global
 # Remove individually
 mdkb setup remove mcp claude --scope local
 mdkb setup remove mcp codex
+mdkb setup remove mcp grok
+mdkb setup remove mcp agy
 mdkb setup remove hooks claude --scope local
 mdkb setup remove hooks codex
+mdkb setup remove hooks grok
+mdkb setup remove hooks agy
 ```
 
 Soft alternatives before uninstalling: create an empty `.mdkbignore-hooks` marker at the repo root to silence hooks for that working tree, or toggle `session_start_enabled` / `user_prompt_submit_enabled` / `post_tool_use_enabled` in `.mdkb/config.toml`.

@@ -1616,13 +1616,7 @@ fn run_embedding_generation(
     code_index: &tokio::sync::Mutex<Option<IndexFacade>>,
 ) -> crate::error::Result<(usize, bool)> {
     let config_path = dir.join("config.toml");
-    let config = match crate::config::Config::load(&config_path) {
-        Ok(config) => config,
-        Err(e) if matches!(e.kind(), ErrorKind::ConfigNotFound { .. }) => {
-            crate::config::Config::default()
-        }
-        Err(e) => return Err(e),
-    };
+    let config = crate::config::Config::load_for_reembed(&config_path)?;
     if !dir.join("index.sqlite").is_file() {
         return Ok((0, true));
     }
@@ -1722,8 +1716,12 @@ const EMBED_WORKER_ENV: &str = "MDKB_EMBED_WORKER";
 /// its own (tests/layering.rs), and its ONNX pool is bounded to two threads.
 /// Measured 2026-11-20: run inside the daemon, a Granite regeneration of
 /// tuicommander held two cores at nice 0 for its whole run and competed with
-/// interactive work. The child lowers itself to `search.embed_nice` and gets an
-/// ONNX pool of half the cores, so it uses idle cores and yields busy ones.
+/// interactive work. The child lowers itself to `search.embed_nice` and keeps
+/// the default ONNX pool of [`crate::llm::DEFAULT_ORT_THREADS`] threads, or
+/// `MDKB_ORT_THREADS` when the daemon has it. Half the cores (7 of 14) was
+/// faster per store, but a migration of every store held about seven cores for
+/// hours with nobody waiting for it (2026-11-23); a low nice value lowers the
+/// child's priority, not its heat or its share of an idle machine.
 ///
 /// The caller must hold no store lock: the child takes writer admission itself.
 /// The health marker is invalidated before the child writes; the caller verifies
@@ -1741,10 +1739,6 @@ fn regenerate_in_child(
         .args(["--format", "json", "update", "--reembed"])
         .current_dir(root)
         .env("MDKB_NO_DAEMON", "1")
-        .env(
-            crate::llm::ORT_THREADS_ENV,
-            crate::llm::regeneration_threads().to_string(),
-        )
         .stdin(std::process::Stdio::null())
         .output()?;
     if !output.status.success() {

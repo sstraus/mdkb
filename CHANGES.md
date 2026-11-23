@@ -1,5 +1,45 @@
 # Changelog
 
+## 4.0.0 (2026-11-23)
+
+A major version for the command-line and configuration changes that 3.16.0
+already shipped: removed and renamed commands (`experiment`, the `search` file
+filter, the overlapping read commands) and removed `daemon.toml` keys
+(`socket_path`). Scripts written against 3.14 need the replacements listed
+under 3.16.0 and 3.15.0 below.
+
+### Added
+
+- **Grok CLI and Antigravity CLI (`agy`) setup.** `mdkb setup mcp grok|agy`
+  registers the MCP server (`~/.grok/config.toml`,
+  `~/.gemini/config/mcp_config.json`); `mdkb setup hooks agy` adds an mdkb hook
+  group to `~/.gemini/config/hooks.json`, and `mdkb hook agy <event>` speaks
+  agy's own hook protocol, so memory warmup and prompt recall reach an agy model
+  (prompt recall runs once per prompt, not before every model call). `mdkb setup
+  hooks grok` registers the tool and stop hooks only: Grok drops session and
+  prompt hook context, and it refuses while Grok already runs the Claude Code
+  hooks. Each has a matching `setup remove`. Measured on grok 1.0.89 and agy
+  1.5.10 (story 095-9bbf).
+
+### Changed
+
+- **Automatic re-embedding uses two threads.** The background migration that
+  follows a model change ran with half the cores (7 of 14); migrating every
+  store kept the machine busy for hours. It now uses the default ONNX budget of
+  two threads (`MDKB_ORT_THREADS` still overrides it). A store takes about
+  2.8x longer and costs less CPU in total. Reported by the maintainer.
+
+### Fixed
+
+- **Repositories without `.mdkb/config.toml` migrate to the `daemon.toml`
+  model.** The background migration and `update --reembed` fell back to the
+  built-in MiniLM for such a repository, while search used the model chosen in
+  `~/.mdkb/daemon.toml`. The daemon refused the migration every time it opened
+  the store ("embedding configuration changed"), so the store stayed
+  lexical-only. Both now use the machine-wide model when the repository has no
+  config file. Found by the maintainer while switching every repository to
+  Granite (story 094-9a63).
+
 ## 3.16.0 (2026-11-23)
 
 First public release since 3.14.0. It publishes the changes of 3.15.0 below,

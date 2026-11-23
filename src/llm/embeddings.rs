@@ -243,7 +243,7 @@ fn cap_rayon_global_pool() {
 /// Measured 2026-09-21 on 14 cores: `mdkb update` at the caller's priority held
 /// 900–1080% and took the load average from 10 to 27. Reniced to +15 it still
 /// held 858% with the machine otherwise idle, while a higher-priority
-/// competitor ran unimpeded.
+/// process competing for the cores ran unimpeded.
 pub const DEFAULT_EMBED_NICE: i32 = 15;
 
 /// Lower this process's scheduling priority, permanently.

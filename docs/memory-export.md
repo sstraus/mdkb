@@ -79,4 +79,4 @@ Fields reset on import: `access_count` → 0, `last_accessed` → null, `confirm
 - **Version control** — commit `.mdkb/memory/entries/` to track knowledge over time
 - **Hand-editing** — edit `.md` files directly, then re-import
 - **Migration** — move entries between projects or machines
-- **Backup** — snapshot before `mdkb memory delete` operations
+- **Backup** — snapshot before `mdkb memory rm` operations

@@ -627,7 +627,7 @@ pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
 ///
 /// The lock file (`target.lock`) is never removed — it is a stable sentinel
 /// reused across invocations, consistent with the daemon-singleton pattern.
-fn locked_read_modify_write<F>(target: &Path, f: F) -> Result<()>
+pub(super) fn locked_read_modify_write<F>(target: &Path, f: F) -> Result<()>
 where
     F: FnOnce() -> Result<serde_json::Value>,
 {
@@ -707,7 +707,7 @@ where
 }
 
 /// Read and parse `path` as a JSON object. Missing or empty file yields `{}`.
-fn read_json_file(path: &Path, cmd: &str) -> Result<serde_json::Value> {
+pub(super) fn read_json_file(path: &Path, cmd: &str) -> Result<serde_json::Value> {
     if !path.exists() {
         return Ok(serde_json::json!({}));
     }
@@ -740,7 +740,7 @@ fn read_json_file(path: &Path, cmd: &str) -> Result<serde_json::Value> {
 /// Two cases: our own `_managedBy: "mdkb"` tag, and legacy untagged installs
 /// (pre-tag) whose command still invokes `mdkb hook <cli_event>`. Foreign hooks
 /// (rtk's `hook claude`, other tools) do not match — the marker is event-specific.
-fn is_mdkb_hook_entry(item: &serde_json::Value, cli_event: &str) -> bool {
+pub(super) fn is_mdkb_hook_entry(item: &serde_json::Value, cli_event: &str) -> bool {
     if item.get("_managedBy").and_then(|v| v.as_str()) == Some("mdkb") {
         return true;
     }
@@ -838,7 +838,7 @@ pub fn detect_hook_drift(settings: &[&serde_json::Value]) -> HookDrift {
 
 /// A settings file as JSON. Missing or unparseable files read as `{}` so drift
 /// detection never fails a caller — it degrades to "no mdkb hooks seen".
-fn read_settings_lenient(path: Result<PathBuf>) -> serde_json::Value {
+pub(super) fn read_settings_lenient(path: Result<PathBuf>) -> serde_json::Value {
     path.ok()
         .filter(|p| p.exists())
         .and_then(|p| std::fs::read_to_string(&p).ok())
@@ -1075,18 +1075,23 @@ fn write_hook_entries(
     // concurrent invocations serialize and each sees the other's changes.
     let mut registered_out = Vec::new();
     let mut skipped_out = Vec::new();
+    let mut merged_json = serde_json::Value::Null;
     let registered_ref = &mut registered_out;
     let skipped_ref = &mut skipped_out;
+    let merged_ref = &mut merged_json;
+    // The written value is returned as is. A read of the file after the lock
+    // is released races a concurrent writer's rename, which Windows refuses
+    // with "Access is denied" while the target is open.
     locked_read_modify_write(settings_path, || {
         let mut settings = read_json_file(settings_path, cmd_name)?;
         let (registered, skipped) =
             upsert_hook_entries(&mut settings, binary_path, disabled, daemon_required, host);
         *registered_ref = registered;
         *skipped_ref = skipped;
+        *merged_ref = settings.clone();
         Ok(settings)
     })?;
 
-    let merged_json = read_json_file(settings_path, cmd_name)?;
     Ok((registered_out, skipped_out, merged_json))
 }
 
