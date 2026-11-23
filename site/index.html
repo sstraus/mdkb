@@ -46,7 +46,7 @@
             <p class="kicker">Local · open source · one binary</p>
             <h1>Repository memory for <span class="hl">coding agents</span>.</h1>
             <p class="lede">
-              mdkb gives Claude Code, Codex and any MCP client one retrieval layer for the repository:
+              mdkb gives Claude Code, Codex, Grok, Antigravity, ego and any MCP client one retrieval layer for the repository:
               what the team decided, what the docs say, and what the code does. It finds the part that
               matters for this prompt, so the agent does not load the whole repository every turn.
             </p>
@@ -147,7 +147,7 @@
               <tr>
                 <th>Proof</th>
                 <td>Rarely measured.</td>
-                <td><code>mdkb eval</code> fails CI below a recall floor; <code>mdkb stats</code> reports hit rate and latency.</td>
+                <td><code>mdkb eval</code> fails CI below a recall floor; <code>mdkb status</code> reports hit rate and latency.</td>
               </tr>
             </tbody>
           </table>
@@ -162,8 +162,8 @@
             <p class="kicker">Recall without a tool call</p>
             <h2>Context arrives at the moment it is useful.</h2>
             <p class="lede">
-              Lifecycle hooks for Claude Code and Codex run through one dispatcher (command hooks, a Unix
-              socket or native HTTP). The agent does not have to remember to ask.
+              Lifecycle hooks for Claude Code, Codex, Antigravity, Grok and ego run through one dispatcher
+              (command hooks, a Unix socket or native HTTP). The agent does not have to remember to ask.
             </p>
           </div>
 
@@ -352,7 +352,7 @@ mdkb code impact NAME --depth 2</pre>
             </div>
             <div class="card">
               <h3>Hook statistics</h3>
-              <p><code>mdkb stats</code> reports hook activation, hit rate, latency and mining outcomes.</p>
+              <p><code>mdkb status</code> reports hook activation, hit rate, latency and mining outcomes.</p>
             </div>
             <div class="card">
               <h3>Private telemetry</h3>

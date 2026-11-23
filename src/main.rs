@@ -282,6 +282,7 @@ fn is_lifecycle_hook(command: &Command) -> bool {
                 | HookCommand::PostToolUse
                 | HookCommand::PreToolUse
                 | HookCommand::Stop
+                | HookCommand::Agy { .. }
         )
     )
 }
@@ -1693,6 +1694,20 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         println!("Restart Codex CLI to activate the mdkb MCP server.");
                     }
                 }
+                SetupMcpCommand::Grok { dry_run } => {
+                    let result = mdkb::cli::setup_grok::handle_setup_mcp_grok(dry_run)?;
+                    if !dry_run {
+                        println!("{}", result.message);
+                        println!("Restart grok to activate the mdkb MCP server.");
+                    }
+                }
+                SetupMcpCommand::Agy { dry_run } => {
+                    let result = mdkb::cli::setup_agy::handle_setup_mcp_agy(dry_run)?;
+                    if !dry_run {
+                        println!("{}", result.message);
+                        println!("Restart agy to activate the mdkb MCP server.");
+                    }
+                }
             },
             SetupCommand::Hooks(hooks_cmd) => match hooks_cmd {
                 SetupHooksCommand::Claude {
@@ -1751,6 +1766,19 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         println!("Opt out per-directory with .mdkbignore-hooks");
                     }
                 }
+                SetupHooksCommand::Grok { force, dry_run } => {
+                    let result = mdkb::cli::setup_grok::handle_setup_hooks_grok(dry_run, force)?;
+                    if !dry_run {
+                        println!("{}", result.message);
+                    }
+                }
+                SetupHooksCommand::Agy { dry_run } => {
+                    let result = mdkb::cli::setup_agy::handle_setup_hooks_agy(dry_run)?;
+                    if !dry_run {
+                        println!("{}", result.message);
+                        println!("Opt out per-directory with .mdkbignore-hooks");
+                    }
+                }
             },
             SetupCommand::Remove(remove_cmd) => match remove_cmd {
                 SetupRemoveCommand::Mcp(mcp_cmd) => match mcp_cmd {
@@ -1761,6 +1789,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     RemoveMcpCommand::Codex => {
                         let msg = mdkb::cli::setup::handle_remove_mcp_codex()?;
                         println!("{msg}");
+                    }
+                    RemoveMcpCommand::Grok => {
+                        println!("{}", mdkb::cli::setup_grok::handle_remove_mcp_grok()?);
+                    }
+                    RemoveMcpCommand::Agy => {
+                        println!("{}", mdkb::cli::setup_agy::handle_remove_mcp_agy()?);
                     }
                 },
                 SetupRemoveCommand::Hooks(hooks_cmd) => match hooks_cmd {
@@ -1779,6 +1813,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     RemoveHooksCommand::Codex => {
                         let msg = mdkb::cli::setup::handle_remove_hooks_codex()?;
                         println!("{msg}");
+                    }
+                    RemoveHooksCommand::Grok => {
+                        println!("{}", mdkb::cli::setup_grok::handle_remove_hooks_grok()?);
+                    }
+                    RemoveHooksCommand::Agy => {
+                        println!("{}", mdkb::cli::setup_agy::handle_remove_hooks_agy()?);
                     }
                 },
                 SetupRemoveCommand::Claude { scope } => {
@@ -1828,6 +1868,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             HookCommand::PostToolUse => dispatch_hook("hook.post_tool_use").await?,
             HookCommand::PreToolUse => dispatch_hook("hook.pre_tool_use").await?,
             HookCommand::Stop => dispatch_hook("hook.stop").await?,
+            HookCommand::Agy { event } => dispatch_agy_hook(event).await?,
             HookCommand::Reindex { files, root } => {
                 hook_client::call_reindex(files, root).await?;
             }
@@ -1880,6 +1921,26 @@ async fn dispatch_hook(method: &str) -> Result<()> {
         return Ok(());
     }
     hook_client::call_hook_event(method, event, Some(root)).await
+}
+
+/// An agy lifecycle hook: translate agy's event, dispatch it like any other
+/// hook, and answer in agy's format. Always prints a JSON object, `{}` when
+/// there is nothing to add, so agy never reads silence as a failed hook.
+async fn dispatch_agy_hook(event: mdkb::cli::host_agy::AgyEvent) -> Result<()> {
+    use mdkb::cli::host_agy;
+    let input = hook_logic::parse_event(&hook_logic::read_stdin_best_effort());
+    let reply = std::sync::Mutex::new(serde_json::json!({}));
+    if let Some((method, translated)) = host_agy::translate(event, &input)
+        && let Some(root) = hook_client::resolve_hook_root(&translated, None)
+        && !hook_logic::mdkbignore_hooks_present(&root)
+    {
+        let emit = |result: &serde_json::Value| {
+            *reply.lock().unwrap() = host_agy::reply(event, result);
+        };
+        hook_client::call_hook_event_with(method, translated, Some(root), &emit).await?;
+    }
+    println!("{}", reply.into_inner().unwrap());
+    Ok(())
 }
 
 /// How `mdkb mcp` runs on this invocation.

@@ -1286,6 +1286,18 @@ impl Config {
         config
     }
 
+    /// Load configuration for a destructive rebuild: a missing file is the
+    /// machine default (daemon.toml's model), any other error is refused so a
+    /// rebuild never silently replaces the configured encoder.
+    pub fn load_for_reembed(path: impl AsRef<Path>) -> Result<Self> {
+        match Self::load(path) {
+            Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
+                Ok(Self::machine_default())
+            }
+            other => other,
+        }
+    }
+
     pub(crate) fn is_removed_rerank_error(error: &crate::error::Error) -> bool {
         matches!(error.kind(), ErrorKind::ConfigInvalid { field, message }
             if field.starts_with("hooks.recall_rerank_") && message.starts_with("removed;"))

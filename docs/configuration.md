@@ -39,7 +39,7 @@ the reference for types and validation. Machine-wide settings live in
 | `[code.indexing] batch_size` | 500 | Files per indexing commit. |
 | `[code.indexing] debounce_ms` | 300 | File-watcher events inside this window count as one change. |
 | `[code.indexing] batch_idle_ms` | 30000 | Quiet time after the last change before an incremental reindex runs. Lower is fresher and costs more embedding passes. |
-| `[code.semantic_search] enabled`, `threshold` | true, 0.3 | Embedding-based code search (`search --scope semantic-code`) and its minimum score. |
+| `[code.semantic_search] enabled`, `threshold` | true, 0.3 | Embedding-based code search (`code search --semantic`) and its minimum score. |
 | `[code.duplication] similarity_threshold` | 0.7 | Minimum cosine for a clone pair that the structural pass did not already group. |
 | `[code.duplication] hamming_threshold` | 6 | Bits two structural fingerprints may differ by and still group. |
 | `[code.duplication] min_nodes` | 30 | Smallest body (named AST nodes) that `dup` reports. |

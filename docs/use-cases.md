@@ -7,7 +7,7 @@ a person page and three Python files, run on 2026-11-21 with main after the
 command-audit fixes (mdkb 3.14.0 and older differ where
 [the audit](command-audit-2026-11-21.md) lists a defect).
 
-For a compact model-facing version, read [`llms.txt`](../llms.txt). For every
+For a compact model-facing version, read [`llms.txt`](https://mdkb.tuicommander.com/llms.txt). For every
 flag, run `mdkb <command> --help`.
 
 Contents:
@@ -322,7 +322,7 @@ exponential backoff for payments") pass the title check. Search before you
 write:
 
 ```
-mdkb search "the claim in plain words" --scope memory
+mdkb search "the claim in plain words" --memory
 ```
 
 Then update the existing slug with `memory add SAME_ID ...` (it is an upsert).
@@ -340,7 +340,7 @@ Created evolution relationship #1: adr/0002-queues-v2.md supersedes adr/0001-que
 $ mdkb evolve current adr/0001-queues.md
 Current version: [2] docs:adr/0002-queues-v2.md - Replace retry queue with outbox
 
-$ mdkb search "payment retries" --scope docs
+$ mdkb search "payment retries" --docs
 [2] docs:adr/0002-queues-v2.md - Replace retry queue with outbox (score: 1.00)
 ...
 ```

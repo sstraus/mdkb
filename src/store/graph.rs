@@ -963,7 +963,7 @@ mod tests {
     #[test]
     fn a_path_still_wins_over_another_document_s_alias() {
         // The regression that matters: identity resolution is a fallback, not a
-        // competitor. If it ever runs first, every reference that happens to
+        // rival. If it ever runs first, every reference that happens to
         // look like someone's alias stops pointing at the file it names.
         let conn = setup_db();
         let by_path = insert_doc(&conn, "alice.md");

@@ -136,6 +136,7 @@ mdkb search 'Y' --root NAME    # or --root '*' for all repos in scope
 
 ## Operations
 
+- Connect a client: `mdkb setup mcp claude|codex|grok|agy`; hooks: `mdkb setup hooks claude|codex|ego|grok|agy` (Grok runs only the tool hooks; it drops session and prompt context).
 - The daemon owns every write. The CLI routes mutations to it. `MDKB_NO_DAEMON=1 mdkb CMD` runs in-process for debugging.
 - After a binary upgrade: `mdkb daemon restart`, then `mdkb repos refresh --only outdated`.
 - `mdkb compact` vacuums both databases. `mdkb memory prune` archives expired and aged lifecycle entries.
@@ -143,12 +144,12 @@ mdkb search 'Y' --root NAME    # or --root '*' for all repos in scope
 
 ## Docs
 
-- [Use cases with worked examples](docs/use-cases.md): one page per job (search, correlation, deduplication, consolidation, maintenance).
-- [Command audit 2026-11-21](docs/command-audit-2026-11-21.md): verified behaviour, defects, and improvement proposals per command.
-- [README CLI reference](README.md#cli-reference)
-- [Knowledge graph](docs/graph.md): edges, identities, relation modes.
-- [Memory guidelines](docs/memory-guidelines.md): what to store and how.
-- [Hooks](docs/hooks.md): automatic recall and reindex.
-- [External ingest](docs/external-ingest.md): daemon RPC for non-markdown sources.
-- [Daemon RPC](docs/daemon-rpc.md): socket framing, error codes, and the symbol lookups editor integrations use.
-- [Agent search strategy](docs/agent-search-strategy.md)
+- [Use cases with worked examples](https://github.com/sstraus/mdkb/blob/main/docs/use-cases.md): one page per job (search, correlation, deduplication, consolidation, maintenance).
+- [Command audit 2026-11-21](https://github.com/sstraus/mdkb/blob/main/docs/command-audit-2026-11-21.md): verified behaviour, defects, and improvement proposals per command.
+- [README CLI reference](https://github.com/sstraus/mdkb/blob/main/README.md#cli-reference)
+- [Knowledge graph](https://github.com/sstraus/mdkb/blob/main/docs/graph.md): edges, identities, relation modes.
+- [Memory guidelines](https://github.com/sstraus/mdkb/blob/main/docs/memory-guidelines.md): what to store and how.
+- [Hooks](https://github.com/sstraus/mdkb/blob/main/docs/hooks.md): automatic recall and reindex.
+- [External ingest](https://github.com/sstraus/mdkb/blob/main/docs/external-ingest.md): daemon RPC for non-markdown sources.
+- [Daemon RPC](https://github.com/sstraus/mdkb/blob/main/docs/daemon-rpc.md): socket framing, error codes, and the symbol lookups editor integrations use.
+- [Agent search strategy](https://github.com/sstraus/mdkb/blob/main/docs/agent-search-strategy.md)
