@@ -67,8 +67,8 @@ impl Fixture {
         serde_json::from_str(&self.ok(&[
             "--format",
             "json",
-            "session",
-            "index",
+            "update",
+            "--sessions",
             "--sessions-path",
             self.sessions_base.to_str().unwrap(),
             "--project-root",

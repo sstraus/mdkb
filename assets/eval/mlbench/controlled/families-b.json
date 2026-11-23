@@ -1,0 +1,122 @@
+[
+{"family": "F07-caching", "docs": [
+ {"id": "cache-ttl-catalog", "kind": "doc", "type": "topic",
+  "en": ["Catalog cache lifetime", "Product catalog entries stay in the Redis cache for 10 minutes. A price change publishes a catalog.updated event that deletes the affected keys at once, so the 10 minute lifetime only matters when the event is lost."],
+  "it": ["Durata della cache del catalogo", "Le voci del catalogo prodotti restano nella cache Redis per 10 minuti. Una modifica di prezzo pubblica un evento catalog.updated che cancella subito le chiavi interessate, quindi la durata di 10 minuti conta solo quando l'evento va perso."]},
+ {"id": "cache-stampede", "kind": "memory", "type": "problem",
+  "en": ["Cache stampede after Redis restart", "When Redis restarted at peak time, 3,000 requests missed the cache together and all queried the database, which went to 100% CPU. Fix: a per-key lock so only one request rebuilds a missing entry while the others wait up to 200 ms for it."],
+  "it": ["Effetto valanga sulla cache dopo il riavvio di Redis", "Quando Redis si è riavviato nell'ora di punta, 3.000 richieste hanno mancato la cache insieme e hanno interrogato tutte il database, che è arrivato al 100% di CPU. Correzione: un lock per chiave, così una sola richiesta ricostruisce la voce mancante e le altre la aspettano fino a 200 ms."]},
+ {"id": "cache-no-user-data", "kind": "memory", "type": "decision",
+  "en": ["Never cache per-user responses in the CDN", "The CDN caches only anonymous GET responses. A response that depends on the session cookie must send Cache-Control: private. In May a dashboard page was cached publicly and one customer saw another customer's name."],
+  "it": ["Mai mettere in cache sulla CDN risposte specifiche per utente", "La CDN mette in cache solo risposte GET anonime. Una risposta che dipende dal cookie di sessione deve inviare Cache-Control: private. A maggio una pagina della dashboard è stata messa in cache pubblicamente e un cliente ha visto il nome di un altro cliente."]},
+ {"id": "cache-local-lru", "kind": "doc", "type": "topic",
+  "en": ["In-process LRU cache", "Each API pod keeps an in-memory LRU cache of 5,000 feature-flag and tenant-settings entries. It is not shared between pods and has a 30 second lifetime, so two pods can disagree for up to 30 seconds after a change."],
+  "it": ["Cache LRU in-process", "Ogni pod dell'API tiene in memoria una cache LRU di 5.000 voci con feature flag e impostazioni dei tenant. Non è condivisa tra i pod e dura 30 secondi, quindi due pod possono dare risultati diversi per un massimo di 30 secondi dopo una modifica."]},
+ {"id": "cache-key-version", "kind": "memory", "type": "topic",
+  "en": ["Cache keys carry a schema version", "Every cache key starts with a version prefix such as v7:catalog:<id>. When the cached object format changes, bump the prefix instead of flushing Redis; old keys expire on their own."],
+  "it": ["Le chiavi di cache includono una versione dello schema", "Ogni chiave di cache inizia con un prefisso di versione come v7:catalog:<id>. Quando cambia il formato dell'oggetto in cache, si incrementa il prefisso invece di svuotare Redis; le chiavi vecchie scadono da sole."]}
+ ],
+ "intents": [
+  {"id": "q031", "rel": {"cache-ttl-catalog": 3}, "tags": [], "en": "a product price changed but the old price is still shown, how long is the catalog cached?", "it": "è cambiato il prezzo di un prodotto ma si vede ancora quello vecchio, per quanto resta in cache il catalogo?"},
+  {"id": "q032", "rel": {"cache-stampede": 3}, "tags": ["long"], "en": "the database hit full CPU right after Redis came back up, how did we prevent that from happening again?", "it": "il database è andato al 100% di CPU appena Redis è ripartito, come abbiamo evitato che si ripeta?"},
+  {"id": "q033", "rel": {"cache-no-user-data": 3}, "tags": ["negation"], "en": "can the CDN cache a logged-in dashboard page?", "it": "la CDN può mettere in cache una pagina della dashboard di un utente loggato?"},
+  {"id": "q034", "rel": {"cache-local-lru": 3}, "tags": [], "en": "two API pods return different feature flag values for the same tenant", "it": "due pod dell'API restituiscono valori diversi dei feature flag per lo stesso tenant"},
+  {"id": "q035", "rel": {"cache-key-version": 3}, "tags": ["short"], "en": "should I flush Redis after changing a cached format?", "it": "devo fare flush di Redis dopo aver cambiato il formato in cache?"}
+ ]},
+{"family": "F08-flags", "docs": [
+ {"id": "flag-naming", "kind": "doc", "type": "topic",
+  "en": ["Feature flag naming", "Flag names use team.area.feature in lower case, for example billing.invoices.pdf_v2. A flag that changes a default for everybody also needs an owner and a removal date in the flag description."],
+  "it": ["Nomi dei feature flag", "I nomi dei flag seguono team.area.funzione in minuscolo, per esempio billing.invoices.pdf_v2. Un flag che cambia un comportamento predefinito per tutti deve avere anche un responsabile e una data di rimozione nella descrizione."]},
+ {"id": "flag-cleanup-90d", "kind": "memory", "type": "decision",
+  "en": ["Remove release flags within 90 days", "A release flag that has been at 100% for 90 days is removed with its dead branch. Old flags hid a bug in March because nobody tested the off path anymore. Permanent kill switches are exempt and carry the ops. prefix."],
+  "it": ["Rimuovere i flag di rilascio entro 90 giorni", "Un flag di rilascio rimasto al 100% per 90 giorni viene rimosso insieme al ramo di codice morto. A marzo i flag vecchi hanno nascosto un bug perché nessuno testava più il percorso disattivato. I kill switch permanenti sono esclusi e hanno il prefisso ops."]},
+ {"id": "flag-percent-rollout", "kind": "doc", "type": "topic",
+  "en": ["Percentage rollouts", "A percentage rollout hashes the tenant ID, not the user ID, so all users of one tenant see the same behavior. Increasing the percentage only adds tenants; a tenant that already has the feature keeps it."],
+  "it": ["Rilascio graduale a percentuale", "Il rilascio a percentuale calcola l'hash dell'ID del tenant, non dell'utente, così tutti gli utenti di un tenant vedono lo stesso comportamento. Aumentare la percentuale aggiunge solo tenant; un tenant che ha già la funzione la mantiene."]},
+ {"id": "flag-kill-switch-search", "kind": "memory", "type": "topic",
+  "en": ["Kill switch for search suggestions", "The flag ops.search.suggestions turns off search suggestions in under 10 seconds without a deploy. Use it when the suggestion service slows down the search page; the main search keeps working."],
+  "it": ["Kill switch dei suggerimenti di ricerca", "Il flag ops.search.suggestions disattiva i suggerimenti di ricerca in meno di 10 secondi senza deploy. Va usato quando il servizio dei suggerimenti rallenta la pagina di ricerca; la ricerca principale continua a funzionare."]},
+ {"id": "flag-default-off-test", "kind": "memory", "type": "problem",
+  "en": ["Tests ran only with flags on", "The test fixture enabled every flag, so the production default (off) was never tested and a null pointer shipped in pdf_v1. Now each flagged code path runs its tests once with the flag on and once with it off."],
+  "it": ["I test giravano solo con i flag attivi", "La fixture dei test attivava ogni flag, così il default di produzione (disattivato) non veniva mai testato ed è finito in produzione un null pointer in pdf_v1. Ora ogni percorso con un flag esegue i test una volta con il flag attivo e una volta disattivato."]}
+ ],
+ "intents": [
+  {"id": "q036", "rel": {"flag-naming": 3}, "tags": ["short"], "en": "how should I name a new feature flag?", "it": "come devo chiamare un nuovo feature flag?"},
+  {"id": "q037", "rel": {"flag-cleanup-90d": 3}, "tags": [], "en": "when do we delete a flag that is already fully rolled out?", "it": "quando eliminiamo un flag già attivo per tutti?"},
+  {"id": "q038", "rel": {"flag-percent-rollout": 3}, "tags": ["long"], "en": "during a 20% rollout some users of the same company see the new screen and others don't, is that expected?", "it": "durante un rollout al 20% alcuni utenti della stessa azienda vedono la nuova schermata e altri no, è normale?"},
+  {"id": "q039", "rel": {"flag-kill-switch-search": 3}, "tags": ["identifier"], "en": "the search page is slow because of suggestions, can I switch them off without deploying?", "it": "la pagina di ricerca è lenta per colpa dei suggerimenti, posso spegnerli senza fare un deploy?"},
+  {"id": "q040", "rel": {"flag-default-off-test": 3, "flag-cleanup-90d": 1}, "tags": ["negation"], "en": "a bug reached production only on the flag-off path, why didn't tests catch it?", "it": "un bug è arrivato in produzione solo con il flag spento, perché i test non l'hanno trovato?"}
+ ]},
+{"family": "F09-observability", "docs": [
+ {"id": "obs-log-levels", "kind": "doc", "type": "topic",
+  "en": ["Log level policy", "Production services log at INFO. DEBUG is enabled per pod for at most one hour with arpctl log-level <pod> debug. ERROR is for failures that need a human; an expected validation failure is logged at INFO."],
+  "it": ["Regole sui livelli di log", "I servizi in produzione loggano a livello INFO. Il livello DEBUG si attiva per singolo pod per al massimo un'ora con arpctl log-level <pod> debug. ERROR è riservato ai guasti che richiedono una persona; un errore di validazione previsto va loggato come INFO."]},
+ {"id": "obs-trace-sampling", "kind": "memory", "type": "decision",
+  "en": ["Trace sampling at 5% plus all errors", "We keep 5% of traces at random and 100% of traces that contain an error or take more than 2 seconds. Full sampling cost 4x more storage and nobody looked at the extra fast traces."],
+  "it": ["Campionamento delle trace al 5% più tutti gli errori", "Teniamo il 5% delle trace a caso e il 100% di quelle che contengono un errore o durano più di 2 secondi. Il campionamento completo costava 4 volte più storage e nessuno guardava le trace veloci in più."]},
+ {"id": "obs-cardinality", "kind": "memory", "type": "problem",
+  "en": ["Metrics bill exploded from a user_id label", "Someone added user_id as a label on http_requests_total and the time series count went from 40,000 to 2 million in a day. Labels must have bounded values: route, method and status class only."],
+  "it": ["Costo delle metriche esploso per un'etichetta user_id", "Qualcuno ha aggiunto user_id come etichetta su http_requests_total e le serie temporali sono passate da 40.000 a 2 milioni in un giorno. Le etichette devono avere valori limitati: solo route, metodo e classe di status."]},
+ {"id": "obs-alert-slo", "kind": "doc", "type": "topic",
+  "en": ["Alerts are based on SLO burn rate", "Pages fire when the error budget of the 99.9% availability SLO burns 14 times faster than allowed over one hour. Single CPU or memory spikes create tickets, not pages."],
+  "it": ["Gli alert si basano sul burn rate degli SLO", "Le chiamate di reperibilità partono quando l'error budget dello SLO di disponibilità al 99,9% si consuma 14 volte più velocemente del consentito in un'ora. I singoli picchi di CPU o memoria creano ticket, non chiamate."]},
+ {"id": "obs-request-id", "kind": "doc", "type": "topic",
+  "en": ["Request ID propagation", "The gateway sets X-Request-Id on every request and each service copies it into its logs and outgoing calls. Support asks customers for this ID; with it one log query shows the whole request path."],
+  "it": ["Propagazione del request ID", "Il gateway imposta X-Request-Id su ogni richiesta e ogni servizio lo copia nei propri log e nelle chiamate in uscita. Il supporto chiede questo ID ai clienti; con quello una sola query sui log mostra tutto il percorso della richiesta."]}
+ ],
+ "intents": [
+  {"id": "q041", "rel": {"obs-log-levels": 3}, "tags": ["identifier"], "en": "how do I turn on debug logging for a single pod?", "it": "come attivo il log di debug su un solo pod?"},
+  {"id": "q042", "rel": {"obs-trace-sampling": 3}, "tags": [], "en": "why can't I find the trace of a fast successful request?", "it": "perché non trovo la trace di una richiesta veloce andata a buon fine?"},
+  {"id": "q043", "rel": {"obs-cardinality": 3}, "tags": ["negation", "identifier"], "en": "can I add the customer id as a label on a Prometheus metric?", "it": "posso aggiungere l'id del cliente come label su una metrica Prometheus?"},
+  {"id": "q044", "rel": {"obs-alert-slo": 3}, "tags": ["short"], "en": "what wakes up the on-call engineer?", "it": "cosa fa scattare la reperibilità di notte?"},
+  {"id": "q045", "rel": {"obs-request-id": 3}, "tags": ["long"], "en": "a customer sent us a failing request reference, how do I find every log line for it across services?", "it": "un cliente ci ha mandato il riferimento di una richiesta fallita, come trovo tutte le righe di log tra i vari servizi?"}
+ ]},
+{"family": "F10-deploy", "docs": [
+ {"id": "deploy-canary", "kind": "doc", "type": "topic",
+  "en": ["Canary deploys", "Every backend release goes first to one canary pod that receives 5% of traffic for 15 minutes. The rollout continues only if its error rate and p95 latency stay within 10% of the stable pods."],
+  "it": ["Deploy canary", "Ogni rilascio del backend va prima su un pod canary che riceve il 5% del traffico per 15 minuti. Il rollout continua solo se il tasso di errore e la latenza p95 restano entro il 10% rispetto ai pod stabili."]},
+ {"id": "deploy-freeze-friday", "kind": "memory", "type": "decision",
+  "en": ["No production deploys after Thursday 16:00", "From Thursday 16:00 to Monday 09:00 only hotfixes approved by the on-call lead are deployed. Two weekend incidents in a row came from Friday afternoon releases."],
+  "it": ["Niente deploy in produzione dopo giovedì alle 16:00", "Da giovedì alle 16:00 a lunedì alle 09:00 si rilasciano solo hotfix approvati dal responsabile di reperibilità. Due incidenti consecutivi nel fine settimana sono nati da rilasci del venerdì pomeriggio."]},
+ {"id": "deploy-rollback", "kind": "doc", "type": "topic",
+  "en": ["Rolling back a release", "arpctl rollback <service> returns to the previous image in about two minutes. It does not undo database migrations; a release with a non-reversible migration is marked forward-only in its release notes."],
+  "it": ["Rollback di un rilascio", "arpctl rollback <service> torna all'immagine precedente in circa due minuti. Non annulla le migrazioni del database; un rilascio con una migrazione non reversibile è marcato forward-only nelle note di rilascio."]},
+ {"id": "deploy-readiness-probe", "kind": "memory", "type": "problem",
+  "en": ["Pods got traffic before the cache was warm", "The readiness probe returned 200 as soon as the HTTP server started, before the catalog cache was loaded, and the first requests took 8 seconds. The probe now waits for the warm-up to finish."],
+  "it": ["I pod ricevevano traffico prima che la cache fosse calda", "La readiness probe rispondeva 200 appena partiva il server HTTP, prima che la cache del catalogo fosse caricata, e le prime richieste impiegavano 8 secondi. Ora la probe aspetta la fine del warm-up."]},
+ {"id": "deploy-image-tags", "kind": "memory", "type": "decision",
+  "en": ["Deploy by image digest, not by tag", "Manifests reference images by sha256 digest. A retagged latest image once deployed untested code to two clusters. Tags stay for humans; the deploy tool resolves them to digests."],
+  "it": ["Deploy tramite digest dell'immagine, non tramite tag", "I manifest indicano le immagini con il digest sha256. Una volta un'immagine latest ritaggata ha portato codice non testato su due cluster. I tag restano per le persone; lo strumento di deploy li converte in digest."]}
+ ],
+ "intents": [
+  {"id": "q046", "rel": {"deploy-canary": 3}, "tags": [], "en": "how much traffic does a new release get before it reaches every pod?", "it": "quanto traffico riceve un nuovo rilascio prima di arrivare su tutti i pod?"},
+  {"id": "q047", "rel": {"deploy-freeze-friday": 3}, "tags": ["negation", "short"], "en": "can I deploy on Friday afternoon?", "it": "posso fare un deploy venerdì pomeriggio?"},
+  {"id": "q048", "rel": {"deploy-rollback": 3, "mig-v42-rollback": 1}, "tags": ["identifier"], "en": "does arpctl rollback also revert the schema migration?", "it": "arpctl rollback annulla anche la migrazione dello schema?"},
+  {"id": "q049", "rel": {"deploy-readiness-probe": 3}, "tags": ["long"], "en": "right after every deploy the first requests are extremely slow and then everything is fine", "it": "subito dopo ogni deploy le prime richieste sono lentissime e poi va tutto bene"},
+  {"id": "q050", "rel": {"deploy-image-tags": 3}, "tags": ["identifier"], "en": "why do our manifests use sha256 instead of the latest tag?", "it": "perché i nostri manifest usano sha256 invece del tag latest?"}
+ ]},
+{"family": "F11-backups", "docs": [
+ {"id": "backup-schedule", "kind": "doc", "type": "topic",
+  "en": ["Database backup schedule", "The primary database takes a full snapshot every night at 02:00 UTC and ships its write-ahead log every 5 minutes. The recovery point objective is therefore 5 minutes. Snapshots are kept for 35 days."],
+  "it": ["Pianificazione dei backup del database", "Il database primario fa uno snapshot completo ogni notte alle 02:00 UTC e invia il write-ahead log ogni 5 minuti. L'obiettivo di punto di ripristino è quindi di 5 minuti. Gli snapshot sono conservati per 35 giorni."]},
+ {"id": "backup-restore-drill", "kind": "memory", "type": "decision",
+  "en": ["Quarterly restore drill", "Once a quarter we restore the latest snapshot into an empty cluster and run the smoke tests against it. The first drill found that the backups lacked the extensions schema and could not be restored."],
+  "it": ["Prova di ripristino trimestrale", "Una volta a trimestre ripristiniamo l'ultimo snapshot in un cluster vuoto ed eseguiamo gli smoke test. La prima prova ha scoperto che nei backup mancava lo schema delle estensioni e non si potevano ripristinare."]},
+ {"id": "backup-object-storage", "kind": "doc", "type": "topic",
+  "en": ["Uploaded files backup", "Customer uploads in object storage are versioned, and deleted objects stay recoverable for 30 days. A second copy goes to another region every hour. Versioning is not a backup of the database."],
+  "it": ["Backup dei file caricati", "Gli upload dei clienti nell'object storage sono versionati e gli oggetti cancellati restano recuperabili per 30 giorni. Una seconda copia va in un'altra regione ogni ora. Il versioning non è un backup del database."]},
+ {"id": "backup-encryption-key", "kind": "memory", "type": "problem",
+  "en": ["Backups encrypted with a deleted key", "In January a key rotation script deleted the old KMS key while snapshots from the previous month still used it. Those snapshots were unreadable. Old keys are now disabled for 60 days before deletion, which outlives snapshot retention."],
+  "it": ["Backup cifrati con una chiave cancellata", "A gennaio uno script di rotazione ha cancellato la vecchia chiave KMS mentre gli snapshot del mese prima la usavano ancora. Quegli snapshot erano illeggibili. Ora le chiavi vecchie restano disattivate per 60 giorni prima della cancellazione, più della durata di conservazione degli snapshot."]},
+ {"id": "backup-pitr", "kind": "doc", "type": "topic",
+  "en": ["Point-in-time restore", "arpctl db restore --at '2026-03-04T10:15:00Z' creates a new cluster at that moment from the nearest snapshot plus the log. It never overwrites the running database; the operator switches traffic after checking the data."],
+  "it": ["Ripristino a un istante preciso", "arpctl db restore --at '2026-03-04T10:15:00Z' crea un nuovo cluster a quell'istante partendo dallo snapshot più vicino più il log. Non sovrascrive mai il database in esecuzione; l'operatore sposta il traffico dopo aver controllato i dati."]}
+ ],
+ "intents": [
+  {"id": "q051", "rel": {"backup-schedule": 3, "backup-pitr": 1}, "tags": [], "en": "how much data can we lose at most if the database dies?", "it": "quanti dati possiamo perdere al massimo se il database muore?"},
+  {"id": "q052", "rel": {"backup-restore-drill": 3}, "tags": [], "en": "do we ever check that backups can actually be restored?", "it": "verifichiamo mai che i backup si possano davvero ripristinare?"},
+  {"id": "q053", "rel": {"backup-object-storage": 3}, "tags": ["short"], "en": "recover a file a customer deleted", "it": "recuperare un file cancellato da un cliente"},
+  {"id": "q054", "rel": {"backup-encryption-key": 3}, "tags": ["identifier", "long"], "en": "some old snapshots cannot be decrypted after the KMS rotation, what happened and how is it prevented now?", "it": "alcuni snapshot vecchi non si decifrano più dopo la rotazione KMS, cosa è successo e come lo evitiamo adesso?"},
+  {"id": "q055", "rel": {"backup-pitr": 3}, "tags": ["negation"], "en": "does a point-in-time restore overwrite the production database?", "it": "un ripristino point-in-time sovrascrive il database di produzione?"}
+ ]}
+]

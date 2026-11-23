@@ -215,7 +215,7 @@ fn concurrent_memory_and_vector_writes_leave_one_sound_index() {
                     )
                     .expect("insert memory entry");
                 let rowid = ctx.conn.last_insert_rowid();
-                vectors::store_memory_embedding(&ctx.conn, rowid, &embedding, "stress")
+                vectors::store_memory_embedding(&ctx.conn, rowid, &embedding, "AllMiniLML6V2")
                     .expect("store memory embedding");
 
                 if n % 3 == 0 {

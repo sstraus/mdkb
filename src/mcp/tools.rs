@@ -534,7 +534,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// source: live lines; literals: AST values; symbols: definitions; semantic-code: concepts; docs; memory; knowledge: docs+memory; duplicates: audit. Legacy code and omitted docs+memory remain accepted. Field [tags] mark applicable scopes.
+    /// source: live lines; literals: AST values; symbols: definitions; semantic-code: concepts; docs; memory; knowledge: docs+memory, up to `limit` of each; duplicates: audit. Legacy code and omitted docs+memory remain accepted. Field [tags] mark applicable scopes.
     #[serde(default)]
     pub scope: Option<String>,
 
@@ -546,8 +546,9 @@ pub struct SearchParams {
     #[serde(default)]
     pub threshold: Option<f32>,
 
-    /// [symbols] file path substring. [duplicates] file path prefix; omit it to sweep the repository, which ignores query.
+    /// Removed: use `path`. Still deserialized, and hidden from the schema, so a stale caller gets an error that names the replacement instead of a silently ignored filter.
     #[serde(default)]
+    #[schemars(skip)]
     pub file: Option<String>,
 
     /// [memory] Minimum confidence 0.0-1.0, also applied to default docs+memory; omit or 0 for no filter.

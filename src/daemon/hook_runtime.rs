@@ -12,7 +12,7 @@ use super::registry::RepoRegistry;
 /// Max time to wait for hook requests that are already executing.
 ///
 /// `mdkb update` on a large repository legitimately runs for minutes, and the
-/// CLI that asked for it budgets an hour (`cli::hook_client::MUTATION_TIMEOUT`).
+/// CLI that asked for it waits as long as the daemon answers `ping`.
 /// Draining it under the five-second grace sized for idle sockets cut it off and
 /// reported a failed mutation for a write the daemon then finished anyway while
 /// the runtime dropped its blocking pool — the client saw `early eof`, the index
@@ -83,10 +83,24 @@ pub(crate) async fn drain_in_flight_work(
 /// for a refusal — silently changes when the CLI is allowed to write.
 pub const DISPATCHED_ERROR_CODE: i32 = -32603;
 
-/// Method `mdkb daemon status` uses to ask the running daemon which repos it
+/// A method that ran and was refused by the store before it wrote anything:
+/// an unknown memory id or document, a duplicate title, an evolution cycle, an
+/// invalid field. The answer is final. The caller prints it and does not run
+/// the request itself, which would only fail the same way after loading the
+/// store a second time. See [`crate::error::ErrorKind::is_validation_refusal`].
+pub const REJECTED_ERROR_CODE: i32 = -32010;
+
+/// Method `mdkb status` uses to ask the running daemon which repos it
 /// knows. Like `ping` it names no repository, so it is answered before the
 /// `params.root` requirement and never opens a store.
 pub const REPOS_METHOD: &str = "daemon.repos";
+
+/// Method `mdkb repos prune` uses to drop Gone roots from the daemon's own map.
+/// Names no repository and opens no store, like [`REPOS_METHOD`]. Params:
+/// `{"paths": [absolute path, ...], "dry_run": bool}`; no or empty `paths`
+/// selects every Gone root. A daemon without this method answers `-32602`
+/// ("missing 'params.root'") before dispatch: a refusal that wrote nothing.
+pub const PRUNE_METHOD: &str = "daemon.repos_prune";
 
 /// Parse a JSON-RPC request and route it through the shared dispatch layer.
 ///
@@ -142,6 +156,10 @@ pub(crate) async fn dispatch_hook_message(
         .to_string();
     }
 
+    if method == PRUNE_METHOD {
+        return prune_reply(id, &params, registry).await;
+    }
+
     let Some(root) = params.get("root").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)");
     };
@@ -185,6 +203,61 @@ pub(crate) async fn dispatch_hook_message(
         })
         .to_string(),
         Err(error) => rpc_error(id, error.code.0, &error.message),
+    }
+}
+
+/// Answer [`PRUNE_METHOD`]. Malformed params are refused before the map is
+/// touched (`-32602`); a failed write is the post-dispatch code, because the
+/// in-memory map was changed and restored on the way.
+async fn prune_reply(id: Value, params: &Value, registry: &Arc<RepoRegistry>) -> String {
+    let dry_run = match params.get("dry_run") {
+        None => false,
+        Some(Value::Bool(b)) => *b,
+        Some(_) => {
+            return rpc_error(
+                id,
+                -32602,
+                "daemon.repos_prune: 'dry_run' must be a boolean",
+            );
+        }
+    };
+    let paths: Vec<std::path::PathBuf> = match params.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(value) => match serde_json::from_value(value.clone()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return rpc_error(
+                    id,
+                    -32602,
+                    &format!("daemon.repos_prune: bad 'paths': {error}"),
+                );
+            }
+        },
+    };
+    if let Some(relative) = paths.iter().find(|p| !p.is_absolute()) {
+        return rpc_error(
+            id,
+            -32602,
+            &format!(
+                "daemon.repos_prune: '{}' is not an absolute path",
+                relative.display()
+            ),
+        );
+    }
+    let owner = Arc::clone(registry);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let selected = (!paths.is_empty()).then_some(paths.as_slice());
+        owner.prune_gone_roots(selected, dry_run)
+    })
+    .await;
+    match outcome {
+        Ok(Ok(report)) => json!({"jsonrpc": "2.0", "id": id, "result": report}).to_string(),
+        Ok(Err(why)) => rpc_error(id, DISPATCHED_ERROR_CODE, &why),
+        Err(error) => rpc_error(
+            id,
+            DISPATCHED_ERROR_CODE,
+            &format!("prune task failed: {error}"),
+        ),
     }
 }
 
@@ -323,11 +396,117 @@ mod tests {
             "Repo path must not be empty"
         );
         assert_eq!(
-            RepoHandle::open(empty, &toml::Table::new())
+            RepoHandle::open(empty, &DaemonConfig::default())
                 .unwrap_err()
                 .to_string(),
             "Repo path must not be empty"
         );
         assert_eq!(registry.active_count(), 1);
+    }
+
+    fn state_registry(state: &Path) -> Arc<RepoRegistry> {
+        Arc::new(RepoRegistry::new(DaemonConfig {
+            state_dir: Some(state.to_path_buf()),
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().into_owned()],
+            ..DaemonConfig::default()
+        }))
+    }
+
+    async fn call(registry: &Arc<RepoRegistry>, method: &str, params: Value) -> Value {
+        let dctx = Arc::new(DispatchContext {
+            metrics: Arc::new(UsageMetrics::new()),
+            session_id: Arc::new(AtomicI64::new(0)),
+            persistent_call_count: Arc::new(AtomicU64::new(0)),
+            optimize_interval_calls: 200,
+            hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
+            background: None,
+        });
+        let body = json!({"jsonrpc": "2.0", "id": 3, "method": method, "params": params});
+        let reply = dispatch_hook_message(body.to_string().as_bytes(), registry, &dctx).await;
+        serde_json::from_str(&reply).unwrap()
+    }
+
+    /// Catches: the daemon's own map keeping a root that vanished while it ran
+    /// (what the CLI sees in `repos list`), a dry run that mutates, and a
+    /// prune that requires `params.root` like a repo method.
+    #[tokio::test]
+    async fn prune_method_drops_a_vanished_root_from_the_live_daemon_map() {
+        let state = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (stale, keep) = (tmp.path().join("stale"), tmp.path().join("keep"));
+        for r in [&stale, &keep] {
+            std::fs::create_dir_all(r.join(".mdkb")).unwrap();
+        }
+        let registry = state_registry(state.path());
+        registry.get_or_open(&stale).unwrap();
+        registry.get_or_open(&keep).unwrap();
+        let stale = stale.canonicalize().unwrap();
+        std::fs::remove_dir_all(&stale).unwrap();
+
+        let dry = call(
+            &registry,
+            PRUNE_METHOD,
+            json!({"paths": [stale], "dry_run": true}),
+        )
+        .await;
+        assert_eq!(dry["result"]["dry_run"], true);
+        assert_eq!(dry["result"]["removed"], json!([stale]));
+        assert!(registry.listed_roots().contains(&stale));
+
+        let done = call(&registry, PRUNE_METHOD, json!({"paths": [stale]})).await;
+        assert_eq!(done["result"]["removed"], json!([stale]));
+        let listed = registry.listed_roots();
+        assert!(!listed.contains(&stale) && listed.contains(&keep.canonicalize().unwrap()));
+        let persisted = std::fs::read_to_string(state.path().join("repos.json")).unwrap();
+        assert!(
+            !persisted.contains(stale.to_string_lossy().as_ref()),
+            "{persisted}"
+        );
+    }
+
+    /// Catches a relative or malformed selection reaching the map, where it
+    /// would be resolved against the daemon's cwd: with a live Gone root and a
+    /// real state dir, nothing is removed and `repos.json` is byte-identical.
+    #[tokio::test]
+    async fn prune_method_refuses_relative_paths_and_bad_params_before_any_change() {
+        let state = tempfile::TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stale = tmp.path().join("stale");
+        std::fs::create_dir_all(stale.join(".mdkb")).unwrap();
+        let registry = state_registry(state.path());
+        registry.get_or_open(&stale).unwrap();
+        let stale = stale.canonicalize().unwrap();
+        std::fs::remove_dir_all(&stale).unwrap();
+        let file = state.path().join("repos.json");
+        let before = std::fs::read(&file).unwrap();
+        for params in [
+            json!({"paths": ["relative/dir"]}),
+            json!({"paths": 7}),
+            json!({"dry_run": "yes"}),
+        ] {
+            let reply = call(&registry, PRUNE_METHOD, params.clone()).await;
+            assert_eq!(reply["error"]["code"], -32602, "{params}: {reply}");
+            assert!(registry.listed_roots().contains(&stale), "{params}");
+            assert_eq!(std::fs::read(&file).unwrap(), before, "{params}");
+        }
+    }
+
+    /// Recorded from this dispatcher, which is what a daemon built before
+    /// `daemon.repos_prune` also runs for any method it does not know: the
+    /// refusal the CLI must read as "daemon too old", not as a failed prune.
+    #[tokio::test]
+    async fn a_method_the_daemon_does_not_know_is_a_refusal_the_cli_recognizes() {
+        let reply = call(&registry(), "daemon.no_such_method", json!({})).await;
+        let (code, message) = (
+            &reply["error"]["code"],
+            reply["error"]["message"].as_str().unwrap(),
+        );
+        assert_eq!(code, -32602);
+        assert!(crate::cli::repos::daemon_lacks_prune(&format!(
+            "daemon error {code}: {message}"
+        )));
+        assert!(!crate::cli::repos::daemon_lacks_prune(
+            "daemon error -32603: could not persist"
+        ));
     }
 }

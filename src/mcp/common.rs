@@ -399,6 +399,10 @@ mod tests {
     async fn hook_http_matches_the_unix_dispatch_for_every_lifecycle_method() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
+        // Both transports must see an existing store. On an unknown root the
+        // first hook returns NoStore, then its queued telemetry initializes the
+        // store before the second hook: those are different lifecycle states.
+        drop(crate::core::Context::init(&root).unwrap());
         let (router, registry, dispatch) = real_hook_router(&root, Some("secret"));
 
         for method in [

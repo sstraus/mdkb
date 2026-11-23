@@ -1,5 +1,402 @@
 # Changelog
 
+## 3.16.0 (2026-11-23)
+
+First public release since 3.14.0. It publishes the changes of 3.15.0 below,
+which was not released separately.
+
+### Added
+
+- **One embedding model for every repository, set once.** `[embedding] model`
+  in `~/.mdkb/daemon.toml` selects the model of every repository whose
+  `.mdkb/config.toml` does not choose one; a repository's own choice still wins.
+  The Granite floor defaults follow the effective model, also for a repository
+  with no config file. Changing it makes the affected stores' vectors stale, and
+  the daemon rebuilds them in the background. Processes started by `cargo test`
+  and `cargo run` here ignore the key. Requested by the maintainer
+  (story 094-9a63).
+
+- **Query telemetry can be enabled for every repository on the machine.**
+  `~/.mdkb/daemon.toml` `[telemetry]` accepts `query_events` and
+  `retention_days`. A repository that tracks `.mdkb/config.toml` in Git can
+  now record query events without a commit that enables telemetry for every
+  team member. The order is: default, then `daemon.toml`, then the
+  repository's own `[telemetry]` keys, key by key; a repository that sets
+  `query_events = false` stays disabled. `mdkb status` reports the
+  merged value. Found by the maintainer when telemetry could not be enabled
+  in a team repository (story 083-74c1).
+
+- **`memory audit` reports dead symbols.** An entry that cites a backticked
+  `Type::method` or `function()` which the code index no longer defines and no
+  tracked source mentions is listed as `dead_symbol_reference`. A standard
+  library method is not reported, because the source still uses it. The pass
+  runs only with a code index newer than HEAD in a git repository; otherwise
+  `symbol_check_skipped` names the reason (story 081-1642).
+
+- **`mdkb coupling --docs` pairs documents with the source they change
+  with.** Plain `coupling` drops every file the code index does not parse, so
+  documents never appeared. The new report lists document <-> source pairs
+  and marks a pair `drifted` when the source changed after the document last
+  did. Changelogs, `llms.txt`, todo, stories, plans and the memory projection
+  are skipped. On mdkb's own history: 37 pairs, 14 drifted, 3 judged noise
+  (story 081-1642).
+
+### Breaking changes
+
+- **Status, indexing and top-level commands are consolidated.** Found by the
+  owner review of the 079 consolidation, 2026-11-22 (story 093-1e8d). The old
+  names fail with a one-line `Run:` error that prints the new command with
+  your arguments.
+  - `mdkb status` replaces `stats`, `code info`, `daemon status` and
+    `metrics status`. `--format json` is one object that keeps every `stats`
+    key at the same path and adds `daemon` and `telemetry`. Every line that
+    is not healthy ends with the command that fixes it. Outside a repository
+    it prints the daemon section only.
+  - `mdkb doctor --full` replaces `setup check`; it prints the distiller probe
+    result and still exits non-zero on an error finding.
+  - `mdkb update` replaces `code index`, `code init`, `embed` and
+    `session index`: `--code [--force]`, `--sessions`, `--reembed` and
+    `--collection NAME` (embed one collection, the only way to embed
+    `claude_sessions`). There is no `--embed` flag: `update` already embeds.
+  - `mdkb code dup` and `mdkb code coupling` replace `dup` and `coupling`;
+    `coupling --docs` is now `mdkb graph coupling`.
+  - `mdkb memory import --journal PATH` (a file or a directory) replaces
+    `journal import` and `journal import-all`.
+  - `rm` removes things everywhere (`collection rm`, `memory rm`,
+    `evolve unlink`); `remove` and `delete` still work as hidden aliases.
+  - `mdkb evolve link NEW RELATION OLD` replaces `evolve supersedes`,
+    `updates`, `corrects`, `retracts` and `extends`; `evolve unlink ID`
+    replaces `evolve remove`.
+  - `--root` is accepted by every command in any position. Only search
+    commands fan out over several repos; the others need one.
+  - The TUICommander dashboard plugin reads `mdkb status` (version 1.5.0).
+
+- **`mdkb experiment` is removed.** No search, recall or hook ever assigned a
+  query to a variant or recorded a result, so `experiment status` always
+  reported `n=0` and `end` never found a winner. The `create`, `status`,
+  `end`, `cancel` and `list` subcommands are gone; compare configurations
+  with `mdkb eval recall` or the developer telemetry profile. Existing
+  `experiments*` tables in older stores are left in place and no longer
+  read. Found by the 2026-11-22 documentation coverage audit (story
+  084-ce57).
+
+- **Overlapping CLI commands are removed.** Each removed name now fails and
+  names its replacement:
+  `mget` → `get PATTERN` (now with `--collection`);
+  `history`, `current`, `superseded-by` → `evolve history|current|superseded-by`;
+  `hook status` → `doctor` or `stats`.
+  `memory search` and `search --file` stay until the Wiz bridge and the MCP
+  `file` parameter move with them. Found by the 2026-11-21 command audit
+  (story 079-c50c).
+
+- **`search`, `code search` and `code grep` replace `search --scope`.** A
+  model does not guess `--scope`, so each thing you look for has its own
+  command. `search QUERY...` returns documents and memory as two groups with
+  their own limits and joins unquoted words; `--docs`, `--memory` and
+  `--entry-type` pick a group. `code search NAME` finds symbols (fuzzy, exact
+  names first; `-k`, `--path`, `--exact`, `--semantic`). `code grep PATTERN`
+  reads live source lines (`-e`, `--regex`, `-i`, `--path`); `--literals` reads
+  indexed AST literals. `code find` is a hidden alias of `code search --exact`
+  and its `--file` fails with the `--path` form. `memory search` is the same
+  code path as `search --memory`. Removed from `search`: `-e`, `--regex`, `-i`,
+  `-k`, `--path`, `--search-contract`, and the literal group in the default
+  result. JSON of `search` is one shape, `{"documents": [...], "memory":
+  [...]}`; the `text` key and the `{scope, hits}` envelope are gone.
+  `search --scope NAME` stays as a hidden flag that maps every MCP scope name
+  to the new commands, because MCP and the Wiz bridge use those names. The
+  top-level `mget`, `history`, `current` and `superseded-by` are now unknown
+  commands that name their replacement. Found by the owner review of the 079
+  consolidation, 2026-11-22 (story 091-ba1b).
+
+- **Every usage error is one line that names the command that works.** The
+  form is `error: <what is wrong>. Run: <command>`, with no usage block, exit
+  2 (runtime failures stay exit 1), and `{"error", "run"}` under `--format
+  json`. A flag that belongs to another command names it and rewrites the
+  command (`--entry-type belongs to memory search`). An unknown command goes
+  through a table of typical guesses (`grep` → `code grep`, `find` → `code
+  search`, `index` → `update`, `show` → `get`, `delete` → `memory rm`), then
+  edit distance. `search` prints a `code search` hint on stderr when it finds
+  nothing or the query looks like an identifier. Found by the owner review of
+  the 079 consolidation, 2026-11-22 (story 091-ba1b).
+
+- **Internal commands leave `--help`.** `hook`, `serve`, `mcp`, `eval`,
+  `memory curate-priors`, `memory propose` and `code parse` still run but are
+  hidden, as is `surface`, which now prints the "MCP <-> CLI" section of
+  `mdkb cheatsheet`. The LLM guide moved from `--help` into `cheatsheet`, which
+  is rewritten for the new commands; `schema` leaves out hidden commands.
+  Found by the owner review of the 079 consolidation, 2026-11-22 (story
+  091-ba1b).
+
+### Changed
+
+- **`serve --https` keeps its certificate in `~/.mdkb/certs`.** It used the
+  platform config directory (`~/Library/Application Support/mdkb/certs` on
+  macOS, `~/.config/mdkb/certs` on Linux), the only mdkb state outside
+  `~/.mdkb`. The first `serve --https` start after the upgrade writes a new
+  certificate there; delete the old directory by hand (story 089-0118).
+
+### Fixed
+
+- **`search --scope knowledge` no longer drops memory when many documents
+  match.** Documents and memory shared one limit with documents first, so a
+  query with `limit` or more matching documents returned zero memory hits. The
+  CLI and the MCP `search` tool now return up to `limit` documents, then up to
+  `limit` memory entries; `truncated` is true when either corpus had more.
+  Found by the review of the CLI simplification proposal, 2026-11-22 (story
+  092-9289).
+
+- **The daemon starts from the home directory.** `serve --daemon`,
+  `serve --global`, `daemon status|stop|restart` and `repos *` anchor no store,
+  but the guard against anchoring one in `~` refused them too, so a daemon
+  that an agent spawned from its home directory exited at once and MCP
+  failed. Found by the 2026-11-22 documentation coverage audit (story
+  090-a611).
+
+- **`socket_path` in `daemon.toml` no longer breaks `mdkb mcp`.** The daemon
+  always bound `~/.mdkb/daemon.sock`, but the `mdkb mcp` proxy dialled the
+  configured `socket_path`, so every MCP session failed with "daemon did not
+  become reachable". The key is removed: the proxy now dials the socket the
+  daemon binds, a `daemon.toml` that still has the key loads with a warning,
+  and `mdkb mcp --socket` stays as the one-off override. Found by the
+  2026-11-22 documentation coverage audit (story 085-6db4).
+
+- **`code init` and `--profile-dir` help name what they do.** `code init`
+  said it creates `.mdkb/code/`; it creates `.mdkb/code.sqlite`.
+  `setup hooks claude --profile-dir` and `setup remove hooks claude
+  --profile-dir` said the default is `~/.claude`; `$CLAUDE_CONFIG_DIR` comes
+  first when it is set. Found by the 2026-11-22 documentation coverage audit
+  (stories 087-51ca, 088-6067).
+- **`serve --https` renews its self-signed certificate.** It reused the
+  cached `server.pem` whenever the file existed, so a year after first use
+  every TLS client failed on the expired certificate. It now replaces a
+  certificate that has expired, expires within 30 days or cannot be read.
+  Found by the 2026-11-22 documentation coverage audit (story 086-28d6).
+
+## 3.15.0 (2026-11-21)
+
+### Added
+
+- **CLI `graph` reads the memory graph and other repositories.** `graph links|backlinks --scope memory` walks `memory link` edges, as MCP `graph` with `scope: memory` does, and `graph --root NAME` reads one other known repository (story 078-fba4).
+
+- **Choose an embedding model per store.** MiniLM remains the English default;
+  `embedding.model = "granite107m"` selects the pinned multilingual FP32 encoder.
+  Model identity now guards documents, chunks, memories and code vectors.
+  Encountering an incompatible writable store schedules a background full model
+  migration, without making the user run a recovery command. Serving keeps
+  lexical retrieval available and never uses incompatible or partial vectors.
+  Heavy migrations are serialized within the process; later encounters retry
+  interrupted work. `mdkb embed --reembed` remains available for explicit full
+  rebuilds. Regeneration preserves source content. Proven legacy MiniLM vectors
+  remain usable; ambiguous or mixed legacy data requires safe regeneration. Stats and doctor
+  expose stale and pending identities. Production reranking and its configuration
+  have been removed. An isolated recall
+  comparison found that the MiniLM memory threshold admitted unrelated Granite
+  context: Granite now uses a provisional model-specific memory default for
+  sigil recall and explicit memory search, while explicit thresholds are
+  preserved. The default does not eliminate false admissions. Requested by the maintainer (story 058-0ed6).
+
+- **`mdkb repos prune [PATH...] [--dry-run]` removes missing repositories from
+  the registry.** A repository whose directory was deleted while the daemon ran
+  stayed in `repos list` as Gone until the daemon restarted. The command asks
+  the running daemon, which drops the Gone roots from its map and `repos.json`
+  together. It removes only roots whose directory is gone. With no PATH every
+  Gone root is removed and other roots are skipped silently. With PATHs, a path
+  that exists, has no store, cannot be read or is unknown is refused and
+  reported, the Gone paths of the same selection are still removed, and the
+  exit status is non-zero. `--dry-run` changes nothing; `--format json` reports
+  `removed` and `refused`. No repository, store or index is deleted, and
+  hand-written scopes and `daemon.toml` stay. A write failure is an error, and
+  the daemon keeps the root. With no daemon, or a daemon that predates the
+  command, the command changes nothing and says what to do next. On Unix,
+  install this build and run `mdkb daemon restart`; other platforms have no
+  daemon to prune. Found by the maintainer
+  (story 051-b9c6).
+
+### Fixed
+
+- **`repos prune` removes repositories without a store, and an empty `.mdkb`
+  no longer counts as a store.** Scratch repositories that ran
+  real agents had their store deleted by a cleanup that left an empty `.mdkb`
+  folder. `repos list` showed them as NoStore, but the registry probe saw the
+  folder and called them healthy, so neither the startup check nor `repos
+  prune` removed them: 116 of 177 registry rows on the maintainer's machine.
+  The registry now treats a `.mdkb` that is empty or holds only lock files as
+  no store; a `.mdkb` that still holds anything else (a memory projection, a
+  quarantined index) is kept, because it may be the only copy. `repos prune`
+  removes NoStore roots as well as Gone ones. Found by the 2026-11-21 command
+  audit (story 067-5c87). A root under a `daemon.toml` `ignore` path is now served
+  but never recorded, so `ignore = ["~/Gits/.tmp"]` keeps scratch repositories
+  out of the registry.
+
+- **Command audit fixes.** A run of every CLI command against a scratch
+  repository (docs/command-audit-2026-11-21.md) found these defects:
+  - `evolve` accepted a cycle; `A supersedes B` then `B supersedes A` hid both
+    documents from search and recall. The write is now refused with the chain,
+    `current` reports an existing cycle, `doctor` lists them, and the new
+    `mdkb evolve remove <id>` deletes one edge and makes the older document
+    current again (story 069-cf5c).
+  - `collection rename` failed with `FOREIGN KEY constraint failed` once the
+    collection held documents. Documents now move with the name (070-0da0).
+  - Symbol listings (`code find/search/callers/calls/impact/parse`,
+    `search --scope symbols|semantic-code`, MCP `code_graph` text) printed
+    0-based tree-sitter rows as `path:line`. Text and CSV lines are 1-based;
+    JSON `range` stays 0-based (071-eb7b).
+  - A store refusal routed through the daemon (unknown memory id, duplicate
+    title, unknown collection) printed `invalid search query ... may still be
+    writing`. Refusals now travel under their own code (-32010), print the bare
+    cause and exit non-zero; `collection remove`, `memory rm` and
+    `experiment status` of a missing name exit non-zero, and `search -c` with
+    an unknown collection fails with the known names (072-e8e9).
+  - `dup --file PATH` compared only code under PATH and missed every clone in
+    another file. It now narrows the report like `--since` (073-504b).
+  - `evolve`, `history`, `current` and `superseded-by` accepted only the exact
+    stored path; they now resolve references like `get` and `graph`.
+    `superseded-by` printed a truncated line; `history` prints edge ids
+    (074-55bc).
+  - `graph backlinks` matched only the literal target, so a document named by
+    its `id:` or an alias had no backlinks by path. The CLI, MCP `graph` and
+    traversal now resolve identities (075-b14e).
+  - `memory list` listed superseded entries with no marker; it now lists active
+    entries, `--status all` lists every status with a marker, and `memory show`
+    prints status, confidence, provenance and edges (076-7514).
+  - `memory add --dry-run` of a write the store would refuse exited 0; it now
+    fails with the refusal (077-1b6c).
+  - `update` labelled this run's code-index counts as totals, literal search
+    printed index age in Unix seconds, `graph relations` read as if allowlist
+    keys were ignored, the `stats` banner promised removal of quarantine
+    copies the sweep keeps, and `daemon status` printed every registry row
+    (080-4dae, 066-bbd4, 067-5c87).
+
+  Found by the maintainer's command audit, not by a report.
+
+- **Check the embedding identity once per recall turn.** The identity probe ran
+  on every semantic read, nine times per prompt, and raised the recall search
+  p50 from about 45 ms to 245 ms. The recall hook now runs its reads in one
+  SQLite read snapshot, which reuses one probe, and the probe reads only the
+  vector index shadow tables. Search p50 is 76-88 ms; the injected context is
+  unchanged. Found by the maintainer's latency replay (story 065-9a07).
+
+- **Keep session transcripts out of embedding regeneration.** `embed --reembed`
+  and the automatic model migration embedded every transcript although
+  `search.auto_embed_sessions` is false. On tuicommander 58% of the chunk
+  vectors were transcripts, and the vector leg filled its pool with them, so
+  only 24 of 276 recall document candidates kept a cosine. Regeneration now uses
+  the configured scope. The chunk and document vector searches (`search`,
+  `vsearch`, recall) apply the same scope as BM25 and widen the KNN until it
+  holds enough in-scope documents. Found by the maintainer's model comparison
+  (story 065-9a07).
+
+- **Run daemon embedding regeneration in a lowered child process.** The daemon
+  ran a full regeneration in its own process at nice 0 and competed with
+  interactive work for its whole duration. It now starts `mdkb embed --reembed`
+  as a child at `search.embed_nice`, with an ONNX pool of half the cores. An
+  unbounded pool was slower than 8 threads and used 2.6 times the CPU. Found by
+  the maintainer during the tuicommander migration (story 068-6648).
+
+- **Wait for a routed mutation while the daemon is alive.** The CLI abandoned a
+  routed mutation after one hour, although the daemon was still running it; a
+  routed `embed --reembed` of a large store failed this way and the daemon
+  finished it anyway. The client now waits while the daemon answers `ping`
+  every 30 seconds, and stops with an undetermined result when it does not.
+  Found by the maintainer.
+
+- **Give vector hits a place in recall document pools.** Hybrid fusion weighted
+  vectors at 0.7 against 1.0 for BM25. The best vector hit therefore scored
+  below the 24th BM25 hit, and the 12-document recall pool held BM25 hits only,
+  so a question in one language rarely reached a document in another. Both legs
+  now weigh 1.0, and exact score ties sort by document id, so CLI and MCP return
+  the same order. The Granite document floor (`recall_docs_min_cosine`) is now
+  0.77 instead of 0.782. On 39 labelled questions against tuicommander, recall
+  injected the target document for 24 instead of 16 (Italian 13/24 instead of
+  8/24), and 1 of 20 process prompts got context, as before. `search` placed the
+  target in the top 10 for 34 instead of 30. Found by the maintainer.
+
+- **Inject one variant of a translated entry with Granite.** When a memory
+  entry or a document exists in two languages, recall injected both and stated
+  the answer twice. With the Granite model, recall now drops a memory entry or
+  document whose stored vector scores at least 0.91 against a higher-ranked
+  one. On the bilingual fixture, translation pairs score a median of about 0.94
+  and distinct items at most 0.904, so 52 of 60 memory pairs and 39 of 50
+  document pairs merge and no distinct item does; prompts with a duplicate fell
+  from 31 to 3 of 40. MiniLM is unchanged: it scores a translation pair below
+  many distinct entries. Found by the maintainer.
+
+- **Keep direct code indexing's semantic archive usable in fresh processes.**
+  Register the vector extension before the archive's SQLite identity check.
+  Independent review identified the missing registration, and an isolated
+  no-daemon CLI reproduction observed `no such module: vec0` while code indexing
+  otherwise reported success.
+
+- **Describe automatic embedding migration without requesting a second rebuild.**
+  Non-ambiguous transitions in daemon-capable mode are warnings with lexical
+  fallback guidance, not errors directing agents to a manual full regeneration.
+  Ambiguous identities and direct/no-daemon recovery remain explicit errors;
+  SQLite and code-archive details are preserved together. Independent review
+  found the misleading guidance and obsolete reranker telemetry documentation.
+
+- **Show the terminal distiller error instead of a startup warning.** When the
+  distiller has no stdout, prefer its last explicit error line over surrounding
+  progress logs. Keep diagnostics bounded and redact credential-shaped values
+  before truncation. Found by a live setup check whose authentication error was
+  hidden behind an initial warning.
+
+- **Expire stale repository paths without a daemon restart.** Apply the configured
+  inactivity limit to registrations whose directory has disappeared or no longer
+  holds a store, including old paths left by a move or rename. Reuse the last
+  successful access date; keep unreadable stores and explicit configuration.
+  Remove only the registration, never repository files, indexes or memories.
+  Found while checking the maintainer's request for stale-repository cleanup.
+
+- **Reduce serial I/O in `mdkb stats` on large memory projections.** Read and
+  parse entry files with at most four readers while preserving full malformed,
+  unreadable and unprojected-memory diagnostics. Memory reconciliation uses
+  the same parser; stats still changes neither memory data nor access tracking.
+  Found through the maintainer's native CLI latency measurements.
+
+- **Keep embedding identity inspection off the hook response thread.** A
+  background migration check could still run SQLite after the prompt deadline
+  and delay the response. Inspect on the existing worker, preserve single-flight
+  ownership, reject read-only encounters before scheduling, and release the
+  serving slot before model work. Found by the full Linux test gate
+  (story 058-0ed6).
+
+- **Keep opaque external IDs out of CLI text search results.** Show the source,
+  title and numeric document ID instead. `mdkb get <id>` still retrieves the
+  document; local file paths and structured output stay unchanged. Found by
+  the maintainer in truncated search output (story 052-b7ce).
+
+- **Build the embedding model once for concurrent first requests.** Callers
+  that ask for the model while it loads now wait for that one load and share
+  it. A failed load lets the next caller try again. Found by the maintainer's
+  memory lifecycle benchmark: 8 concurrent cold callers built 8 models, about
+  1640 MiB at peak (story 056-4b87).
+
+- **Bound the ONNX threads of embedding and reranking.** Every model session
+  now shares one ONNX Runtime pool of 2 intra-op threads instead of one thread
+  per core. `MDKB_ORT_THREADS` sets another count; `0` restores one pool per
+  session. Found by the maintainer's model benchmark: the recall reranker held
+  9-11 cores per run and `mdkb embed` 7 (story 048-19eb).
+
+- **Confirm a recalled prior in the session that received it.** The prompt
+  hint now includes `--session`, and confirmation preserves it through the
+  daemon and direct paths. Several open sessions no longer make the hinted
+  command fail. Found by the maintainer's managed agents (story 042-d183).
+
+- **Refresh code at each session start.** The hook now creates missing indexes
+  and checks source changes even after a recent scan. Refresh runs in the
+  background and uses the existing incremental indexer. The in-process fallback
+  (`MDKB_NO_DAEMON`) does not refresh, because it would hold the hook past the
+  host timeout; it prints the manual `code index` command. Literal-search text
+  reports whether the session refresh is running and explains that unchanged
+  files keep their original index timestamp. Found by the maintainer
+  (story 041-e6ac).
+
+- **Keep hook registrations in place during setup.** Reinstalling Codex or
+  Claude hooks replaces the first mdkb group at its existing position and removes
+  later duplicates. Other groups keep their order. An unchanged binary path
+  leaves repeated setup output byte-identical; a new path changes the command
+  text without moving the group. Found by the maintainer (story 040-3d67).
+
 ## 3.14.0 (2026-11-04)
 
 First public release since 3.12.1. It publishes the changes of 3.13.0 and

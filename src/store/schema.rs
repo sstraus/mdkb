@@ -3257,7 +3257,7 @@ mod tests {
             &conn,
             second_before,
             &vec![0.1f32; 384],
-            "test-model",
+            crate::llm::embeddings::Model::MiniLm.identity(),
         )
         .unwrap();
 

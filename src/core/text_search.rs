@@ -26,6 +26,9 @@ pub struct TextSearchResult {
     pub truncated: bool,
     /// Oldest indexed file timestamp: a conservative indication of index age.
     pub indexed_at: Option<i64>,
+    /// Human-only activity snapshot; preserve the existing JSON contract.
+    #[serde(skip)]
+    pub(crate) background_refresh_active: Option<bool>,
 }
 
 /// `None` means this repo has no literal-capable code index yet. Default search
@@ -56,6 +59,7 @@ pub fn search(
         })?;
     let mut result = TextSearchResult {
         indexed_at,
+        background_refresh_active: crate::code::indexing::refresh::active(root),
         ..Default::default()
     };
     if query.is_empty() || limit == 0 {
@@ -455,10 +459,21 @@ pub fn render(result: &TextSearchResult) -> String {
         output.push_str("More literal hits available; increase --limit or narrow --file.\n");
     }
     if let Some(timestamp) = result.indexed_at {
+        let when = chrono::DateTime::from_timestamp(timestamp, 0).map_or_else(
+            || timestamp.to_string(),
+            |d| d.format("%Y-%m-%d %H:%M UTC").to_string(),
+        );
         let _ = writeln!(
             output,
-            "Index age: oldest file indexed at {timestamp} (Unix seconds); run `mdkb code index` to refresh."
+            "Index age: oldest file indexed at {when} (unchanged files retain their age)."
         );
     }
+    output.push_str(match result.background_refresh_active {
+        Some(true) => "Session-start code refresh: in progress. Retry shortly.\n",
+        Some(false) => {
+            "Session-start code refresh: not running. Run `mdkb update --code` to refresh now.\n"
+        }
+        None => "Session-start code refresh: status unavailable.\n",
+    });
     output
 }

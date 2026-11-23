@@ -198,13 +198,13 @@ strong lexical match; confidence only orders what was already admitted.
 2. Extract `tool_input.pattern` from stdin JSON → skip if empty
 3. Classify pattern:
    - Pure identifier (single word, no regex metacharacters) → suggest
-     `mdkb search --scope symbols "{pattern}"`
+     `mdkb code search "{pattern}"`
    - Definition search (`fn X`, `func X`, `def X`, `class X`, etc.) →
      suggest `mdkb code callers {name}`
    - Callsite pattern (`name(`) → suggest `mdkb code callers {name}`
    - Other → return `{}`
 4. Resolve binary path via `std::env::current_exe()`
-5. Build suggestion: `Use '{binary} search --scope symbols "{pattern}"'
+5. Build suggestion: `Use '{binary} code search "{pattern}"'
    or '{binary} code callers {pattern}' via Bash.`
 
 **Matcher:** `Grep|Bash` — direct Grep calls and shell-based recursive
@@ -268,15 +268,31 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `user_prompt_submit_deadline_ms` | u64 | `1000` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. The hook client waits this plus 250 ms, so a raised value is honoured on the daemon path. `0` disables the daemon cut; the client then waits the default plus 250 ms |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
-| `recall_rerank_languages` | list of language codes | `[]` | Explicit opt-in to jina-v2-int8 reranking for automatic prompts. Detector supports `it`/`en`; a tie uses Italian. Empty means no reranker download or model load; failures keep MiniLM recall |
-| `recall_rerank_deadline_ms` | u64 | `700` | Reranker's own deadline, clamped to the remaining effective hook deadline minus 150 ms |
-| `recall_rerank_min_scores` | language-to-f32 table | `{ it = -1.05, en = -1.95 }` | Every selected language needs a finite floor. Explicit tables replace the defaults; unsupported language codes and missing floors fail validation. The English fit admitted 3/24 held-out negatives |
 | `user_prompt_submit_shadow` | bool | `false` | Run the always-on path on skipped prompts, record it, inject nothing |
 | `daemon_required` | bool | `false` | Disable the in-process command-hook fallback |
 | `code_hits_in_pretooluse` | bool | `true` | Return indexed definition hits before suggesting a command |
 | `doc_graph_in_recall` | bool | `true` | Add bounded one-hop document neighbors to recall |
 
-Removed `recall_rerank_it` / `recall_rerank_en` switches name `recall_rerank_languages`; removed scalar floor keys name `recall_rerank_min_scores`. Daemon admission, MCP startup, lifecycle-hook policy loading and document watcher updates refuse the repository with a logged error instead of using defaults. Hooks skip the event and exit 0. Diagnostic loaders (`doctor`, config reporting) can still inspect the error. Other malformed files retain the existing logged whole-file fallback at cold start; malformed daemon hot-reloads keep the last good configuration. Removed keys refuse new requests. No legacy values are translated. `mdkb embed` fetches the cross-encoder only for a nonempty language list. A daemon started with the empty default never loads its weights; restart a daemon that previously loaded the model to release its resident memory.
+Embedding selection belongs to `[embedding] model = "minilm" | "granite107m"` (MiniLM is English only; a store with any other language needs Granite)
+in each store. Model identity is checked before vector admission and retrieval.
+An incompatible writable store encountered by the daemon schedules background
+regeneration; hooks do not perform downloads or full inference rebuilds inside
+the serving request. The separate worker can fetch the selected weights.
+Lexical retrieval remains available until a complete compatible generation is
+published. Read-only discovery does not start a migration. Short-lived
+in-process hooks and direct routes do not own automatic full rebuilds; this
+includes routes used without the Unix daemon. Failed attempts have a 30-second
+encounter-driven retry delay; a configuration change permits an immediate retry.
+Required mutations can wait for writer admission throughout regeneration, even
+though lexical reads remain available. Explicit
+`mdkb update --reembed` remains available for a manual rebuild. MiniLM floors remain unchanged. Granite's default automatic
+memory floor is `0.782`, an initial calibration proxy rather than a
+verified production-context rate. Its default document floor is `0.77`, measured
+on 39 labelled multilingual questions and 20 process prompts; relevant and
+unrelated documents overlap between 0.73 and 0.80. Explicit configured floors are preserved.
+All `hooks.recall_rerank_*` keys are removed and rejected. No production reranker
+is loaded, downloaded or invoked. See [the README](../README.md) for migration
+and pending-state recovery.
 
 ## Opt-out Mechanisms
 
@@ -293,13 +309,13 @@ From most to least granular:
 
 ## Observability
 
-- **`mdkb stats`** — shows `HooksSummary` with `slow_events_7d` (hooks
+- **`mdkb status`** — shows `HooksSummary` with `slow_events_7d` (hooks
   that exceeded latency budget in last 7 days).
 - **`.mdkb/hook-events.jsonl`** — one line per hook invocation, with event
   name, outcome (ok/empty/error), elapsed time, and latency budget. The file
   is capped at 1 MiB (`HOOK_LOG_CAP_BYTES`); rotation drops the oldest half, so
   a busy repo may retain well under 7 days. When the oldest retained row is
-  newer than the 7-day cutoff, `mdkb stats` labels the hook-event counts
+  newer than the 7-day cutoff, `mdkb status` labels the hook-event counts
   `since <date> UTC` instead of `7d`. `hook-slow.jsonl` keeps the `7d` label.
 - **stderr** — all internal errors are logged via `tracing::warn`.
 

@@ -1,5 +1,6 @@
 //! CLI layer - command parsing and execution with clap.
 
+pub mod cheatsheet;
 pub mod daemon;
 pub mod doctor;
 pub mod handlers;
@@ -13,17 +14,18 @@ pub mod mcp_proxy;
 pub mod memory;
 pub mod priority;
 pub mod repos;
+pub mod retired;
 pub mod setup;
 pub mod setup_ego;
 pub mod stats_render;
 pub mod stats_render_report;
 pub mod stats_report;
+pub mod usage_errors;
 
 use std::path::PathBuf;
 
 use clap::builder::PossibleValuesParser;
-use clap::error::{ContextKind, ContextValue, ErrorKind};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::eval::recall::Mode as EvalMode;
 use crate::store::memory::{EntryType, SourceType};
@@ -62,26 +64,14 @@ fn memory_relation_values() -> PossibleValuesParser {
 #[derive(Parser, Debug)]
 #[command(name = "mdkb")]
 #[command(author, version, about, long_about = None)]
-#[command(after_help = "LLM-FIRST GUIDE
-  1. Discover commands: mdkb --help; mdkb <command> --help; mdkb <group> <command> --help.
-     For a machine-readable command tree: mdkb schema (or mdkb schema <top-level-command>).
-     For short usage examples: mdkb cheatsheet; for MCP/CLI names: mdkb surface.
-  2. Initialize inside the intended project: mdkb init. Read .mdkb/config.toml.
-     Every shipped setting and default is present there as a commented TOML line.
-     Leave defaults commented to follow future releases; uncomment only the keys to override.
-     For integration setup and safe previews: mdkb setup --help; mdkb setup <group> --help.
-  3. Find a setting: search .mdkb/config.toml for the relevant section or key.
-     Check the linked topic guide for effects and dependencies before changing it.
-     The complete key definitions, types, and validation are linked below.
-     Change only that setting in .mdkb/config.toml; mdkb doctor checks the result.
-  4. Find a flag: mdkb <command> --help lists its flags, accepted values, and defaults.
-     CLI flags apply to one invocation; persistent repository options go in .mdkb/config.toml.
-     Run mdkb setup check to verify host integrations.
-
+#[command(after_help = "START HERE
+  mdkb cheatsheet            task -> command table, the MCP <-> CLI map, and how to start
+  mdkb <command> --help      flags of one command
+  mdkb schema <command>      the same as JSON
 ONLINE REFERENCE (full URLs; this help needs no network)
   CLI commands: https://github.com/sstraus/mdkb/blob/main/README.md#cli-reference
-  Project configuration and ignore rules: https://github.com/sstraus/mdkb/blob/main/README.md#configuration
-  All config keys, types, and validation (source of truth): https://github.com/sstraus/mdkb/blob/main/src/config.rs
+  Configuration and ignore rules: https://github.com/sstraus/mdkb/blob/main/README.md#configuration
+  All config keys, types, and validation: https://github.com/sstraus/mdkb/blob/main/src/config.rs
   Integration setup and hook settings: https://github.com/sstraus/mdkb/blob/main/docs/hooks.md
   Graph settings: https://github.com/sstraus/mdkb/blob/main/docs/graph.md
   Memory conventions: https://github.com/sstraus/mdkb/blob/main/docs/memory-guidelines.md")]
@@ -93,6 +83,15 @@ pub struct Cli {
     /// Output format
     #[arg(long, global = true, default_value = "text")]
     pub format: OutputFormat,
+
+    /// Repo to run in: a name, a path, a comma list of either, or "*" for every known repo.
+    /// Only `search` and `memory search` fan out over several repos; every other command needs one.
+    /// Omit for this directory's repo
+    ///
+    /// A `PathBuf` on purpose: `hook` subcommands declare their own `--root` as a path, and
+    /// clap shares one value type per argument name across a global flag and its subcommands.
+    #[arg(long, global = true)]
+    pub root: Option<PathBuf>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -108,6 +107,23 @@ pub enum OutputFormat {
     Markdown,
 }
 
+/// Whatever was passed to a removed command. Accepted only so the command can
+/// fail with its replacement instead of clap's generic "unrecognized
+/// subcommand", which names nothing.
+#[derive(Args, Debug)]
+pub struct RetiredArgs {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+    pub args: Vec<String>,
+}
+
+pub use retired::consolidated_replacement;
+
+/// The error a removed command fails with: what it was and the command that
+/// replaces it. `run` must work as typed.
+pub fn retired(old: &str, run: &str) -> crate::error::Error {
+    crate::error::Error::usage(format!("`mdkb {old}` was removed"), run)
+}
+
 /// CLI subcommands.
 #[derive(Subcommand, Debug)]
 pub enum Command {
@@ -118,100 +134,47 @@ pub enum Command {
     #[command(subcommand)]
     Collection(CollectionCommand),
 
-    /// Report duplicated code
-    Dup {
-        /// Also run the semantic pass: loads a model, costs minutes on a large repository. Off unless asked for
-        #[arg(long)]
-        semantic: bool,
+    /// Removed: use `mdkb code dup`.
+    #[command(hide = true, disable_help_flag = true)]
+    Dup(RetiredArgs),
 
-        /// Cosine floor for the semantic pass, which it also enables. Omit to use code.duplication.similarity_threshold
-        #[arg(long)]
-        threshold: Option<f32>,
+    /// Removed: use `mdkb code coupling` (documents: `mdkb graph coupling`).
+    #[command(hide = true, disable_help_flag = true)]
+    Coupling(RetiredArgs),
 
-        /// Fewest AST nodes a body needs to be worth comparing. Omit to use code.duplication.min_nodes
-        #[arg(long = "min-nodes")]
-        min_nodes: Option<u32>,
-
-        /// Only look at paths starting with this. Omit to sweep the repository
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Review mode: report only clusters touching what this ref changed, still scored against the whole index
-        #[arg(long)]
-        since: Option<String>,
-    },
-
-    /// Report files that change together but have no edge between them
-    Coupling {
-        /// Fewest shared commits before a pair counts. Omit for the built-in floor
-        #[arg(long = "min-cochanges")]
-        min_cochanges: Option<usize>,
-
-        /// How far back to read history, in git's own wording. Omit for the last year
-        #[arg(long)]
-        since: Option<String>,
-
-        /// Which revision to walk. Omit to walk the current branch
-        #[arg(long = "ref")]
-        git_ref: Option<String>,
-    },
-
-    /// Search one corpus: source, literals, symbols, semantic-code, docs, memory, or knowledge
+    /// Search docs and memory (two groups); code has `code search` and `code grep`
     Search {
-        /// Search query; omit only when -e supplies source or literal alternatives
-        query: Option<String>,
+        /// Search words; unquoted words are joined into one query
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
 
-        /// OR alternatives for source or literals (repeat -e)
-        #[arg(short = 'e', long = "pattern")]
-        patterns: Vec<String>,
+        /// Search documents only
+        #[arg(long, conflicts_with_all = ["memory", "entry_type"])]
+        docs: bool,
 
-        /// Treat source patterns as regular expressions
+        /// Search memory entries only (`--entry-type` implies it)
         #[arg(long)]
-        regex: bool,
+        memory: bool,
 
-        /// Exact file or directory prefix for source, literals, or symbols
-        #[arg(long)]
-        path: Option<String>,
-
-        /// Opt in to a coverage envelope for existing JSON scopes
-        #[arg(long = "search-contract")]
-        search_contract: Option<String>,
-
-        /// Maximum number of results
+        /// Maximum results per group
         #[arg(short, long, default_value = "10")]
         limit: usize,
 
-        /// Filter by collection
-        #[arg(short, long)]
+        /// Search one collection (documents only)
+        #[arg(short, long, conflicts_with = "memory")]
         collection: Option<String>,
 
         /// Include superseded/retracted documents
         #[arg(long)]
         include_superseded: bool,
 
-        /// Choose source (live lines), literals (indexed values), symbols, semantic-code, docs, memory, or knowledge; omitting scope keeps the legacy mixed search
-        #[arg(long)]
-        scope: Option<String>,
-
-        /// Case-insensitive literal search (Unicode lowercase matching)
-        #[arg(short = 'i', long)]
-        ignore_case: bool,
-
-        /// Filter by symbol kind (function, struct, method, etc.) - used with code/symbols scopes
-        #[arg(short, long)]
-        kind: Option<String>,
-
-        /// Filter by file path (substring match) - used with symbols/text scopes
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Filter by entry type - used with memory scope
+        /// Only memory entries of this type (implies --memory)
         #[arg(long = "entry-type", alias = "type", value_parser = entry_type_values())]
         entry_type: Option<String>,
 
-        /// Repo to search: a name, a path, a comma list of either, or "*" for every known repo. Omit for this directory's repo
-        #[arg(long)]
-        root: Option<String>,
+        /// MCP scope name; still works so MCP and Wiz callers keep running
+        #[arg(long, hide = true)]
+        scope: Option<String>,
     },
 
     /// Retrieve a document by ID, path, memory slug, glob pattern, or comma-separated list
@@ -222,39 +185,61 @@ pub enum Command {
         /// Line range (e.g., 10:50)
         #[arg(long)]
         lines: Option<String>,
-    },
 
-    /// Retrieve multiple documents by pattern
-    Mget {
-        /// Glob pattern to match paths (e.g., "docs/*.md")
-        pattern: String,
-
-        /// Filter by collection
+        /// Keep only glob matches from this collection
         #[arg(short, long)]
         collection: Option<String>,
     },
 
-    /// Reindex everything (documents and source code), or specific files with --files
+    /// Reindex documents, source code and embeddings (everything by default)
+    ///
+    /// With no flag: reindex documents and source code, embed what is missing, and
+    /// sync memory. One flag narrows the run: `--code` the source index only
+    /// (`--code --force` rebuilds it from scratch), `--sessions` the Claude Code
+    /// transcripts, `--reembed` every embedding for the selected model,
+    /// `--collection NAME` the embeddings of one collection (the only way to
+    /// embed `claude_sessions`, which the default run skips).
     Update {
         /// Only reindex specific files (absolute or relative paths)
-        #[arg(long, num_args = 1..)]
+        #[arg(long, num_args = 1.., conflicts_with_all = ["code", "sessions", "reembed", "collection"])]
         files: Vec<String>,
 
-        /// Force document reindexing regardless of modification time; source code
-        /// remains incremental (use `mdkb code index --force` for a full code rebuild)
-        #[arg(long)]
+        /// Force document reindexing regardless of modification time. With
+        /// `--code`: rebuild the source index from scratch
+        #[arg(long, conflicts_with_all = ["sessions", "reembed", "collection"])]
         force: bool,
-    },
 
-    /// Generate embeddings for documents
-    Embed {
-        /// Embed only this collection. Required to embed `claude_sessions`,
-        /// which is excluded from the default (all-collections) embed.
+        /// Only the source code index
+        #[arg(long, conflicts_with_all = ["sessions", "reembed", "collection"])]
+        code: bool,
+
+        /// Only Claude Code session transcripts
+        #[arg(long, conflicts_with_all = ["reembed", "collection"])]
+        sessions: bool,
+
+        /// Rebuild documents, chunks, memories and semantic code embeddings for the selected model
+        #[arg(long)]
+        reembed: bool,
+
+        /// Embed only this collection (add --reembed to rebuild it). Required to embed `claude_sessions`
         #[arg(long)]
         collection: Option<String>,
+
+        /// With `--sessions`: sessions base directory (default: ~/.claude/projects)
+        #[arg(long, requires = "sessions")]
+        sessions_path: Option<String>,
+
+        /// With `--sessions`: project root to match (default: this repo)
+        #[arg(long, requires = "sessions")]
+        project_root: Option<String>,
     },
 
-    /// Start MCP server (stdio by default, --http or --https for network transport)
+    /// Removed: use `mdkb update` (add `--reembed` to rebuild every embedding).
+    #[command(hide = true, disable_help_flag = true)]
+    Embed(RetiredArgs),
+
+    /// Start the MCP server (internal)
+    #[command(hide = true)]
     Serve {
         /// Run as HTTP server instead of stdio
         #[arg(long)]
@@ -305,10 +290,8 @@ pub enum Command {
     #[command(subcommand)]
     Repos(ReposCommand),
 
-    /// Connect Claude's stdio MCP transport to the mdkb daemon over its unix
-    /// socket. Auto-spawns the daemon if it isn't running. On platforms
-    /// without the daemon (Windows), serves MCP in-process instead. Set
-    /// `MDKB_NO_DAEMON=1` to force in-process mode anywhere.
+    /// Connect Claude's stdio MCP transport to the daemon (internal)
+    #[command(hide = true)]
     Mcp {
         /// Override the daemon socket path (default: ~/.mdkb/daemon.sock).
         /// Unix only, and only when the daemon proxy runs: passing it where
@@ -317,26 +300,33 @@ pub enum Command {
         socket: Option<PathBuf>,
     },
 
-    /// List problems with this installation and the fix for each
+    /// List problems with this installation and the fix for each (non-zero exit when one is an error)
     Doctor {
         /// Also run the slow checks (the live prior-distiller probe)
         #[arg(long)]
         full: bool,
     },
 
-    /// Show diagnostic statistics (index health, memory, code, sessions, hooks)
-    Stats {
+    /// One page: index health, memory, code, sessions, hooks, daemon, telemetry, recall
+    ///
+    /// Every line that is not healthy ends with the command that fixes it.
+    /// `--format json` prints one object.
+    Status {
         /// Disable ANSI color output
         #[arg(long)]
         no_color: bool,
     },
 
+    /// Removed: use `mdkb status`.
+    #[command(hide = true, disable_help_flag = true)]
+    Stats(RetiredArgs),
+
     /// Query metrics and search quality analysis
     #[command(subcommand)]
     Metrics(MetricsCommand),
 
-    /// Evaluate memory retrieval quality against a fixture
-    #[command(subcommand)]
+    /// Evaluate memory retrieval quality against a fixture (internal)
+    #[command(subcommand, hide = true)]
     Eval(EvalCommand),
 
     /// Manage memory entries for AI knowledge persistence
@@ -347,35 +337,15 @@ pub enum Command {
     #[command(subcommand)]
     Evolve(EvolveCommand),
 
-    /// Show evolution history of a document
-    History {
-        /// Document path or ID
-        path: String,
-    },
-
-    /// Find current version of a superseded document
-    Current {
-        /// Document path or ID
-        path: String,
-    },
-
-    /// Show what superseded this document
-    SupersededBy {
-        /// Document path or ID
-        path: String,
-    },
-
     /// Query the knowledge graph (typed edges from frontmatter + wikilinks)
-    #[command(subcommand)]
-    Graph(GraphCommand),
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCommand,
+    },
 
-    /// Manage A/B experiments
-    #[command(subcommand)]
-    Experiment(ExperimentCommand),
-
-    /// Import Claude Code journal entries to memory
-    #[command(subcommand)]
-    Journal(JournalCommand),
+    /// Removed: use `mdkb memory import --journal PATH`.
+    #[command(hide = true, disable_help_flag = true)]
+    Journal(RetiredArgs),
 
     /// Setup and configure mdkb integrations
     #[command(subcommand)]
@@ -406,40 +376,31 @@ pub enum Command {
     /// Compact command reference for AI consumption
     Cheatsheet,
 
-    /// Map each MCP tool to its CLI equivalent, and say where they differ
-    ///
-    /// The two surfaces expose overlapping capability under different names —
-    /// the MCP tool is `memory_write`, the command is `mdkb memory add` — so
-    /// this answers "what is the other name for this?" without reading source.
+    /// Prints the "MCP <-> CLI" section of `mdkb cheatsheet`
+    #[command(hide = true)]
     Surface,
 
-    /// Emit machine-readable CLI schema as JSON (omit COMMAND for the full tree)
+    /// Emit the CLI schema of one command as JSON
     Schema {
         /// Specific subcommand to describe (omit for the full schema)
         command: Option<String>,
     },
 
-    /// Claude Code session indexing
-    #[command(subcommand)]
-    Session(SessionCommand),
+    /// Removed: use `mdkb update --sessions`.
+    #[command(hide = true, disable_help_flag = true)]
+    Session(RetiredArgs),
 
-    /// Lifecycle hook dispatch (SessionStart, PostToolUse, …) and one-shot
-    /// JSON-RPC client for hooks (reindex, search, memory-write, status, …).
-    ///
-    /// Lifecycle events read JSON from stdin and always exit 0. One-shot
-    /// client methods connect the daemon hook socket (auto-spawning the
-    /// daemon if needed), issue one JSON-RPC call, and print the result.
-    /// Host CLIs must never be blocked by mdkb — failures log to stderr and
-    /// still exit 0.
-    #[command(subcommand)]
+    /// Lifecycle hook dispatch and one-shot hook client (internal)
+    #[command(subcommand, hide = true)]
     Hook(HookCommand),
 }
 
 /// `mdkb daemon <cmd>` subcommands. See `cli::daemon` for behavior.
 #[derive(Subcommand, Debug)]
 pub enum DaemonCommand {
-    /// Print daemon pid, socket state, and uptime. Always exits 0.
-    Status,
+    /// Removed: use `mdkb status`.
+    #[command(hide = true, disable_help_flag = true)]
+    Status(RetiredArgs),
 
     /// Send SIGTERM to the running daemon and wait for shutdown.
     Stop,
@@ -466,6 +427,32 @@ pub enum ReposCommand {
         /// Which stores to refresh.
         #[arg(long, value_enum)]
         only: RefreshFilter,
+    },
+
+    /// Remove repositories that are gone from disk or hold no store from the
+    /// daemon's registry.
+    ///
+    /// Asks the running daemon, which owns the in-memory map and `repos.json`.
+    /// Only roots whose directory no longer exists (Gone) or whose `.mdkb` is
+    /// missing, empty or holds only lock files (NoStore) are removed. With no PATH, every such
+    /// root is removed and all other roots are skipped without a mention. With
+    /// PATHs, a path that is healthy, cannot be read or is not in the registry
+    /// is refused and reported, the removable paths of the same selection are
+    /// still removed, and the exit status is non-zero.
+    /// Nothing but the registry entry is removed: no repository, store or index
+    /// is deleted, and hand-written scopes and `daemon.toml` stay. PATH must be
+    /// spelled as `mdkb repos list` prints it. Fails without changing anything
+    /// when no daemon runs or the daemon predates this command. On Unix,
+    /// install this build and run `mdkb daemon restart`; other platforms have
+    /// no daemon to prune. A timeout leaves the outcome unconfirmed, so check
+    /// `mdkb repos list` before retrying.
+    Prune {
+        /// Roots to remove; default: every Gone or NoStore root.
+        paths: Vec<PathBuf>,
+
+        /// Report what would be removed and change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -573,115 +560,9 @@ pub enum HookCommand {
         root: Option<PathBuf>,
     },
 
-    /// Query daemon-side index status.
-    Status {
-        /// Target repo root (defaults to $PWD).
-        #[arg(long)]
-        root: Option<PathBuf>,
-    },
-}
-
-/// Session indexing subcommands.
-#[derive(Subcommand, Debug)]
-pub enum SessionCommand {
-    /// Index Claude Code session JSONL files
-    Index {
-        /// Path to sessions base directory (default: ~/.claude/projects)
-        #[arg(long)]
-        sessions_path: Option<String>,
-
-        /// Project root to match (default: current directory)
-        #[arg(long)]
-        project_root: Option<String>,
-    },
-}
-
-/// Journal import subcommands.
-#[derive(Subcommand, Debug)]
-pub enum JournalCommand {
-    /// Import a journal file to memory entries
-    Import {
-        /// Path to journal markdown file
-        path: String,
-
-        /// Dry run - show what would be imported without saving
-        #[arg(short, long)]
-        dry_run: bool,
-    },
-
-    /// Import all journal entries from a directory
-    ImportAll {
-        /// Path to journal directory (defaults to .claude/journal/)
-        #[arg(long)]
-        dir: Option<String>,
-
-        /// Dry run - show what would be imported without saving
-        #[arg(short = 'n', long)]
-        dry_run: bool,
-
-        /// Skip entries already imported (based on source_path)
-        #[arg(long, default_value = "true")]
-        skip_existing: bool,
-    },
-}
-
-/// A/B Experiment subcommands.
-#[derive(Subcommand, Debug)]
-pub enum ExperimentCommand {
-    /// Create a new A/B experiment
-    Create {
-        /// Experiment name (unique identifier)
-        name: String,
-
-        /// JSON config for variant A
-        #[arg(long)]
-        config_a: String,
-
-        /// JSON config for variant B
-        #[arg(long)]
-        config_b: String,
-
-        /// Description of the experiment
-        #[arg(short, long)]
-        description: Option<String>,
-
-        /// Traffic split to variant A (0.0-1.0, default 0.5)
-        #[arg(short, long, default_value = "0.5")]
-        split: f64,
-
-        /// Minimum samples per variant before significance calculation
-        #[arg(short, long, default_value = "100")]
-        min_samples: i64,
-    },
-
-    /// Show experiment status with metrics
-    Status {
-        /// Experiment name
-        name: String,
-    },
-
-    /// End an experiment and record winner
-    End {
-        /// Experiment name
-        name: String,
-
-        /// Winning variant (A or B), auto-determined if not specified
-        #[arg(short, long)]
-        winner: Option<String>,
-    },
-
-    /// Cancel an experiment without a winner
-    Cancel {
-        /// Experiment name
-        name: String,
-    },
-
-    /// List all experiments
-    List {
-        /// Show only running experiments
-        #[arg(short, long)]
-        running: bool,
-    },
+    /// Removed: use `mdkb doctor` or `mdkb status`.
+    #[command(hide = true, disable_help_flag = true)]
+    Status(RetiredArgs),
 }
 
 /// Collection management subcommands.
@@ -718,7 +599,8 @@ pub enum CollectionCommand {
     },
 
     /// Remove a collection
-    Remove {
+    #[command(alias = "remove", alias = "delete")]
+    Rm {
         /// Collection name
         name: String,
     },
@@ -800,8 +682,9 @@ pub fn parse_eval_modes(mode: &str) -> Vec<EvalMode> {
 /// Metrics subcommands.
 #[derive(Subcommand, Debug)]
 pub enum MetricsCommand {
-    /// Show developer telemetry configuration and stored event count
-    Status,
+    /// Removed: use `mdkb status`.
+    #[command(hide = true, disable_help_flag = true)]
+    Status(RetiredArgs),
 
     /// Show query metrics summary
     Show {
@@ -842,7 +725,8 @@ pub enum MetricsCommand {
 /// Memory management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
-    /// Merge curator-reviewed prior clusters into the oldest cluster
+    /// Merge curator-reviewed prior clusters into the oldest cluster (internal)
+    #[command(hide = true)]
     CuratePriors {
         /// At least two distinct active cluster IDs
         #[arg(required = true, num_args = 2..)]
@@ -926,6 +810,10 @@ pub enum MemoryCommand {
         /// confirmed or refuted; misfired means a true injected prior fired out of context.
         #[arg(long)]
         outcome: String,
+
+        /// Session that received an injected prior (printed by the recall hook).
+        #[arg(long)]
+        session: Option<String>,
     },
 
     /// Link a memory entry to another entry or document via a typed relation
@@ -955,22 +843,28 @@ pub enum MemoryCommand {
         #[arg(short, long, default_value = "50")]
         limit: usize,
 
-        /// Filter by status (active, superseded, archived)
+        /// Filter by status: active (default), superseded, archived, or all
         #[arg(short, long)]
         status: Option<String>,
     },
 
-    /// List cluster-less user priors with conservative migration proposals
+    /// List cluster-less user priors with conservative migration proposals (internal)
+    #[command(hide = true)]
     Propose,
 
-    /// Search memory entries
+    /// Search memory entries (same as `mdkb search QUERY --memory`)
     Search {
-        /// Search query
-        query: String,
+        /// Search words; unquoted words are joined into one query
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
 
         /// Maximum results
         #[arg(short, long, default_value = "10")]
         limit: usize,
+
+        /// Only entries of this type
+        #[arg(long = "entry-type", alias = "type", value_parser = entry_type_values())]
+        entry_type: Option<String>,
     },
 
     /// Get warmup index (compact list for AI session start)
@@ -981,7 +875,7 @@ pub enum MemoryCommand {
     },
 
     /// Delete a memory entry
-    #[command(alias = "delete")]
+    #[command(alias = "delete", alias = "remove")]
     Rm {
         /// Entry ID
         id: String,
@@ -1018,10 +912,16 @@ pub enum MemoryCommand {
     /// `git pull` without reindexing documents.
     Sync,
 
-    /// Import memory entries from a JSON file or markdown folder
+    /// Import memory entries from a JSON file or markdown folder, or from Claude Code journals
     Import {
         /// Path to JSON file or markdown directory
-        path: String,
+        #[arg(required_unless_present = "journal", conflicts_with = "journal")]
+        path: Option<String>,
+
+        /// Import Claude Code journal entries instead: a journal markdown file, or a directory
+        /// of them (such as .claude/journal). Entries already imported are skipped
+        #[arg(long, value_name = "PATH")]
+        journal: Option<String>,
 
         /// Show what would be imported without saving
         #[arg(long)]
@@ -1081,74 +981,75 @@ pub enum MemoryCommand {
 /// Evolution management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum EvolveCommand {
-    /// Mark a document as superseding another
-    Supersedes {
-        /// The new document (path or ID)
-        new: String,
-
-        /// The old document (path or ID)
-        old: String,
-
-        /// Reason for supersession
-        #[arg(short, long)]
-        reason: Option<String>,
+    /// Show the evolution history of a document
+    History {
+        /// Document path or ID
+        path: String,
     },
 
-    /// Mark a document as updating another
-    Updates {
-        /// The updating document (path or ID)
+    /// Find the current version of a superseded document
+    Current {
+        /// Document path or ID
+        path: String,
+    },
+
+    /// Show what superseded this document
+    SupersededBy {
+        /// Document path or ID
+        path: String,
+    },
+
+    /// Record that a document supersedes, updates, corrects, retracts or extends another
+    ///
+    /// Edges run newer -> older. `supersedes` and `retracts` hide the older document.
+    Link {
+        /// The newer document (path or ID)
         new: String,
 
-        /// The updated document (path or ID)
+        /// How NEW relates to OLD
+        #[arg(value_parser = ["supersedes", "updates", "corrects", "retracts", "extends"])]
+        relation: String,
+
+        /// The older document (path or ID)
         old: String,
 
-        /// Scope (e.g., section path)
+        /// Section the edge covers (`updates` only)
         #[arg(short, long)]
         scope: Option<String>,
 
-        /// Reason for update
+        /// Why the edge exists
         #[arg(short, long)]
         reason: Option<String>,
     },
 
-    /// Mark a document as correcting another
-    Corrects {
-        /// The correcting document (path or ID)
-        new: String,
-
-        /// The corrected document (path or ID)
-        old: String,
-
-        /// Reason for correction
-        #[arg(short, long)]
-        reason: Option<String>,
+    /// Remove an evolution edge by the id `history` prints
+    ///
+    /// A document no other supersedes/retracts edge hides becomes current again.
+    #[command(alias = "rm", alias = "remove", alias = "delete")]
+    Unlink {
+        /// Evolution relationship id
+        id: i64,
     },
 
-    /// Mark a document as retracting another
-    Retracts {
-        /// The retracting document (path or ID)
-        new: String,
+    /// Removed: use `mdkb evolve link NEW supersedes OLD`.
+    #[command(hide = true, disable_help_flag = true)]
+    Supersedes(RetiredArgs),
 
-        /// The retracted document (path or ID)
-        old: String,
+    /// Removed: use `mdkb evolve link NEW updates OLD`.
+    #[command(hide = true, disable_help_flag = true)]
+    Updates(RetiredArgs),
 
-        /// Reason for retraction
-        #[arg(short, long)]
-        reason: Option<String>,
-    },
+    /// Removed: use `mdkb evolve link NEW corrects OLD`.
+    #[command(hide = true, disable_help_flag = true)]
+    Corrects(RetiredArgs),
 
-    /// Mark a document as extending another
-    Extends {
-        /// The extending document (path or ID)
-        new: String,
+    /// Removed: use `mdkb evolve link NEW retracts OLD`.
+    #[command(hide = true, disable_help_flag = true)]
+    Retracts(RetiredArgs),
 
-        /// The extended document (path or ID)
-        old: String,
-
-        /// Reason for extension
-        #[arg(short, long)]
-        reason: Option<String>,
-    },
+    /// Removed: use `mdkb evolve link NEW extends OLD`.
+    #[command(hide = true, disable_help_flag = true)]
+    Extends(RetiredArgs),
 }
 
 /// Knowledge-graph query subcommands.
@@ -1156,22 +1057,30 @@ pub enum EvolveCommand {
 pub enum GraphCommand {
     /// Outgoing edges from an entity (what it points to)
     Links {
-        /// Entity (document path, ID, or raw slug)
+        /// Entity (document path, ID, or raw slug; a memory id with --scope memory)
         entity: String,
 
         /// Filter by relation type
         #[arg(short, long)]
         relation: Option<String>,
+
+        /// Graph to read: doc (frontmatter and wikilinks) or memory (memory link edges)
+        #[arg(long, default_value = "doc", value_parser = ["doc", "memory"])]
+        scope: String,
     },
 
     /// Incoming edges to an entity (what points to it)
     Backlinks {
-        /// Entity (document path, ID, or raw slug)
+        /// Entity (document path, ID, or raw slug; a memory id or doc path with --scope memory)
         entity: String,
 
         /// Filter by relation type
         #[arg(short, long)]
         relation: Option<String>,
+
+        /// Graph to read: doc (frontmatter and wikilinks) or memory (memory link edges)
+        #[arg(long, default_value = "doc", value_parser = ["doc", "memory"])]
+        scope: String,
     },
 
     /// Adjacent entities up to a traversal depth (undirected)
@@ -1218,6 +1127,21 @@ pub enum GraphCommand {
         apply: bool,
     },
 
+    /// Document <-> source pairs that change together, marking documents the source changed after
+    Coupling {
+        /// Fewest shared commits before a pair counts. Omit for the built-in floor
+        #[arg(long = "min-cochanges")]
+        min_cochanges: Option<usize>,
+
+        /// How far back to read history, in git's own wording. Omit for the last year
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Which revision to walk. Omit to walk the current branch
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+
     /// Entities ranked by degree centrality (full scan; explicit use only)
     Hubs {
         /// Filter to a single relation type
@@ -1236,7 +1160,7 @@ pub enum GraphCommand {
   Repository settings: mdkb init creates .mdkb/config.toml with every default commented out.
   Edit only the settings you need; see mdkb --help for topic guides and key definitions.
   Integration commands: mdkb setup mcp --help; mdkb setup hooks --help.
-  Preview changes where supported with --dry-run; verify with mdkb setup check.
+  Preview changes where supported with --dry-run; verify with mdkb doctor --full.
   Online setup guide: https://github.com/sstraus/mdkb/blob/main/README.md#installation
   Hook options and troubleshooting: https://github.com/sstraus/mdkb/blob/main/docs/hooks.md")]
 pub enum SetupCommand {
@@ -1263,8 +1187,9 @@ pub enum SetupCommand {
     #[command(subcommand)]
     Remove(SetupRemoveCommand),
 
-    /// Verify the configured integrations actually work (exits non-zero on failure)
-    Check,
+    /// Removed: use `mdkb doctor --full`.
+    #[command(hide = true, disable_help_flag = true)]
+    Check(RetiredArgs),
 }
 
 /// MCP setup subcommands.
@@ -1306,8 +1231,8 @@ pub enum SetupHooksCommand {
         #[arg(long)]
         dry_run: bool,
 
-        /// Claude Code profile directory (default: ~/.claude).
-        /// Use for non-standard profiles like ~/.claude-private.
+        /// Claude Code profile directory for --scope user (default: $CLAUDE_CONFIG_DIR
+        /// when set, else ~/.claude). Use for non-standard profiles like ~/.claude-private.
         #[arg(long)]
         profile_dir: Option<PathBuf>,
 
@@ -1386,7 +1311,8 @@ pub enum RemoveHooksCommand {
         #[arg(short, long, default_value = "local")]
         scope: String,
 
-        /// Claude Code profile directory (default: ~/.claude)
+        /// Claude Code profile directory for --scope user (default: $CLAUDE_CONFIG_DIR
+        /// when set, else ~/.claude)
         #[arg(long)]
         profile_dir: Option<PathBuf>,
     },
@@ -1398,50 +1324,23 @@ pub enum RemoveHooksCommand {
 /// Code intelligence subcommands.
 #[derive(Subcommand, Debug)]
 pub enum CodeCommand {
-    /// Initialize code index in .mdkb/code/
-    Init,
+    /// Removed: use `mdkb update --code`.
+    #[command(hide = true, disable_help_flag = true)]
+    Init(RetiredArgs),
 
-    /// Build code index from source files
-    Index {
-        /// Paths to index (defaults to current directory)
-        paths: Vec<String>,
+    /// Removed: use `mdkb update --code`.
+    #[command(hide = true, disable_help_flag = true)]
+    Index(RetiredArgs),
 
-        /// Force full reindex (discard existing index)
-        #[arg(long)]
-        force: bool,
-    },
+    /// Find symbols by name (fuzzy, exact matches first); `--semantic` searches by meaning
+    Search(CodeSearchArgs),
 
-    /// Fuzzy symbol search
-    Search {
-        /// Search query
-        query: String,
+    /// Search live source lines; `--literals` searches indexed AST literal values
+    Grep(CodeGrepArgs),
 
-        /// Maximum results
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Filter by symbol kind (function, struct, method, etc.)
-        #[arg(short, long)]
-        kind: Option<String>,
-    },
-
-    /// Exact symbol lookup by name
-    Find {
-        /// Symbol name
-        name: String,
-
-        /// Filter by symbol kind
-        #[arg(short, long)]
-        kind: Option<String>,
-
-        /// Filter by file path (substring match)
-        #[arg(short, long)]
-        file: Option<String>,
-
-        /// Maximum number of results
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-    },
+    /// Alias of `code search --exact`
+    #[command(hide = true)]
+    Find(CodeSearchArgs),
 
     /// Show what functions a symbol calls
     Calls {
@@ -1465,86 +1364,149 @@ pub enum CodeCommand {
         depth: usize,
     },
 
-    /// Show code index statistics
-    Info,
+    /// Removed: use `mdkb status`.
+    #[command(hide = true, disable_help_flag = true)]
+    Info(RetiredArgs),
 
-    /// Parse a file and output symbols as JSONL
+    /// Report duplicated code
+    Dup {
+        /// Also run the semantic pass: loads a model, costs minutes on a large repository. Off unless asked for
+        #[arg(long)]
+        semantic: bool,
+
+        /// Cosine floor for the semantic pass, which it also enables. Omit to use code.duplication.similarity_threshold
+        #[arg(long)]
+        threshold: Option<f32>,
+
+        /// Fewest AST nodes a body needs to be worth comparing. Omit to use code.duplication.min_nodes
+        #[arg(long = "min-nodes")]
+        min_nodes: Option<u32>,
+
+        /// Report clusters with a member under this path prefix, still compared against the whole index. Omit to report every cluster
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Review mode: report only clusters touching what this ref changed, still scored against the whole index
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Report files that change together but have no edge between them
+    Coupling {
+        /// Fewest shared commits before a pair counts. Omit for the built-in floor
+        #[arg(long = "min-cochanges")]
+        min_cochanges: Option<usize>,
+
+        /// How far back to read history, in git's own wording. Omit for the last year
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Which revision to walk. Omit to walk the current branch
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+
+    /// Parse a file and output symbols as JSONL (internal)
+    #[command(hide = true)]
     Parse {
         /// File path to parse
         file: String,
     },
 }
 
+/// Symbol kinds `-k` accepts, as `SymbolKind` prints them.
+pub const SYMBOL_KINDS: [&str; 16] = [
+    "function",
+    "method",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "class",
+    "module",
+    "variable",
+    "constant",
+    "field",
+    "parameter",
+    "type_alias",
+    "macro",
+    "actor",
+    "signal",
+];
+
+fn symbol_kind_values() -> PossibleValuesParser {
+    PossibleValuesParser::new(SYMBOL_KINDS)
+}
+
+/// Arguments of `code search`, which `code find` shares.
+#[derive(Args, Debug, Clone)]
+pub struct CodeSearchArgs {
+    /// Symbol name or words; unquoted words are joined into one query
+    #[arg(required = true, num_args = 1..)]
+    pub name: Vec<String>,
+
+    /// Filter by symbol kind
+    #[arg(short, long, value_parser = symbol_kind_values())]
+    pub kind: Option<String>,
+
+    /// Repository-relative path prefix
+    #[arg(long, conflicts_with = "semantic")]
+    pub path: Option<String>,
+
+    /// Maximum number of results
+    #[arg(short, long, default_value = "10")]
+    pub limit: usize,
+
+    /// Only symbols named exactly NAME
+    #[arg(long, conflicts_with = "semantic")]
+    pub exact: bool,
+
+    /// Rank by meaning instead of by name (needs code embeddings)
+    #[arg(long)]
+    pub semantic: bool,
+
+    /// Removed: use --path PREFIX
+    #[arg(short, long, hide = true)]
+    pub file: Option<String>,
+}
+
+/// Arguments of `code grep`.
+#[derive(Args, Debug, Clone)]
+pub struct CodeGrepArgs {
+    /// Pattern; unquoted words are joined into one. Omit when -e gives them all
+    #[arg(num_args = 0.., required_unless_present = "patterns")]
+    pub pattern: Vec<String>,
+
+    /// Another pattern; every pattern is an OR alternative (repeat -e)
+    #[arg(short = 'e', long = "pattern")]
+    pub patterns: Vec<String>,
+
+    /// Treat the patterns as regular expressions
+    #[arg(long, conflicts_with = "literals")]
+    pub regex: bool,
+
+    /// Case-insensitive match (Unicode lowercase)
+    #[arg(short = 'i', long)]
+    pub ignore_case: bool,
+
+    /// Repository-relative path prefix
+    #[arg(long)]
+    pub path: Option<String>,
+
+    /// Maximum number of hits
+    #[arg(short, long, default_value = "10")]
+    pub limit: usize,
+
+    /// Search indexed AST literal values (JSX text, i18n strings) instead of source lines
+    #[arg(long)]
+    pub literals: bool,
+}
+
 impl Cli {
-    /// Parse CLI arguments.
-    ///
-    /// An unrecognized subcommand is the one clap usage error that does not
-    /// already name what a caller needs: a missing argument is listed by
-    /// name, and a near-miss typo gets a did-you-mean tip, but an unknown
-    /// subcommand prints only a bare usage line. A model that hits it spends
-    /// a whole extra request on `--help` to find the valid names. This
-    /// augments that one error kind with the subcommand list of the exact
-    /// command level the invalid word was given to, without touching any
-    /// other error's formatting.
+    /// Parse CLI arguments. A usage error prints one line naming the command
+    /// that works and exits 2 (see [`usage_errors`]).
     pub fn parse_args() -> Self {
-        Self::try_parse().unwrap_or_else(|err| augment_invalid_subcommand_error(err).exit())
+        let argv: Vec<String> = std::env::args().collect();
+        Self::try_parse_from(&argv).unwrap_or_else(|err| usage_errors::exit_with(err, &argv))
     }
-}
-
-/// Appends a "valid subcommands: ..." tip to an [`ErrorKind::InvalidSubcommand`]
-/// error, reusing clap's own tip-rendering machinery so the addition is styled
-/// and placed exactly like the existing did-you-mean tip. Any other error
-/// kind is returned unchanged.
-fn augment_invalid_subcommand_error(mut err: clap::Error) -> clap::Error {
-    if err.kind() != ErrorKind::InvalidSubcommand {
-        return err;
-    }
-    let Some(names) = valid_subcommands_for_error(&err) else {
-        return err;
-    };
-    if names.is_empty() {
-        return err;
-    }
-
-    let mut suggested = match err.get(ContextKind::Suggested) {
-        Some(ContextValue::StyledStrs(existing)) => existing.clone(),
-        _ => Vec::new(),
-    };
-    suggested.push(format!("valid subcommands: {}", names.join(", ")).into());
-    err.insert(ContextKind::Suggested, ContextValue::StyledStrs(suggested));
-    err
-}
-
-/// Finds the exact command level an invalid subcommand was given to and
-/// returns its visible subcommand names, in declaration order.
-///
-/// clap's `InvalidSubcommand` error carries the offending word but not which
-/// nested command it failed under (that context is only recorded for
-/// `MissingSubcommand`). The error's own usage line already names that
-/// command path — e.g. "Usage: mdkb memory [OPTIONS] <COMMAND>" — since
-/// clap built it for the exact command that rejected the word. Walking
-/// `Cli::command()` down that path re-finds the same [`clap::Command`].
-fn valid_subcommands_for_error(err: &clap::Error) -> Option<Vec<String>> {
-    let ContextValue::StyledStr(usage) = err.get(ContextKind::Usage)? else {
-        return None;
-    };
-    let usage = usage.to_string();
-    let mut path = usage
-        .strip_prefix("Usage:")
-        .unwrap_or(usage.as_str())
-        .split_whitespace()
-        .take_while(|tok| !tok.starts_with('[') && !tok.starts_with('<'));
-    path.next(); // the binary name, not a subcommand
-
-    let mut cmd = Cli::command();
-    for name in path {
-        cmd = cmd.find_subcommand(name)?.clone();
-    }
-
-    Some(
-        cmd.get_subcommands()
-            .filter(|s| !s.is_hide_set())
-            .map(|s| s.get_name().to_string())
-            .collect(),
-    )
 }

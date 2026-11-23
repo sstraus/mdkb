@@ -26,6 +26,7 @@ fn dir(parent: &Path, name: &str) -> PathBuf {
 fn live(parent: &Path, name: &str) -> PathBuf {
     let p = dir(parent, name);
     std::fs::create_dir_all(p.join(".mdkb")).unwrap();
+    std::fs::write(p.join(".mdkb/index.sqlite"), b"").unwrap();
     p
 }
 
@@ -107,6 +108,8 @@ fn a_scoped_gone_root_that_returns_is_listed_again_with_its_scope() {
     assert!(!read_known_roots(&map).contains(&g));
 
     std::fs::create_dir_all(g.join(".mdkb")).unwrap();
+
+    std::fs::write(g.join(".mdkb/index.sqlite"), b"").unwrap();
 
     assert!(read_known_roots(&map).contains(&g));
     assert_eq!(

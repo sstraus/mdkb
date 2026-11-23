@@ -73,6 +73,9 @@ async fn external_ingest_cli_reads_survive_reindex_and_preserve_source() {
     let search: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(search[0]["source"], "tuic-stories");
     assert_eq!(search[0]["read_only"], true);
+    // Catches compact rendering accidentally removing identity from structured output.
+    assert_eq!(search[0]["path"], "2333-b498");
+    assert_eq!(search[0]["id"].as_i64().unwrap().to_string(), id);
     // Catches the text/Markdown/CSV renderers silently dropping read-only provenance.
     for format in ["text", "markdown", "csv"] {
         let output = cli::run(
@@ -83,6 +86,16 @@ async fn external_ingest_cli_reads_survive_reindex_and_preserve_source() {
         let rendered = String::from_utf8(output.stdout).unwrap();
         assert!(rendered.contains("read-only"), "{format}: {rendered}");
         assert!(rendered.contains("tuic-stories"), "{format}: {rendered}");
+        if format == "text" {
+            // Catches opaque owner IDs consuming the title's terminal/context space.
+            assert!(!rendered.contains("2333-b498"), "{rendered}");
+            assert!(
+                rendered.contains(&format!("[{id}] tuic-stories - Quasar feature")),
+                "{rendered}"
+            );
+        } else {
+            assert!(rendered.contains("2333-b498"), "{format}: {rendered}");
+        }
         if format == "csv" {
             assert!(
                 rendered.contains("\"Quasar feature [read-only, source: tuic-stories]\""),
@@ -100,6 +113,24 @@ async fn external_ingest_cli_reads_survive_reindex_and_preserve_source() {
     assert_eq!(get["content"], "quasar original owner content");
     assert_eq!(get["document"]["metadata"]["external"]["read_only"], true);
     assert_eq!(get["document"]["metadata"]["status"], "complete");
+
+    // Catches hiding genuine filesystem paths together with opaque external IDs.
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(
+        root.join("docs/local-guide.md"),
+        "# Local lighthouse\n\nlighthouse filesystem content\n",
+    )
+    .unwrap();
+    {
+        let slot = handle.ctx.lock().await;
+        let ctx = slot.as_ref().unwrap();
+        mdkb::core::indexing::handle_update_force(ctx, &root, true).unwrap();
+    }
+    let output = cli::run(&["search", "lighthouse", "--scope", "docs"], &root);
+    assert!(output.status.success());
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    assert!(rendered.contains("docs:local-guide.md"), "{rendered}");
+    assert!(rendered.contains("Local lighthouse"), "{rendered}");
 
     // A path that looks like the owner ID is still not a file owned by this collection.
     std::fs::write(root.join("2333-b498"), "filesystem impostor").unwrap();

@@ -13,7 +13,7 @@ use super::body::hamming;
 /// Why a pair that looked alike is not reported.
 ///
 /// Carried rather than discarded silently: a suppression is a decision the tool
-/// made on the reader's behalf, and `mdkb dup --explain` can say which one.
+/// made on the reader's behalf, and `mdkb code dup --explain` can say which one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Suppression {
     /// One calls the other, on an edge the resolver actually placed. A wrapper

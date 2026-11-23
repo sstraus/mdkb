@@ -98,9 +98,9 @@ fn root_help_guides_configuration_without_creating_a_store() {
     assert!(out.status.success(), "{}", combined(&out));
     let text = combined(&out);
     for required in [
-        ".mdkb/config.toml",
+        "mdkb cheatsheet",
         "mdkb <command> --help",
-        "mdkb schema",
+        "mdkb schema <command>",
         "https://github.com/sstraus/mdkb/blob/main/README.md#configuration",
         "https://github.com/sstraus/mdkb/blob/main/docs/hooks.md",
         "https://github.com/sstraus/mdkb/blob/main/src/config.rs",
@@ -111,6 +111,10 @@ fn root_help_guides_configuration_without_creating_a_store() {
         !dir.path().join(".mdkb").exists(),
         "help must not initialize a store"
     );
+    // The configuration guide moved from the top-level help into the cheatsheet.
+    let sheet = combined(&run(&["cheatsheet"], dir.path()));
+    assert!(sheet.contains(".mdkb/config.toml"), "{sheet}");
+    assert!(sheet.contains("mdkb setup --help"), "{sheet}");
 }
 
 /// Catches a setup guide attached to the wrong clap command: the integration

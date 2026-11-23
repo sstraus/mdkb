@@ -22,13 +22,22 @@ use super::schema;
 /// How [`CodeDb::query_symbols`] matches the symbol name.
 #[derive(Debug, Clone, Copy)]
 pub enum NameMatch<'a> {
-    /// Exact name equality — what `code find` looks up.
+    /// Exact name equality — what `code search --exact` looks up.
     Exact(&'a str),
     /// Substring match over name, signature and doc comment via the FTS5
-    /// trigram index — what `search --scope symbols` looks up.
+    /// trigram index — what `code search` looks up.
     Fuzzy(&'a str),
     /// No name predicate; only the kind and file filters narrow the set.
     Any,
+}
+
+/// How [`CodeDb::query_symbols`] matches the file path.
+#[derive(Debug, Clone, Copy)]
+pub enum FileMatch<'a> {
+    /// Path substring — the MCP `code_graph` file filter.
+    Contains(&'a str),
+    /// Repository-relative path prefix — what `--path` filters on.
+    Prefix(&'a str),
 }
 
 /// What a call site said about its target, beyond the name.
@@ -490,7 +499,7 @@ impl CodeDb {
         &self,
         name: NameMatch<'_>,
         kind: Option<&str>,
-        file_pattern: Option<&str>,
+        file_pattern: Option<FileMatch<'_>>,
         limit: usize,
     ) -> rusqlite::Result<(Vec<Symbol>, usize)> {
         let mut predicates: Vec<&str> = Vec::new();
@@ -523,7 +532,10 @@ impl CodeDb {
 
         if let Some(file_pattern) = file_pattern {
             predicates.push("s.file_path LIKE ? ESCAPE '\\'");
-            args.push(Box::new(like_pattern(file_pattern)));
+            args.push(Box::new(match file_pattern {
+                FileMatch::Contains(text) => like_pattern(text),
+                FileMatch::Prefix(prefix) => like_prefix_pattern(prefix),
+            }));
         }
 
         let where_clause = if predicates.is_empty() {
@@ -568,7 +580,12 @@ impl CodeDb {
         limit: usize,
     ) -> rusqlite::Result<Vec<Symbol>> {
         Ok(self
-            .query_symbols(NameMatch::Any, None, Some(file_pattern), limit)?
+            .query_symbols(
+                NameMatch::Any,
+                None,
+                Some(FileMatch::Contains(file_pattern)),
+                limit,
+            )?
             .0)
     }
 
@@ -1322,11 +1339,18 @@ const SYMBOL_SELECT_BY_NAME: &str = "SELECT id, name, kind, file_id, file_path, 
 /// Wrap a substring in a LIKE pattern, escaping the LIKE metacharacters so a
 /// `%` or `_` in user input matches literally.
 fn like_pattern(substring: &str) -> String {
-    let escaped = substring
-        .replace('\\', "\\\\")
+    format!("%{}%", escape_like(substring))
+}
+
+/// Wrap a path prefix in a LIKE pattern anchored at the start of the path.
+fn like_prefix_pattern(prefix: &str) -> String {
+    format!("{}%", escape_like(prefix))
+}
+
+fn escape_like(text: &str) -> String {
+    text.replace('\\', "\\\\")
         .replace('%', "\\%")
-        .replace('_', "\\_");
-    format!("%{escaped}%")
+        .replace('_', "\\_")
 }
 
 /// Convert a row from the standard 14-column symbol SELECT to a `Symbol`.

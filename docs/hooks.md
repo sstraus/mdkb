@@ -40,12 +40,12 @@ mdkb search 'Fork from here' --scope text --file src/ --limit 30
 The code-index parser stores AST string literals, JSX text, and JSON values with
 file:line locations and the smallest enclosing symbol when one exists.
 Matching is a case-sensitive fixed substring, not a regular expression;
-`--ignore-case` uses Unicode lowercase matching. The default CLI `mdkb search`
-also includes literal hits. Use `--scope text` to exclude documents and memory,
-or `--scope symbols` for definitions rather than values. `--scope strings` is an
-alias for `text`. `--root` uses the same repository selector as other CLI searches.
+`-i` uses Unicode lowercase matching. Use `mdkb code grep VALUE --literals` to
+search them. `mdkb search` does not include literal hits; `mdkb code search`
+finds definitions rather than values. `--root` uses the same repository
+selector as other CLI searches.
 
-Run `mdkb code index` once to populate literals in an older index. Search reads
+Run `mdkb update --code` once to populate literals in an older index. Search reads
 the index, not source files: the existing post-edit hook and daemon watcher
 refresh changed files. Human output and JSON report the oldest file indexing
 timestamp so a caller can identify stale data and request a refresh.
@@ -197,7 +197,11 @@ line with its fix, for example
 at most 5 findings and then points at `mdkb doctor`. It is absent when nothing
 is wrong. `info` findings, such as "recall runs only on `*` prompts", appear
 only in `mdkb doctor`. The live distiller probe runs only with
-`mdkb doctor --full`.
+`mdkb doctor --full`. Keys in `.mdkb/config.toml` that nothing reads (removed
+or misspelled) appear as a `config.unknown_keys` warning that names each key
+and says to delete it; the daemon logs the same keys once per repository per
+start. The daemon logs `slot held` at WARN only when a mutation keeps a store
+slot for 1 second or more; shorter holds are DEBUG.
 
 **Unextracted relations.** Under `graph.relations = "semi"` only, and only when
 the detector found frontmatter keys that point at indexed documents and are not
@@ -241,16 +245,21 @@ then ranks memory through hybrid BM25 and local-vector retrieval. Matching
 documents reuse the same query embedding, avoiding a second ONNX inference pass.
 
 The sigil selects a **cosine floor**, not a feature: a sigil prompt is admitted
-at `search.memory.min_recall_cosine` (0.40) and — while
-`user_prompt_submit_require_sigil` is `false`, the default — a plain one at
-`hooks.recall_auto_min_cosine` (0.50), because an injection nobody asked for is
+at `search.memory.min_recall_cosine` (default 0.40 for MiniLM, 0.70 for Granite)
+and — while `user_prompt_submit_require_sigil` is `false`, the default — a plain
+one at `hooks.recall_auto_min_cosine` (default 0.50 for MiniLM, 0.782 for Granite),
+because an injection nobody asked for is
 charged on every turn after it. The floor is absolute, measured against the
 query embedding. Automatic memory recall with an embedding must clear it;
 incidental lexical overlap cannot bypass it. Explicit sigil recall and recall
-without an embedding retain the strong lexical admission arm. A successful
-cross-encoder rerank uses its own semantic floor. Confidence orders results
-and never admits them. When
-nothing clears the floor, nothing is injected.
+without an embedding retain the strong lexical admission arm. Explicit threshold
+overrides, including 0.0 to disable the semantic gate, remain unchanged when the
+model changes. The memory setting also gates explicit memory search on the
+CLI and MCP; it is not limited to the hook. Granite's 0.70 default is provisional,
+selected on the English memory fixture, and does not establish a general
+false-admission rate. Explicit floors are independent and can reverse the
+default ordering. Confidence orders results and never admits them. When
+nothing passes either admission arm, nothing is injected.
 
 Output (when matches are found):
 
@@ -433,7 +442,7 @@ Configure it in `~/.mdkb/daemon.toml` under `[priors]` (global base) or in a
 repo's `.mdkb/config.toml` (override), then verify it:
 
 ```bash
-mdkb setup check    # runs the configured CLI once, prints the prior or the failure
+mdkb doctor --full    # runs the configured CLI once, prints the prior or the failure
 ```
 
 Every option below was checked that way on 2026-09-16. Times are `setup check`
@@ -462,8 +471,9 @@ post_tool_use_enabled = true
 user_prompt_submit_require_sigil = false
 
 # The cosine floor for a prompt that carries no sigil. A `*`-prefixed
-# prompt uses the lower `search.memory.min_recall_cosine` (0.40): the
-# sigil selects a threshold, it does not switch recall on. Unused when
+# prompt uses the lower `search.memory.min_recall_cosine` (MiniLM default 0.40,
+# Granite default 0.70; automatic Granite default 0.782). Explicit values win.
+# The sigil selects a threshold, it does not switch recall on. Unused when
 # require_sigil is true, except in shadow mode.
 recall_auto_min_cosine = 0.50
 
@@ -483,7 +493,7 @@ recall_limit = 5
 # Max matching documents injected alongside the memory recall, from
 # the same hybrid engine as `mdkb search --scope docs`. 0 = memory only.
 recall_docs_limit = 3
-recall_docs_min_cosine = 0.57   # a doc must score this cosine or be quoted by the prompt
+recall_docs_min_cosine = 0.57   # a doc must score this cosine or be quoted by the prompt (Granite default 0.77)
 
 # Latency budget in milliseconds. A run over budget is copied to
 # .mdkb/hook-slow.jsonl. Nothing is truncated: the value decides
@@ -497,21 +507,16 @@ latency_budget_ms = 200
 # waits the default (1000) plus 250 ms.
 user_prompt_submit_deadline_ms = 1000
 
-# Optional jina-v2-int8 rerank of MiniLM's top five automatic-recall candidates.
-# Empty by default: no weight download, model load, or cross-encoder memory.
-# Set ["it"] to opt in for Italian only; the detector supports it/en and treats
-# a tied/unknown prompt as Italian. Sigil (*) prompts never rerank.
-# `mdkb embed` fetches the weights only when this list is nonempty. While weights
-# are absent/loading, or on timeout/failure, recall keeps the MiniLM result.
-recall_rerank_languages = []
-recall_rerank_deadline_ms = 700       # clamped to remaining hook deadline
-recall_rerank_min_scores = { it = -1.05, en = -1.95 }
-# Each selected language must have a finite score floor. An explicit table
-# replaces both fitted defaults. Unsupported codes or missing floors are errors.
-# The English fit used 12 synthetic memories and admitted 3/24 held-out negatives;
-# review that floor against a real English store before opting English in.
-# Removed keys recall_rerank_it/en and recall_rerank_min_score_it/en are errors;
-# use recall_rerank_languages and recall_rerank_min_scores instead.
+# Embeddings are selected per store in [embedding], outside this [hooks] table.
+# model = "minilm" (default, English only) or "granite107m" (multilingual FP32).
+# Use granite107m when memory, docs or prompts use any language other than
+# English: MiniLM does not match a translation to its source, and recall can
+# inject both language copies of one entry.
+# Serving requests use cached weights only. A background migration worker can
+# fetch missing weights when the daemon encounters an incompatible writable store.
+# Model changes trigger background regeneration; lexical retrieval stays available.
+# `mdkb update --reembed` remains available for an explicit full rebuild or retry.
+# All hooks.recall_rerank_* keys have been removed and are configuration errors.
 
 # Require daemon delivery instead of using the in-process fallback.
 daemon_required = false
@@ -537,7 +542,7 @@ memory-only behavior.
 
 ```bash
 mdkb setup developer
-mdkb metrics status
+mdkb status
 mdkb metrics quality --period 7
 ```
 
@@ -550,8 +555,25 @@ permit an offline dictionary attack without that key. Use
 daemon after changing the profile because repository configuration is cached by
 the active daemon handle.
 
+Query telemetry is a choice of the developer, so it can also be enabled for
+every repository on the machine, without a change to a tracked
+`.mdkb/config.toml`. Set it in `~/.mdkb/daemon.toml` and restart the daemon:
+
+```toml
+[telemetry]
+query_events = true
+retention_days = 30   # optional, 1 to 365
+```
+
+The order of precedence is: built-in default, then `daemon.toml`, then the
+`[telemetry]` section of the repository, key by key. A repository that sets
+`query_events = false` explicitly stays disabled. A repository that does not
+set the key uses the `daemon.toml` value. `mdkb status` reports the
+merged value as it reads the files now. A running daemon reads `daemon.toml`
+only at startup, so it records with the new value only after a restart.
+
 Query telemetry has no denominator because it records only activated recalls.
-Use `mdkb stats` for engagement: the Hooks row for `user_prompt_submit` reports
+Use `mdkb status` for engagement: the Hooks row for `user_prompt_submit` reports
 all calls, fired recalls, and Hit%. Use `mdkb metrics quality` for retrieval
 quality after activation. Low Hit% points to discoverability or opt-in friction;
 high zero-result rate or low score bands point to retrieval/index quality.
@@ -648,10 +670,10 @@ budget truncates nothing — the value only decides what gets flagged.
 `UserPromptSubmit` is the exception: `user_prompt_submit_deadline_ms` (default
 1000, `0` disables) stops recall when it has not finished, answers with nothing
 and logs `outcome = "deadline"`. The hook client waits that deadline plus a fixed
-250 ms margin, so the deadline you set is the one the host sees; the reranker's
-budget is clamped to the same value. `mdkb stats` counts these as deadline hits.
+250 ms margin, so the deadline you set is the one the host sees.
+`mdkb status` counts these as deadline hits.
 Its rows carry a `phases` object (`prepare`, `context`, `embed`, `lock_wait`,
-`search`, `enrich`, `prior`, `rerank`, `render`, and `between_phases`, in ms).
+`search`, `enrich`, `prior`, `render`, and `between_phases`, in ms).
 Durations include the open interval when cancellation interrupts work;
 `search` includes blocking-pool queue time and execution, not just SQLite time.
 `between_phases` collects intervals after a completed phase and before the next
@@ -661,12 +683,6 @@ Deadline rows include `phases.deadline_phase`, the phase active when recall was
 cut, even before the first phase completes. These are daemon wall-clock timings;
 they do not measure the hook client's socket wait. Completed shadow rows retain
 their `shadow` object; interrupted shadow runs carry both `shadow` and `phases`.
-With the reranker in play the same
-object carries `rerank_outcome`: `ok`, `below_gate`, `timeout`, `no_budget`,
-`loading`, `not_cached`, `load_failed`, `busy`, `failed`, `one_shot`,
-`no_candidates`, `off` or `cut` (the hook deadline fired while the reranker ran).
-Anything but `ok`, `below_gate`, `no_candidates` and `off` means the MiniLM
-result was used (`cut` answers nothing, like any deadline row).
 
 SessionStart rows carry the split of `elapsed_ms` across the six phases, in the
 order they run:
@@ -691,7 +707,7 @@ mostly measures how often the daemon was cold.
 ### Edited files not reindexing
 
 Command hooks auto-start the daemon and fall back in-process unless
-`daemon_required = true`; check `mdkb daemon status` if delivery fails. Native
+`daemon_required = true`; check `mdkb status` if delivery fails. Native
 HTTP hooks require the configured HTTP/HTTPS server to remain running and
 `MDKB_HOOK_TOKEN` to match its bearer token. `mdkb update` remains the safe full
 differential fallback.
@@ -728,3 +744,41 @@ which spawns the real `mdkb` binary and asserts that warmup, recall,
 and immediate watcher delivery match the spec. HTTP/Unix parity, authentication,
 root admission, and JSON-RPC errors are covered in `src/mcp/common.rs` and
 `tests/e2e_mcp_http.rs`.
+
+## Triggered memory rules
+
+`--trigger` attaches a JSON matcher to a `topic`, `problem` or `decision`
+entry. The hooks then inject the entry exactly where it applies, at most once
+per session, instead of waiting for recall to find it:
+
+```bash
+mdkb memory add use-mbx -t "Build through mbx" -T decision -c "Run cargo through the mbx shim." \
+  --trigger '{"tool":"Bash","command_contains":"cargo"}'
+mdkb memory add auth-rule -t "PKCE only" -T decision -c "..." \
+  --trigger '{"prompt_contains":"oauth"}' --trigger '{"path_glob":"src/auth/**"}'
+```
+
+| Selector | Matches | Case |
+|---|---|---|
+| `tool` | the tool name, before or after the call | insensitive |
+| `path_glob` | a glob over the call's repo-relative path | sensitive |
+| `command_contains` | a substring of the shell command | sensitive |
+| `error_contains` | a substring of a failed call's error text (after the call only) | sensitive |
+| `prompt_contains` | a substring of the user's prompt | insensitive |
+| `when` | free prose for readers; never matched | — |
+
+The selectors in one matcher must all match. Repeat `--trigger` to give
+alternatives, of which any one is enough. `prompt_contains` cannot be combined
+with tool selectors, and a matcher needs at least one selector. An entry that is
+expired, not active, or refuted since its last confirmation is not injected.
+MCP `memory_write` takes the same matchers as `triggers`.
+
+## Daemon client commands
+
+`mdkb hook search`, `hook memory-write`, `hook memory-confirm` and
+`hook reindex` send one request to the daemon over its hook socket and print
+the answer. They exist for hook wiring and scripts that must not open the
+store themselves; for interactive use, prefer `mdkb search`, `memory add`,
+`memory confirm` and `update`. `hook memory-write` takes `--id`, `--title`, `--entry-type`, `--content`,
+`--tags` and `--ttl` (seconds); `hook memory-confirm` takes `--id` and
+`--outcome`.

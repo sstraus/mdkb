@@ -159,7 +159,7 @@ pub fn archive_projection(memory_dir: &std::path::Path, id: &str) -> std::io::Re
 ///
 /// Best-effort: neither a schema migration nor an `update` may fail because a
 /// file could not be renamed. A file left behind is reported by the drift count
-/// in `mdkb stats` and swept on a later run; a migration that aborts halfway
+/// in `mdkb status` and swept on a later run; a migration that aborts halfway
 /// leaves a store nobody can open.
 pub fn dispose_projections(conn: &rusqlite::Connection, ids: &[String]) {
     if ids.is_empty() {

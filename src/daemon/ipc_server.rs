@@ -998,8 +998,9 @@ mod tests {
              have written: {resp}"
         );
         assert_eq!(
-            code, -32602,
-            "a validation refusal is INVALID_PARAMS: {resp}"
+            code,
+            i64::from(crate::daemon::hook_runtime::REJECTED_ERROR_CODE),
+            "a validation refusal inside dispatch is final: {resp}"
         );
         assert!(
             envelope["error"]["message"]

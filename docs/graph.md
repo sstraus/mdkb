@@ -243,8 +243,7 @@ the documents, or in `frontmatter_relations`, not in the query.
 ### A worked pass over a repository
 
 ```bash
-mdkb update                                  # extract edges from what changed
-                                             # (--force after editing the allowlist)
+mdkb update                                  # extract edges; also applies an edited allowlist
 mdkb graph hubs --limit 20                   # what everything points at
 mdkb graph hubs --relation owner             # who carries the most
 mdkb graph dangling                          # references with no document

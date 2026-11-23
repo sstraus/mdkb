@@ -7,7 +7,6 @@
 //! - `mdkb_update` - Trigger reindex
 
 pub mod dispatch;
-pub mod recall_rerank;
 pub mod server;
 pub mod tools;
 

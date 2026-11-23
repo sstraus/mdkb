@@ -1,0 +1,122 @@
+[
+{"family": "F12-ratelimit", "docs": [
+ {"id": "rl-public-api", "kind": "doc", "type": "topic",
+  "en": ["Public API rate limits", "Each API key may send 600 requests per minute with a burst of 100. Over the limit the gateway answers 429 with a Retry-After header in seconds. Limits are per key, not per IP address."],
+  "it": ["Limiti di frequenza dell'API pubblica", "Ogni API key può inviare 600 richieste al minuto con un burst di 100. Oltre il limite il gateway risponde 429 con un header Retry-After in secondi. I limiti valgono per chiave, non per indirizzo IP."]},
+ {"id": "rl-login-lockout", "kind": "memory", "type": "decision",
+  "en": ["Login throttling instead of account lockout", "After 5 failed logins an account is slowed down with growing delays, not locked. Hard lockout let attackers block real users on purpose. The delay resets after a successful login."],
+  "it": ["Rallentamento del login invece del blocco dell'account", "Dopo 5 login falliti l'account viene rallentato con ritardi crescenti, non bloccato. Il blocco totale permetteva agli attaccanti di bloccare apposta gli utenti veri. Il ritardo si azzera dopo un login riuscito."]},
+ {"id": "rl-redis-token-bucket", "kind": "doc", "type": "topic",
+  "en": ["Rate limiter implementation", "The gateway keeps one token bucket per API key in Redis and updates it with a Lua script, so the check and the decrement are atomic. If Redis is unreachable the gateway allows the request and logs a warning."],
+  "it": ["Implementazione del rate limiter", "Il gateway tiene un token bucket per API key in Redis e lo aggiorna con uno script Lua, così controllo e decremento sono atomici. Se Redis non è raggiungibile il gateway lascia passare la richiesta e scrive un warning nel log."]},
+ {"id": "rl-partner-exception", "kind": "memory", "type": "decision",
+  "en": ["Higher limit for the logistics partner", "The logistics partner key has 3,000 requests per minute until the end of the year because their sync job runs every hour in one burst. The exception is configured in limits.yaml and must be reviewed in December."],
+  "it": ["Limite più alto per il partner logistico", "La chiave del partner logistico ha 3.000 richieste al minuto fino a fine anno perché il loro job di sincronizzazione gira ogni ora tutto insieme. L'eccezione è configurata in limits.yaml e va rivista a dicembre."]},
+ {"id": "rl-429-retry-storm", "kind": "memory", "type": "problem",
+  "en": ["Retry storm from the mobile app on 429", "The mobile app retried 429 responses immediately and ignored Retry-After, so a short overload became a 20 minute outage. App 4.12 waits for Retry-After with jitter."],
+  "it": ["Tempesta di retry dall'app mobile sui 429", "L'app mobile ripeteva subito le risposte 429 ignorando Retry-After, così un breve sovraccarico è diventato un disservizio di 20 minuti. L'app 4.12 aspetta il Retry-After con un jitter."]}
+ ],
+ "intents": [
+  {"id": "q056", "rel": {"rl-public-api": 3}, "tags": ["short"], "en": "how many API calls per minute are allowed?", "it": "quante chiamate API al minuto sono consentite?"},
+  {"id": "q057", "rel": {"rl-login-lockout": 3}, "tags": ["negation"], "en": "do we lock the account after too many wrong passwords?", "it": "blocchiamo l'account dopo troppe password sbagliate?"},
+  {"id": "q058", "rel": {"rl-redis-token-bucket": 3}, "tags": [], "en": "what happens to rate limiting when Redis is down?", "it": "cosa succede al rate limiting quando Redis è giù?"},
+  {"id": "q059", "rel": {"rl-partner-exception": 3}, "tags": ["identifier"], "en": "which key has a special entry in limits.yaml and until when?", "it": "quale chiave ha una voce speciale in limits.yaml e fino a quando?"},
+  {"id": "q060", "rel": {"rl-429-retry-storm": 3, "rl-public-api": 1}, "tags": ["long"], "en": "a short overload turned into a long outage because clients kept hammering us after being throttled", "it": "un breve sovraccarico è diventato un lungo disservizio perché i client continuavano a martellarci dopo essere stati limitati"}
+ ]},
+{"family": "F13-mobile", "docs": [
+ {"id": "mobile-min-version", "kind": "doc", "type": "topic",
+  "en": ["Minimum supported app version", "The API rejects app versions older than 4.8 with HTTP 426 and the app shows an update screen. The minimum version moves up at most twice a year and is announced 30 days before."],
+  "it": ["Versione minima supportata dell'app", "L'API rifiuta le versioni dell'app precedenti alla 4.8 con HTTP 426 e l'app mostra una schermata di aggiornamento. La versione minima sale al massimo due volte l'anno e viene annunciata 30 giorni prima."]},
+ {"id": "mobile-offline-sync", "kind": "doc", "type": "topic",
+  "en": ["Offline edits and sync", "The app stores edits made offline in a local queue and sends them in order when the network returns. If the server copy changed meanwhile, the server version wins and the user sees a conflict banner."],
+  "it": ["Modifiche offline e sincronizzazione", "L'app salva le modifiche fatte offline in una coda locale e le invia in ordine quando torna la rete. Se nel frattempo la copia sul server è cambiata, vince la versione del server e l'utente vede un banner di conflitto."]},
+ {"id": "mobile-push-token", "kind": "memory", "type": "problem",
+  "en": ["Push notifications stopped after reinstall", "A reinstalled app got a new push token but the old one stayed registered first, so pushes went to a dead token. The app now sends its token at every start and the server keeps only the newest token per device."],
+  "it": ["Le notifiche push si fermavano dopo la reinstallazione", "Un'app reinstallata riceveva un nuovo token push ma quello vecchio restava registrato per primo, così le push andavano a un token morto. Ora l'app invia il token a ogni avvio e il server tiene solo il più recente per dispositivo."]},
+ {"id": "mobile-release-train", "kind": "memory", "type": "decision",
+  "en": ["Two-week mobile release train", "The mobile app ships every second Tuesday. A feature that misses the branch cut waits for the next train; only crash fixes get a separate release."],
+  "it": ["Treno di rilascio mobile ogni due settimane", "L'app mobile esce un martedì ogni due settimane. Una funzione che non entra nel taglio del branch aspetta il treno successivo; solo le correzioni di crash hanno un rilascio separato."]},
+ {"id": "mobile-cert-pinning", "kind": "memory", "type": "decision",
+  "en": ["No certificate pinning in the app", "We removed certificate pinning in version 4.9. A certificate renewal in 2025 broke every installed app for six hours. The app relies on the platform trust store and HSTS."],
+  "it": ["Niente certificate pinning nell'app", "Abbiamo rimosso il certificate pinning nella versione 4.9. Un rinnovo del certificato nel 2025 ha reso inutilizzabili tutte le app installate per sei ore. L'app si affida al trust store della piattaforma e a HSTS."]}
+ ],
+ "intents": [
+  {"id": "q061", "rel": {"mobile-min-version": 3}, "tags": ["identifier"], "en": "users on an old app get HTTP 426, why?", "it": "gli utenti con l'app vecchia ricevono HTTP 426, perché?"},
+  {"id": "q062", "rel": {"mobile-offline-sync": 3}, "tags": ["long"], "en": "I edited a record on the train without signal and my change disappeared when I got back online", "it": "ho modificato un record in treno senza campo e la mia modifica è sparita quando sono tornato online"},
+  {"id": "q063", "rel": {"mobile-push-token": 3}, "tags": [], "en": "a user stopped receiving push notifications after reinstalling the app", "it": "un utente non riceve più le notifiche push dopo aver reinstallato l'app"},
+  {"id": "q064", "rel": {"mobile-release-train": 3}, "tags": ["short"], "en": "when is the next app release?", "it": "quando esce la prossima release dell'app?"},
+  {"id": "q065", "rel": {"mobile-cert-pinning": 3}, "tags": ["negation"], "en": "should the app pin our TLS certificate?", "it": "l'app dovrebbe fare il pinning del nostro certificato TLS?"}
+ ]},
+{"family": "F14-i18n", "docs": [
+ {"id": "i18n-keys", "kind": "doc", "type": "topic",
+  "en": ["Translation keys", "UI strings live in locales/<lang>.json under dotted keys such as invoice.list.empty. Never build a sentence by joining translated fragments; word order differs between languages."],
+  "it": ["Chiavi di traduzione", "Le stringhe dell'interfaccia stanno in locales/<lang>.json sotto chiavi puntate come invoice.list.empty. Non costruire mai una frase unendo frammenti tradotti; l'ordine delle parole cambia da lingua a lingua."]},
+ {"id": "i18n-fallback", "kind": "doc", "type": "topic",
+  "en": ["Missing translation fallback", "A key missing in Italian or German falls back to English, and the build prints a warning with the key name. A key missing in English fails the build."],
+  "it": ["Ripiego per le traduzioni mancanti", "Una chiave mancante in italiano o tedesco ripiega sull'inglese e la build stampa un warning con il nome della chiave. Una chiave mancante in inglese fa fallire la build."]},
+ {"id": "i18n-dates-tz", "kind": "memory", "type": "problem",
+  "en": ["Dates shown one day off", "Due dates were stored as midnight UTC and displayed in the user's time zone, so users in America saw the previous day. Dates without a time are now stored as plain calendar dates, not timestamps."],
+  "it": ["Date mostrate con un giorno di differenza", "Le scadenze erano salvate come mezzanotte UTC e mostrate nel fuso orario dell'utente, così gli utenti in America vedevano il giorno prima. Le date senza orario ora sono salvate come date di calendario semplici, non come timestamp."]},
+ {"id": "i18n-plural", "kind": "memory", "type": "topic",
+  "en": ["Plural forms use ICU messages", "Counts go through ICU plural syntax, for example {count, plural, one {# file} other {# files}}. Polish and Czech need more than two forms, so an if count == 1 check is wrong."],
+  "it": ["Le forme plurali usano i messaggi ICU", "I conteggi passano dalla sintassi plurale ICU, per esempio {count, plural, one {# file} other {# file}}. Polacco e ceco hanno più di due forme, quindi un controllo if count == 1 è sbagliato."]},
+ {"id": "i18n-currency-format", "kind": "memory", "type": "decision",
+  "en": ["Currency formatting follows the invoice locale", "Amounts are formatted with the locale of the invoice, not of the viewer. An Italian accountant opening a German invoice sees 1.234,50 EUR as on the PDF."],
+  "it": ["Il formato della valuta segue la lingua della fattura", "Gli importi sono formattati con la localizzazione della fattura, non di chi la guarda. Un commercialista italiano che apre una fattura tedesca vede 1.234,50 EUR come sul PDF."]}
+ ],
+ "intents": [
+  {"id": "q066", "rel": {"i18n-keys": 3}, "tags": [], "en": "can I concatenate two translated strings to form a sentence?", "it": "posso concatenare due stringhe tradotte per formare una frase?"},
+  {"id": "q067", "rel": {"i18n-fallback": 3}, "tags": ["negation"], "en": "will the build fail if a German translation is missing?", "it": "la build fallisce se manca una traduzione in tedesco?"},
+  {"id": "q068", "rel": {"i18n-dates-tz": 3}, "tags": ["long"], "en": "customers in the US see every due date one day earlier than in Europe", "it": "i clienti negli Stati Uniti vedono ogni scadenza un giorno prima rispetto all'Europa"},
+  {"id": "q069", "rel": {"i18n-plural": 3}, "tags": ["identifier"], "en": "how do I write the plural for a file count?", "it": "come scrivo il plurale per un conteggio di file?"},
+  {"id": "q070", "rel": {"i18n-currency-format": 3}, "tags": ["short"], "en": "which locale formats invoice amounts?", "it": "con quale lingua vengono formattati gli importi delle fatture?"}
+ ]},
+{"family": "F15-notifications", "docs": [
+ {"id": "notif-email-provider", "kind": "memory", "type": "decision",
+  "en": ["Transactional email through one provider with a fallback", "Transactional email goes through the primary provider; after 3 failed sends in a row the notifier switches to the secondary provider for 30 minutes. Marketing email never uses the transactional domain."],
+  "it": ["Email transazionali con un provider e un fallback", "Le email transazionali passano dal provider principale; dopo 3 invii falliti di fila il notifier passa al provider secondario per 30 minuti. Le email di marketing non usano mai il dominio transazionale."]},
+ {"id": "notif-digest", "kind": "doc", "type": "topic",
+  "en": ["Notification digest", "Non-urgent notifications are grouped into one digest email per user per day at 08:00 local time. Urgent ones, like a failed payment or a security alert, are sent immediately."],
+  "it": ["Riepilogo delle notifiche", "Le notifiche non urgenti sono raggruppate in un'unica email di riepilogo al giorno per utente alle 08:00 ora locale. Quelle urgenti, come un pagamento fallito o un avviso di sicurezza, partono subito."]},
+ {"id": "notif-unsubscribe", "kind": "doc", "type": "topic",
+  "en": ["Unsubscribe rules", "Every non-mandatory email has a one-click unsubscribe link. Security and billing emails cannot be turned off, because they are required by the contract."],
+  "it": ["Regole di disiscrizione", "Ogni email non obbligatoria ha un link di disiscrizione con un clic. Le email di sicurezza e di fatturazione non si possono disattivare, perché sono previste dal contratto."]},
+ {"id": "notif-duplicate-sms", "kind": "memory", "type": "problem",
+  "en": ["Duplicate SMS after worker restart", "The SMS worker acknowledged a job only after the provider answered. A restart in that window resent 1,200 two-factor codes. Jobs now carry a dedup key and the worker skips keys sent in the last 10 minutes."],
+  "it": ["SMS duplicati dopo il riavvio del worker", "Il worker degli SMS confermava un job solo dopo la risposta del provider. Un riavvio in quell'intervallo ha rinviato 1.200 codici di verifica in due passaggi. Ora i job hanno una chiave di deduplicazione e il worker salta le chiavi inviate negli ultimi 10 minuti."]},
+ {"id": "notif-webhook-signature", "kind": "doc", "type": "topic",
+  "en": ["Outgoing webhook signatures", "Webhooks we send to customers carry an X-Arpeggio-Signature header with an HMAC-SHA256 of the body and a timestamp. Receivers should reject messages older than 5 minutes."],
+  "it": ["Firme dei webhook in uscita", "I webhook che inviamo ai clienti hanno un header X-Arpeggio-Signature con un HMAC-SHA256 del corpo e un timestamp. Chi li riceve dovrebbe rifiutare i messaggi più vecchi di 5 minuti."]}
+ ],
+ "intents": [
+  {"id": "q071", "rel": {"notif-email-provider": 3}, "tags": [], "en": "what happens to password reset emails if our mail provider is down?", "it": "cosa succede alle email di reset password se il nostro provider di posta è giù?"},
+  {"id": "q072", "rel": {"notif-digest": 3}, "tags": ["short"], "en": "why did I get one summary email instead of many?", "it": "perché ho ricevuto un'unica email di riepilogo invece di tante?"},
+  {"id": "q073", "rel": {"notif-unsubscribe": 3}, "tags": ["negation"], "en": "can a user unsubscribe from billing emails?", "it": "un utente può disiscriversi dalle email di fatturazione?"},
+  {"id": "q074", "rel": {"notif-duplicate-sms": 3}, "tags": ["long"], "en": "customers received the same 2FA code twice after a deploy of the SMS service", "it": "i clienti hanno ricevuto due volte lo stesso codice 2FA dopo un deploy del servizio SMS"},
+  {"id": "q075", "rel": {"notif-webhook-signature": 3}, "tags": ["identifier"], "en": "how does a customer verify X-Arpeggio-Signature?", "it": "come fa un cliente a verificare X-Arpeggio-Signature?"}
+ ]},
+{"family": "F16-privacy", "docs": [
+ {"id": "privacy-retention", "kind": "doc", "type": "topic",
+  "en": ["Data retention", "Closed accounts are anonymized after 90 days. Invoices are kept for 10 years because tax law requires it, but the customer name on them is the only personal data kept."],
+  "it": ["Conservazione dei dati", "Gli account chiusi vengono anonimizzati dopo 90 giorni. Le fatture sono conservate per 10 anni perché lo impone la normativa fiscale, ma il nome del cliente è l'unico dato personale che resta."]},
+ {"id": "privacy-erasure", "kind": "doc", "type": "topic",
+  "en": ["Right to erasure requests", "An erasure request is executed with arpctl privacy erase <account> within 30 days. The command removes the account from the database, search index and backups older than the next snapshot cycle."],
+  "it": ["Richieste di cancellazione dei dati", "Una richiesta di cancellazione si esegue con arpctl privacy erase <account> entro 30 giorni. Il comando rimuove l'account dal database, dall'indice di ricerca e dai backup al ciclo di snapshot successivo."]},
+ {"id": "privacy-logs-pii", "kind": "memory", "type": "problem",
+  "en": ["Email addresses leaked into logs", "The validation error message included the full request body, so email addresses and phone numbers ended up in the log store for months. A log filter now masks fields named email, phone and iban."],
+  "it": ["Indirizzi email finiti nei log", "Il messaggio di errore di validazione includeva tutto il corpo della richiesta, così email e numeri di telefono sono finiti nello storage dei log per mesi. Un filtro ora maschera i campi chiamati email, phone e iban."]},
+ {"id": "privacy-eu-region", "kind": "memory", "type": "decision",
+  "en": ["EU customer data stays in the EU region", "EU tenants are created in the Frankfurt region and their data never leaves it, including backups. Support staff outside the EU see masked personal fields."],
+  "it": ["I dati dei clienti UE restano nella regione UE", "I tenant europei vengono creati nella regione di Francoforte e i loro dati non ne escono mai, backup compresi. Il personale di supporto fuori dall'UE vede i campi personali mascherati."]},
+ {"id": "privacy-analytics-consent", "kind": "memory", "type": "decision",
+  "en": ["Product analytics only after consent", "The web app loads the analytics script only after the user accepts the analytics cookie. Without consent we record nothing, not even an anonymous page view."],
+  "it": ["Analytics di prodotto solo dopo il consenso", "La web app carica lo script di analytics solo dopo che l'utente accetta il cookie di analytics. Senza consenso non registriamo niente, nemmeno una visualizzazione anonima."]}
+ ],
+ "intents": [
+  {"id": "q076", "rel": {"privacy-retention": 3}, "tags": [], "en": "how long do we keep data after a customer closes the account?", "it": "per quanto teniamo i dati dopo che un cliente chiude l'account?"},
+  {"id": "q077", "rel": {"privacy-erasure": 3, "privacy-retention": 1}, "tags": ["identifier", "long"], "en": "a user asked to be forgotten under GDPR, what is the procedure and deadline?", "it": "un utente ha chiesto di essere dimenticato secondo il GDPR, qual è la procedura e la scadenza?"},
+  {"id": "q078", "rel": {"privacy-logs-pii": 3, "obs-log-levels": 1}, "tags": [], "en": "personal data appears in the logs", "it": "nei log compaiono dati personali"},
+  {"id": "q079", "rel": {"privacy-eu-region": 3}, "tags": ["negation"], "en": "can a European tenant's backup be stored in the US?", "it": "il backup di un tenant europeo può stare negli Stati Uniti?"},
+  {"id": "q080", "rel": {"privacy-analytics-consent": 3}, "tags": ["short"], "en": "analytics without cookie consent", "it": "analytics senza consenso ai cookie"}
+ ]}
+]

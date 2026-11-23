@@ -70,6 +70,7 @@ fn gone(parent: &Path, name: &str) -> PathBuf {
 fn live(parent: &Path, name: &str) -> PathBuf {
     let p = dir(parent, name);
     std::fs::create_dir_all(p.join(".mdkb")).unwrap();
+    std::fs::write(p.join(".mdkb/index.sqlite"), b"").unwrap();
     p
 }
 
@@ -243,6 +244,8 @@ fn a_scoped_gone_root_that_comes_back_keeps_its_scope_once() {
     assert!(!m.contains(&g), "a gone root is not a known repo in memory");
 
     std::fs::create_dir_all(g.join(".mdkb")).unwrap();
+
+    std::fs::write(g.join(".mdkb/index.sqlite"), b"").unwrap();
     m.record(&g);
 
     let roots = file_roots(&map);

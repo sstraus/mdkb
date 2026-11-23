@@ -27,8 +27,23 @@ struct DaemonProc {
 
 impl DaemonProc {
     fn spawn() -> Self {
-        let home = TempDir::new().unwrap();
-        let child = Command::new(BIN)
+        Self::spawn_in(TempDir::new().unwrap())
+    }
+
+    /// Boot the daemon with `home` as HOME, so a test can seed
+    /// `~/.mdkb/daemon.toml` before the daemon reads it.
+    fn spawn_in(home: TempDir) -> Self {
+        Self::spawn_from(home, None)
+    }
+
+    /// Like [`spawn_in`](Self::spawn_in), with the daemon started from `cwd`
+    /// instead of the test's own directory.
+    fn spawn_from(home: TempDir, cwd: Option<&Path>) -> Self {
+        let mut cmd = Command::new(BIN);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let child = cmd
             .arg("serve")
             .arg("--daemon")
             .env("HOME", home.path())
@@ -133,7 +148,7 @@ impl DaemonProc {
         // not change what a file is called. Key these symbols under `lib.rs`
         // instead of `src/lib.rs` and the daemon's own watcher files a second
         // copy of every one of them, leaving every lookup by name ambiguous.
-        for args in [vec!["init"], vec!["code", "index", "src"]] {
+        for args in [vec!["init"], vec!["update", "--code"]] {
             let out = Command::new(BIN)
                 .args(&args)
                 .current_dir(&root)
@@ -299,6 +314,66 @@ fn a_daemon_that_cannot_bind_exits_with_the_reason() {
     assert!(
         stderr.contains("daemon.sock"),
         "stderr must name the socket it could not publish: {stderr}"
+    );
+}
+
+/// Proves: a `socket_path` key in `daemon.toml` no longer separates the
+/// `mdkb mcp` proxy from the daemon. Catches: the proxy dialling the
+/// configured path while the daemon binds `~/.mdkb/daemon.sock`, which
+/// failed every MCP session of anyone who set the key (story 085-6db4).
+#[test]
+fn mcp_proxy_reaches_the_daemon_when_daemon_toml_names_a_socket_path() {
+    let home = TempDir::new().unwrap();
+    let base = home.path().join(".mdkb");
+    std::fs::create_dir_all(&base).unwrap();
+    let stray = home.path().join("custom.sock");
+    std::fs::write(
+        base.join("daemon.toml"),
+        format!("socket_path = {:?}\n", stray.to_str().unwrap()),
+    )
+    .unwrap();
+    let d = DaemonProc::spawn_in(home);
+
+    let project = d.home.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    // MDKB_NO_SPAWN: the proxy must find the daemon this test started, not
+    // fork a second one that would hide where the first one listens.
+    let out = Command::new(BIN)
+        .arg("mcp")
+        .current_dir(&project)
+        .env("HOME", d.home.path())
+        .env("MDKB_NO_SPAWN", "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run mdkb mcp");
+    assert!(
+        out.status.success(),
+        "mdkb mcp must reach the running daemon; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Proves: the daemon starts, and `daemon status` answers, when the working
+/// directory is the home directory. Catches: the store-anchoring guard
+/// refusing commands that anchor no store, which killed every daemon an
+/// agent spawned from `~` (story 090-a611).
+#[test]
+fn daemon_starts_and_answers_from_the_home_directory() {
+    let home = TempDir::new().unwrap();
+    let home_path = home.path().to_path_buf();
+    let _d = DaemonProc::spawn_from(home, Some(&home_path));
+
+    let out = Command::new(BIN)
+        .args(["status"])
+        .current_dir(&home_path)
+        .env("HOME", &home_path)
+        .env("MDKB_NO_SPAWN", "1")
+        .output()
+        .expect("run mdkb daemon status");
+    assert!(
+        out.status.success(),
+        "mdkb daemon status must run from the home directory; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

@@ -59,6 +59,9 @@ pub enum AuditSignal {
     /// The entry cites a path that is gone from the working tree, or a line
     /// number past the end of a file that is still there.
     DeadCodeReference { reference: String },
+    /// The entry cites a symbol the code index no longer defines and the
+    /// tracked source no longer mentions.
+    DeadSymbolReference { symbol: String },
     /// Git failed while checking whether a cited path ever existed, so
     /// whether it is dead could not be determined this pass. Must never be
     /// silently read as "resolves".
@@ -126,6 +129,10 @@ pub struct AuditOutcome {
     /// indistinguishable from a complete one in `--format json`. Same defect
     /// class `unchecked` exists to close, one signal over.
     pub source_drift_checked: bool,
+    /// Why the cited-symbol pass did not run; `None` when it ran. A skipped
+    /// pass must not read as "no dead symbol".
+    #[serde(default)]
+    pub symbol_check_skipped: Option<String>,
 }
 
 /// Run an audit: select, then stamp.
@@ -240,6 +247,29 @@ fn select(
         }
     }
 
+    // ── Signal 2b: the symbols entries cite ──────────────────────────────────
+    let symbol_refs = super::memory_audit_symbols::collect(rows);
+    let names: Vec<&str> = symbol_refs.iter().map(|(_, _, n)| n.as_str()).collect();
+    let symbol_check_skipped = match super::memory_audit_symbols::check(ctx.root(), &names) {
+        super::memory_audit_symbols::SymbolPass::Skipped(why) => Some(why),
+        super::memory_audit_symbols::SymbolPass::Checked(statuses) => {
+            use super::memory_audit_symbols::SymbolStatus;
+            for (id, token, name) in &symbol_refs {
+                let signal = match statuses.get(name) {
+                    Some(SymbolStatus::Dead) => AuditSignal::DeadSymbolReference {
+                        symbol: token.clone(),
+                    },
+                    Some(SymbolStatus::CheckFailed) => AuditSignal::ReferenceCheckFailed {
+                        reference: token.clone(),
+                    },
+                    _ => continue,
+                };
+                by_id.entry(id.clone()).or_default().push(signal);
+            }
+            None
+        }
+    };
+
     // ── Signal 3: pairs the store already relates ────────────────────────────
     // `rows` is already the caller's own rowid->id map — no need to make
     // `near_duplicate_pairs` query it a second time.
@@ -323,6 +353,7 @@ fn select(
         near_duplicate_checked: near_duplicate_coverage.checked(),
         near_duplicate_coverage,
         source_drift_checked,
+        symbol_check_skipped,
     })
 }
 

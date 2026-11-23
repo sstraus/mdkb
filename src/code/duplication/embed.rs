@@ -304,6 +304,7 @@ impl DupEmbedder {
     /// Build the model named by `[code.duplication] model`.
     pub fn new(name: &str) -> Result<Self> {
         let variant = fastembed_model(name)?;
+        crate::llm::bound_onnx_threads();
         let model = fastembed::TextEmbedding::try_new(
             fastembed::InitOptions::new(variant)
                 .with_cache_dir(dup_cache_dir())

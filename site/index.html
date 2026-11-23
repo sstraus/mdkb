@@ -30,6 +30,7 @@
           <a href="#value">Why</a>
           <a href="#recall">Recall</a>
           <a href="#memory">Memory</a>
+          <a href="#graph">Graph</a>
           <a href="#code">Code</a>
           <a href="#start">Start</a>
           <a class="nav-gh" href="https://github.com/sstraus/mdkb" rel="noopener noreferrer">GitHub</a>
@@ -245,11 +246,58 @@
         </div>
       </section>
 
+      <!-- ============ GRAPH ============ -->
+      <section id="graph">
+        <div class="wrap">
+          <div class="sec-head">
+            <div class="sec-num">06</div>
+            <p class="kicker">Knowledge graph</p>
+            <h2>Connections someone wrote down, not ones a model guessed.</h2>
+            <p class="lede">
+              Frontmatter keys and <code>[[wikilinks]]</code> become typed edges when the repository is
+              indexed. When recall finds a memory, or the prompt names a document, its neighbours come along:
+              at most three, ranked against the prompt.
+            </p>
+          </div>
+
+          <figure class="fig">
+            <!-- @include doc-graph -->
+            <figcaption>
+              An edge points at the string the author wrote, so <code>alice.md</code> gets its backlinks the moment
+              it is indexed. With the default <code>relations = "auto"</code>, a frontmatter key becomes a relation
+              when its values name indexed documents; free text never does.
+              <a href="https://github.com/sstraus/mdkb/blob/main/docs/graph.md" rel="noopener noreferrer">Full graph guide</a>.
+            </figcaption>
+          </figure>
+
+          <div class="cards" style="margin-top: 40px">
+            <div class="card">
+              <h3>Blast radius of an edit</h3>
+              <p>Every document that names this one, and under which relation. Run it before you rename or retire a page.</p>
+              <pre>mdkb graph backlinks queues.md
+mdkb graph neighbors queues.md</pre>
+            </div>
+            <div class="card">
+              <h3>Gardening reports</h3>
+              <p>References with no document, and what everything points at. Read-only: mdkb never moves files or infers a taxonomy.</p>
+              <pre>mdkb graph dangling
+mdkb graph hubs --relation owner</pre>
+            </div>
+            <div class="card">
+              <h3>Memory relations</h3>
+              <p>An entry whose <code>derived_from</code> or <code>supports</code> target was superseded is injected with <code>[STALE-DEP]</code>.</p>
+              <pre>mdkb memory link auth-v2 \
+  supersedes auth-v1</pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- ============ CODE ============ -->
       <section id="code">
         <div class="wrap">
           <div class="sec-head">
-            <div class="sec-num">06</div>
+            <div class="sec-num">07</div>
             <p class="kicker">Structural code intelligence</p>
             <h2>Know what breaks before you change it.</h2>
             <p class="lede">
@@ -293,7 +341,7 @@ mdkb code impact NAME --depth 2</pre>
       <section id="measure">
         <div class="wrap">
           <div class="sec-head">
-            <div class="sec-num">07</div>
+            <div class="sec-num">08</div>
             <p class="kicker">Retrieval you can measure</p>
             <h2>Numbers from commands, not from adjectives.</h2>
           </div>
@@ -318,12 +366,14 @@ mdkb code impact NAME --depth 2</pre>
       <section id="start">
         <div class="wrap">
           <div class="sec-head">
-            <div class="sec-num">08</div>
+            <div class="sec-num">09</div>
             <p class="kicker">Quick start</p>
             <h2>Three steps, one binary.</h2>
             <p class="lede">
               The embedding model downloads on first use and then runs on-device. No memory API, hosted
-              vector database or LLM extraction service is required.
+              vector database or LLM extraction service is required. The default model is English only:
+              for notes, docs or prompts in other languages, set <code>[embedding] model = "granite107m"</code>
+              in <code>.mdkb/config.toml</code>.
             </p>
           </div>
           <div class="start">

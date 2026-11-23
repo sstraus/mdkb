@@ -1,5 +1,5 @@
 //! Store operations that are neither indexing, memory, nor the code graph:
-//! embeddings, evaluation, experiments, metrics, journal import and session
+//! embeddings, evaluation, metrics, journal import and session
 //! retention.
 //!
 //! Grouped by what they are not, deliberately: each is small, each mutates or
@@ -22,33 +22,6 @@ use crate::store::{collections, documents, evolution, memory, search, stats, vec
 use std::collections::HashSet;
 use walkdir::WalkDir;
 
-/// Fetch the recall reranker's weights, for the two callers that are the user
-/// running `mdkb embed`. Not part of [`handle_embed`]: that also runs on every
-/// index flush, and a 280 MB download has no place there. Best effort — recall
-/// falls back to the MiniLM gate without the weights, but the user who ran
-/// `mdkb embed` asked for them, so a failed fetch is returned to the caller.
-///
-/// Takes no store: the download is slow, so a caller holding the store lock must
-/// not be the one running it.
-pub fn fetch_reranker_weights(hooks: &crate::config::HooksConfig) -> Result<()> {
-    fetch_reranker_weights_with(hooks, crate::llm::rerank::download)
-}
-
-fn fetch_reranker_weights_with(
-    hooks: &crate::config::HooksConfig,
-    download: impl FnOnce() -> Result<()>,
-) -> Result<()> {
-    if !hooks.recall_rerank_any() {
-        return Ok(());
-    }
-    download().map_err(|error| {
-        Error::other(format!(
-            "embeddings are done, but the recall reranker weights were not fetched \
-             (recall keeps the MiniLM gate): {error}"
-        ))
-    })
-}
-
 /// Generate embeddings for documents that don't have them (the `has_embedding`
 /// gate is the hash gate: content changes invalidate the old embedding, so only
 /// new/changed docs are re-embedded; unchanged docs are skipped).
@@ -61,15 +34,86 @@ fn fetch_reranker_weights_with(
 /// avoid 2-5 second load time per request. Per-doc timing over 1s is logged to
 /// `hook-slow.jsonl`.
 pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResult> {
+    handle_embed_inner(ctx, collection, false, false)
+}
+
+/// Explicit model fetch/backfill, and an opt-in all-corpus model migration.
+pub fn handle_embed_explicit(
+    ctx: &Context,
+    collection: Option<&str>,
+    reembed: bool,
+) -> Result<EmbedResult> {
+    let _migration =
+        crate::store::mutation_lock::acquire(&ctx.db_path, "explicit embedding generation")?;
+    handle_embed_explicit_under_lock(ctx, collection, reembed)
+}
+
+/// The adapter must hold the index mutation lock for this entire operation.
+/// Daemon dispatch already holds it; reacquiring a second file handle would deadlock.
+pub(crate) fn handle_embed_explicit_under_lock(
+    ctx: &Context,
+    collection: Option<&str>,
+    reembed: bool,
+) -> Result<EmbedResult> {
+    if reembed && collection.is_some() {
+        return Err(Error::other(
+            "--reembed rebuilds the entire store; omit --collection",
+        ));
+    }
+    handle_embed_inner(ctx, collection, true, reembed)
+}
+
+fn handle_embed_inner(
+    ctx: &Context,
+    collection: Option<&str>,
+    explicit: bool,
+    reembed: bool,
+) -> Result<EmbedResult> {
     let mut result = EmbedResult::default();
 
-    // The one command whose job is to produce embeddings, so it is the one
-    // allowed to fetch the weights (see `llm::get_cached_service`).
-    let service = crate::llm::get_or_download_service()?;
+    // Serving can fall back to defaults on unrelated config errors, but a
+    // destructive rebuild must not silently replace the configured encoder.
+    let config = if reembed {
+        match Config::load(&ctx.config_path) {
+            Ok(config) => config,
+            Err(error) if matches!(error.kind(), ErrorKind::ConfigNotFound { .. }) => {
+                Config::default()
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        Config::load_or_default(&ctx.config_path)
+    };
+    // Only explicit embedding generation may fetch weights.
+    let model = if reembed {
+        config.embedding.model
+    } else {
+        vectors::selected_model(&ctx.conn)?
+    };
+    let dir = ctx
+        .db_path
+        .parent()
+        .ok_or_else(|| Error::other("store has no directory"))?;
+    let code_path = dir.join("code.sqlite");
+    if reembed && !code_path.exists() && dir.join("vectors.bin").exists() {
+        return Err(Error::other(
+            "code vectors have no source code index; rebuild the code index before --reembed",
+        ));
+    }
+    // Obtain weights before deleting any vectors. Watchers never fetch weights.
+    let service = crate::llm::service_for(model, explicit)?;
+    if reembed {
+        vectors::begin_reembed(&ctx.conn)?;
+    }
+    if !reembed {
+        vectors::require_model(&ctx.conn, model.identity(), false)?;
+    }
 
-    // Load config once (chunking + session-embed policy)
-    let config = crate::config::Config::load_or_default(&ctx.config_path);
     let chunking_config = config.chunking.clone();
+    // Regeneration keeps the automatic scope. Including transcripts put 37.6k
+    // session chunks (58%) into one store: the migration took two hours and the
+    // KNN pool left recall documents without a cosine (story 065-9a07).
+    // `mdkb update --collection claude_sessions` still embeds them on request.
     let include_sessions = config.search.auto_embed_sessions;
     let mdkb_dir = ctx.db_path.parent().map(|p| p.to_path_buf());
 
@@ -138,7 +182,7 @@ pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResu
                         doc.id,
                         &chunks,
                         &embeddings,
-                        crate::llm::embeddings::MODEL_NAME,
+                        model.identity(),
                     )?;
                     result.generated += chunks.len();
                 }
@@ -169,12 +213,7 @@ pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResu
             match service.embed_documents(&texts) {
                 Ok(embeddings) => {
                     for ((doc_id, _), embedding) in batch.iter().zip(embeddings) {
-                        vectors::store_embedding(
-                            &ctx.conn,
-                            *doc_id,
-                            &embedding,
-                            crate::llm::embeddings::MODEL_NAME,
-                        )?;
+                        vectors::store_embedding(&ctx.conn, *doc_id, &embedding, model.identity())?;
                         result.generated += 1;
                     }
                 }
@@ -189,6 +228,44 @@ pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResu
         }
     }
 
+    if explicit {
+        result.generated += memory::backfill_memory_embeddings_explicit(&ctx.conn)?;
+    }
+    if reembed {
+        if code_path.exists() {
+            let db = crate::code::storage::CodeDb::open_read_only(&code_path)
+                .map_err(|e| Error::other(e.to_string()))?;
+            let symbols = db.all_symbols().map_err(|e| Error::other(e.to_string()))?;
+            let texts = symbols
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.value(),
+                        crate::code::semantic::format_symbol_text(
+                            s.kind,
+                            &s.name,
+                            s.signature.as_deref(),
+                            s.doc_comment.as_deref(),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            crate::code::semantic::SemanticSearch::reembed_at(
+                dir.join("vectors.bin"),
+                model,
+                &texts,
+            )
+            .map_err(|e| Error::other(e.to_string()))?;
+        }
+        let pending = memory::count_pending_embeddings(&ctx.conn)?;
+        if !result.errors.is_empty() || pending > 0 {
+            return Err(Error::other(format!(
+                "re-embedding incomplete: {} errors, {pending} pending memories; rerun `mdkb update --reembed`",
+                result.errors.len()
+            )));
+        }
+        vectors::finish_reembed(&ctx.conn)?;
+    }
     Ok(result)
 }
 /// Result of embedding generation.
@@ -260,7 +337,7 @@ pub fn handle_eval_judge(
         },
     )
 }
-/// Handle `mdkb history` command - show evolution chain.
+/// Handle `mdkb evolve history` command - show evolution chain.
 pub fn handle_history(ctx: &Context, path_or_id: &str) -> Result<Vec<EvolutionHistoryEntry>> {
     let doc_id = resolve_document_id(ctx, path_or_id)?;
 
@@ -276,6 +353,8 @@ pub fn handle_history(ctx: &Context, path_or_id: &str) -> Result<Vec<EvolutionHi
     for evo in backward {
         if let Some(doc) = documents::get_document(&ctx.conn, evo.source_doc_id)? {
             history.push(EvolutionHistoryEntry {
+                evolution_id: evo.id,
+                direction: EvolutionDirection::Newer,
                 doc_id: doc.id,
                 path: doc.relative_path,
                 title: doc.title,
@@ -290,6 +369,8 @@ pub fn handle_history(ctx: &Context, path_or_id: &str) -> Result<Vec<EvolutionHi
     for evo in forward {
         if let Some(doc) = documents::get_document(&ctx.conn, evo.target_doc_id)? {
             history.push(EvolutionHistoryEntry {
+                evolution_id: evo.id,
+                direction: EvolutionDirection::Older,
                 doc_id: doc.id,
                 path: doc.relative_path,
                 title: doc.title,
@@ -302,7 +383,7 @@ pub fn handle_history(ctx: &Context, path_or_id: &str) -> Result<Vec<EvolutionHi
 
     Ok(history)
 }
-/// Handle `mdkb current` command - find current version of superseded doc.
+/// Handle `mdkb evolve current` command - find current version of superseded doc.
 pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document>> {
     let doc_id = resolve_document_id(ctx, path_or_id)?;
 
@@ -311,11 +392,13 @@ pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document
     let mut visited = std::collections::HashSet::new();
 
     loop {
-        if visited.contains(&current_id) {
-            // Cycle detected, stop
-            break;
+        if !visited.insert(current_id) {
+            // Written before the write path refused cycles: every member is
+            // hidden, so no member is the current version. Say so instead of
+            // returning the start document as its own successor.
+            let chain = evolution::find_cycles(&ctx.conn)?.join("; ");
+            return Err(ErrorKind::EvolutionCycle { chain }.into());
         }
-        visited.insert(current_id);
 
         // Check if current document is superseded
         let superseded_by = evolution::get_superseded_by(&ctx.conn, current_id)?;
@@ -335,9 +418,20 @@ pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document
 
     documents::get_document(&ctx.conn, current_id)
 }
+/// Whether the related document is newer (it evolves the queried one) or older.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EvolutionDirection {
+    Newer,
+    Older,
+}
+
 /// Evolution history entry for display.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct EvolutionHistoryEntry {
+    /// The edge id `mdkb evolve remove` takes.
+    pub evolution_id: i64,
+    pub direction: EvolutionDirection,
     pub doc_id: i64,
     pub path: String,
     pub title: Option<String>,
@@ -358,7 +452,7 @@ pub fn handle_metrics_export(ctx: &Context, period: u32) -> Result<Vec<stats::Qu
     stats::export_query_events(&ctx.conn, period)
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct TelemetryStatus {
     pub enabled: bool,
     pub retention_days: u32,
@@ -367,10 +461,10 @@ pub struct TelemetryStatus {
 }
 
 pub fn handle_metrics_status(ctx: &Context, root: &Path) -> Result<TelemetryStatus> {
-    let config = crate::Config::load_or_default(&ctx.config_path);
+    let telemetry = crate::config::effective_telemetry(&ctx.config_path);
     Ok(TelemetryStatus {
-        enabled: config.telemetry.query_events,
-        retention_days: config.telemetry.retention_days,
+        enabled: telemetry.query_events,
+        retention_days: telemetry.retention_days,
         key_present: crate::metrics::privacy::key_exists(root),
         stored_events: stats::count_query_events(&ctx.conn)?,
     })
@@ -378,144 +472,6 @@ pub fn handle_metrics_status(ctx: &Context, root: &Path) -> Result<TelemetryStat
 
 pub fn handle_metrics_purge(ctx: &Context) -> Result<usize> {
     stats::purge_query_events(&ctx.conn)
-}
-/// Handle `mdkb experiment create`.
-pub fn handle_experiment_create(
-    ctx: &Context,
-    name: &str,
-    description: Option<&str>,
-    config_a: &str,
-    config_b: &str,
-    split: f64,
-    min_samples: i64,
-) -> Result<ExperimentCreateResult> {
-    // Validate name length and format
-    if name.is_empty() || name.len() > MAX_NAME_LENGTH {
-        return Err(Error::from(ErrorKind::Config(format!(
-            "Experiment name must be 1-{} characters",
-            MAX_NAME_LENGTH
-        ))));
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(Error::from(ErrorKind::Config(
-            "Experiment name must contain only alphanumeric characters, hyphens, and underscores"
-                .to_string(),
-        )));
-    }
-
-    // Validate config sizes before parsing
-    if config_a.len() > MAX_CONFIG_SIZE {
-        return Err(Error::from(ErrorKind::Config(format!(
-            "config-a exceeds maximum size of {} bytes",
-            MAX_CONFIG_SIZE
-        ))));
-    }
-    if config_b.len() > MAX_CONFIG_SIZE {
-        return Err(Error::from(ErrorKind::Config(format!(
-            "config-b exceeds maximum size of {} bytes",
-            MAX_CONFIG_SIZE
-        ))));
-    }
-
-    // Validate JSON configs
-    serde_json::from_str::<serde_json::Value>(config_a)
-        .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-a JSON: {e}"))))?;
-    serde_json::from_str::<serde_json::Value>(config_b)
-        .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-b JSON: {e}"))))?;
-
-    // Validate split
-    if !(0.0..=1.0).contains(&split) {
-        return Err(Error::from(ErrorKind::Config(
-            "Traffic split must be between 0.0 and 1.0".to_string(),
-        )));
-    }
-
-    // Validate min_samples
-    if !(1..=10_000).contains(&min_samples) {
-        return Err(Error::from(ErrorKind::Config(
-            "min_samples must be between 1 and 10,000".to_string(),
-        )));
-    }
-
-    // Initialize schema if needed
-    stats::init_experiments_schema(&ctx.conn)?;
-
-    let id = stats::create_experiment(
-        &ctx.conn,
-        name,
-        description,
-        config_a,
-        config_b,
-        split,
-        min_samples,
-    )?;
-
-    Ok(ExperimentCreateResult {
-        id,
-        name: name.to_string(),
-    })
-}
-/// Handle `mdkb experiment status`.
-pub fn handle_experiment_status(
-    ctx: &Context,
-    name: &str,
-) -> Result<Option<stats::ExperimentStatusReport>> {
-    stats::get_experiment_status(&ctx.conn, name)
-}
-/// Handle `mdkb experiment end`.
-pub fn handle_experiment_end(
-    ctx: &Context,
-    name: &str,
-    winner: Option<&str>,
-) -> Result<Option<String>> {
-    stats::init_experiments_schema(&ctx.conn)?;
-
-    // If winner not specified, try to auto-determine from significance
-    let actual_winner = if winner.is_some() {
-        winner.map(|s| s.to_string())
-    } else {
-        // Get experiment status and check for significant winner
-        match stats::get_experiment_status(&ctx.conn, name)? {
-            Some(status) => {
-                if let Some(sig) = status.significance {
-                    sig.winner
-                } else {
-                    None
-                }
-            }
-            None => {
-                return Err(Error::from(ErrorKind::Config(format!(
-                    "Experiment '{name}' not found"
-                ))));
-            }
-        }
-    };
-
-    stats::end_experiment(&ctx.conn, name, actual_winner.as_deref())?;
-
-    Ok(actual_winner)
-}
-/// Handle `mdkb experiment cancel`.
-pub fn handle_experiment_cancel(ctx: &Context, name: &str) -> Result<()> {
-    stats::init_experiments_schema(&ctx.conn)?;
-    stats::cancel_experiment(&ctx.conn, name)
-}
-/// Handle `mdkb experiment list`.
-pub fn handle_experiment_list(ctx: &Context, running_only: bool) -> Result<Vec<stats::Experiment>> {
-    if running_only {
-        stats::get_active_experiments(&ctx.conn)
-    } else {
-        stats::list_experiments(&ctx.conn)
-    }
-}
-/// Result of creating an experiment.
-#[derive(Debug, Clone)]
-pub struct ExperimentCreateResult {
-    pub id: i64,
-    pub name: String,
 }
 /// Handle `mdkb journal import`.
 pub fn handle_journal_import(
@@ -805,18 +761,14 @@ pub fn handle_vsearch(
     }
 
     // Use cached service to avoid reloading
-    let service = crate::llm::get_cached_service()?;
+    let model = vectors::selected_model(&ctx.conn)?;
+    let service = crate::llm::service_for(model, false)?;
 
     // Generate query embedding
     let query_embedding = service.embed_query(query_text)?;
 
-    // Perform vector search - get more results to account for collection filtering
-    let fetch_limit = if collection.is_some() {
-        limit * 2
-    } else {
-        limit
-    };
-    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, fetch_limit)?;
+    let vector_results =
+        vectors::vector_search_for_model(&ctx.conn, &query_embedding, limit, collection, model)?;
 
     if vector_results.is_empty() {
         return Ok(Vec::new());
@@ -833,15 +785,6 @@ pub fn handle_vsearch(
     let mut results = Vec::new();
     for (doc_id, distance) in vector_results {
         if let Some(doc) = doc_map.get(&doc_id) {
-            // Filter by collection if specified; exclude claude_sessions from default search
-            if let Some(coll) = collection {
-                if doc.collection != coll {
-                    continue;
-                }
-            } else if doc.collection == crate::domain::COLLECTION_CLAUDE_SESSIONS {
-                continue;
-            }
-
             results.push(SearchResult {
                 id: doc.id,
                 collection: doc.collection.clone(),
@@ -855,11 +798,6 @@ pub fn handle_vsearch(
                 read_only: crate::store::external::source(&doc.collection).is_some(),
                 repo_root: None,
             });
-
-            // Stop once we have enough results
-            if results.len() >= limit {
-                break;
-            }
         }
     }
 
@@ -1061,35 +999,6 @@ pub(crate) fn apply_line_range(content: &str, range: &str) -> Result<String> {
 }
 /// A doc embedding taking longer than this is logged to `hook-slow.jsonl`.
 const EMBED_SLOW_MS: u64 = 1000;
-/// Maximum size for experiment JSON configs (10KB).
-const MAX_CONFIG_SIZE: usize = 10_000;
-/// Maximum length for experiment names.
-const MAX_NAME_LENGTH: usize = 100;
 /// Single-chunk documents are embedded in groups of this size (PERF-G2) to bound
 /// the peak result vector; `embed_documents` also batches to the model internally.
 const SINGLE_DOC_EMBED_BATCH: usize = 256;
-
-#[cfg(test)]
-mod fetch_reranker_weights_tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_download_reaches_the_caller_and_off_never_downloads() {
-        // Catches: the failure logged and dropped, so `mdkb embed` exits 0
-        // with no reranker weights and the user never learns why recall is
-        // MiniLM-only.
-        let on = crate::config::HooksConfig {
-            recall_rerank_languages: vec!["it".into()],
-            ..Default::default()
-        };
-        let error = fetch_reranker_weights_with(&on, || Err(Error::other("offline")))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("offline"), "{error}");
-        assert!(error.contains("embeddings are done"), "{error}");
-
-        // Catches a default config still fetching the 280 MB reranker weights.
-        let off = crate::config::HooksConfig::default();
-        fetch_reranker_weights_with(&off, || panic!("downloaded with the reranker off")).unwrap();
-    }
-}

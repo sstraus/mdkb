@@ -16,6 +16,7 @@ const MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LIMIT: usize = 1_000;
 const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_FAILED_FILES: usize = 20;
 
 #[derive(Debug, Clone)]
 pub struct SourceRequest<'a> {
@@ -44,10 +45,21 @@ pub struct SourceCoverage {
     /// `None` is unknown, not an assertion that no files were excluded.
     pub excluded_by_policy: Option<usize>,
     pub policy: Vec<&'static str>,
+    /// At most 20 failure diagnostics; failed_files_total includes unsampled failures.
     pub failed_files: Vec<String>,
+    pub failed_files_total: usize,
     pub entries_seen: usize,
     pub bytes_scanned: u64,
     pub output_bytes: usize,
+}
+
+impl SourceCoverage {
+    fn record_failure(&mut self, message: String) {
+        self.failed_files_total += 1;
+        if self.failed_files.len() < MAX_FAILED_FILES {
+            self.failed_files.push(message);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,6 +175,7 @@ pub fn search(root: &Path, request: SourceRequest<'_>) -> Result<SourceResult> {
                 "nested-stores",
             ],
             failed_files: Vec::new(),
+            failed_files_total: 0,
             entries_seen: 0,
             bytes_scanned: 0,
             output_bytes: 0,
@@ -192,8 +205,7 @@ pub fn search(root: &Path, request: SourceRequest<'_>) -> Result<SourceResult> {
                 result.status = "partial";
                 result
                     .coverage
-                    .failed_files
-                    .push("invalid force-include policy".into());
+                    .record_failure("invalid force-include policy".into());
             }
         }
     }
@@ -204,8 +216,7 @@ pub fn search(root: &Path, request: SourceRequest<'_>) -> Result<SourceResult> {
             result.status = "partial";
             result
                 .coverage
-                .failed_files
-                .push("source byte bound reached".into());
+                .record_failure("source byte bound reached".into());
             break;
         }
         scan_file(&file, &root, &matchers, request.limit, &mut result);
@@ -225,8 +236,7 @@ fn collect_entries(
             result.status = "partial";
             result
                 .coverage
-                .failed_files
-                .push("source walk bound reached".into());
+                .record_failure("source walk bound reached".into());
             break;
         }
         match entry {
@@ -239,7 +249,7 @@ fn collect_entries(
             Ok(_) => {}
             Err(error) => {
                 result.status = "partial";
-                result.coverage.failed_files.push(error.to_string());
+                result.coverage.record_failure(error.to_string());
             }
         }
     }
@@ -257,7 +267,7 @@ fn scan_file(
         Ok(metadata) => metadata,
         Err(error) => {
             result.status = "partial";
-            result.coverage.failed_files.push(format!("{rel}: {error}"));
+            result.coverage.record_failure(format!("{rel}: {error}"));
             return;
         }
     };
@@ -267,8 +277,7 @@ fn scan_file(
         result.status = "partial";
         result
             .coverage
-            .failed_files
-            .push(format!("{rel}: file exceeds scan bound"));
+            .record_failure(format!("{rel}: file exceeds scan bound"));
         return;
     }
     let resolved = match crate::domain::canonicalize_plain(path) {
@@ -277,8 +286,7 @@ fn scan_file(
             result.status = "partial";
             result
                 .coverage
-                .failed_files
-                .push(format!("{rel}: path cannot be verified inside root"));
+                .record_failure(format!("{rel}: path cannot be verified inside root"));
             return;
         }
     };
@@ -288,7 +296,7 @@ fn scan_file(
         .and_then(|file| file.take(max_read + 1).read_to_end(&mut bytes));
     if let Err(error) = read {
         result.status = "partial";
-        result.coverage.failed_files.push(format!("{rel}: {error}"));
+        result.coverage.record_failure(format!("{rel}: {error}"));
         return;
     }
     result.coverage.bytes_scanned += bytes.len() as u64;
@@ -296,16 +304,14 @@ fn scan_file(
         result.status = "partial";
         result
             .coverage
-            .failed_files
-            .push(format!("{rel}: file changed or exceeded scan bound"));
+            .record_failure(format!("{rel}: file changed or exceeded scan bound"));
         return;
     }
     if bytes.contains(&0) {
         result.status = "partial";
         result
             .coverage
-            .failed_files
-            .push(format!("{rel}: binary file"));
+            .record_failure(format!("{rel}: binary file"));
         return;
     }
     let text = match std::str::from_utf8(&bytes) {
@@ -314,12 +320,12 @@ fn scan_file(
             result.status = "partial";
             result
                 .coverage
-                .failed_files
-                .push(format!("{rel}: invalid UTF-8"));
+                .record_failure(format!("{rel}: invalid UTF-8"));
             return;
         }
     };
     result.coverage.files_scanned += 1;
+    let mut response_bound_reported = false;
     for (index, line) in text.split_terminator('\n').enumerate() {
         let line = line.strip_suffix('\r').unwrap_or(line);
         let matched: Vec<(usize, usize)> = matchers
@@ -338,16 +344,11 @@ fn scan_file(
         if hit_bytes > MAX_OUTPUT_BYTES.saturating_sub(result.coverage.output_bytes) {
             result.status = "partial";
             result.truncated = true;
-            if !result
-                .coverage
-                .failed_files
-                .iter()
-                .any(|reason| reason == "source response byte bound reached")
-            {
+            if !response_bound_reported {
+                response_bound_reported = true;
                 result
                     .coverage
-                    .failed_files
-                    .push("source response byte bound reached".into());
+                    .record_failure("source response byte bound reached".into());
             }
             continue;
         }
@@ -396,6 +397,35 @@ mod tests {
             "a third distinct location exceeds the global limit"
         );
         assert_eq!(result.status, "complete");
+    }
+
+    #[test]
+    fn scan_with_many_binary_files_caps_failed_file_list() {
+        let dir = tempfile::tempdir().unwrap();
+        for index in 0..35 {
+            fs::write(dir.path().join(format!("binary-{index:02}.dat")), [0, 1]).unwrap();
+        }
+        fs::write(dir.path().join("valid.rs"), "needle\n").unwrap();
+        let result = search(
+            dir.path(),
+            SourceRequest {
+                patterns: &["needle".to_string()],
+                path: None,
+                regex: false,
+                ignore_case: false,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.status, "partial");
+        assert_eq!(result.hits.len(), 1, "sampling must not stop the scan");
+        assert_eq!(
+            result.coverage.failed_files.len(),
+            20,
+            "binary skips must not flood output"
+        );
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["coverage"]["failed_files_total"], 35);
     }
 
     #[test]

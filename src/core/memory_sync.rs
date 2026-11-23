@@ -85,8 +85,13 @@ pub(crate) fn project_entry(ctx: &Context, entry: &MemoryEntry, now: i64) -> Res
 ///
 /// Best-effort on purpose: the row is already committed, and a failed file
 /// write must not unwind it. The next `mdkb memory sync` backfills.
+///
+/// An archived row is never projected: a file in `entries/` for it makes the
+/// next sync revive it. Prior mining reaches here with the id of a promoted
+/// prior that may have expired since.
 pub(crate) fn project_after_write(ctx: &Context, id: &str, now: i64) {
     match memory::get_entry_without_tracking(&ctx.conn, id) {
+        Ok(Some(entry)) if entry.status == EntryStatus::Archived => {}
         Ok(Some(entry)) => {
             if let Err(e) = project_entry(ctx, &entry, now) {
                 tracing::warn!("Failed to save entry {id} to disk: {e}");
@@ -111,7 +116,7 @@ pub(crate) fn project_after_write(ctx: &Context, id: &str, now: i64) {
 /// resurrection.
 ///
 /// Archiving first inverts which way a failure can go. The worst case becomes
-/// a file in `archive/` whose row is still active — drift that `mdkb stats`
+/// a file in `archive/` whose row is still active — drift that `mdkb status`
 /// reports and the next projection repairs — and `remove` never runs, so the
 /// error the caller returns is true: nothing was retired. `archive_projection`
 /// treats a missing file as success, so a retry of the whole operation is safe.
@@ -198,7 +203,7 @@ pub struct MemorySyncSummary {
 
 /// Standing disagreement between the entry projection and the database.
 ///
-/// Reported by `mdkb stats` and at session start, NOT only by the run that
+/// Reported by `mdkb status` and at session start, NOT only by the run that
 /// caused it: 387 orphan files accumulated on a real store because the only
 /// place the number ever appeared was the output of an `mdkb update` nobody
 /// re-read. A count that lives in a health check is the difference between
@@ -226,7 +231,7 @@ pub struct ProjectionDrift {
 ///
 /// Equal counts do not prove the two sides agree (a file could be unreadable
 /// while an unrelated entry is unprojected, netting to zero), so this is a
-/// *smoke* signal: it points at `mdkb stats`, which does the real classification.
+/// *smoke* signal: it points at `mdkb status`, which does the real classification.
 pub fn projection_file_and_row_counts(ctx: &Context) -> Result<(usize, usize)> {
     let entries_dir = ctx.memory_dir().join("entries");
     let files = std::fs::read_dir(&entries_dir)
@@ -354,63 +359,92 @@ fn has_conflict_markers(text: &str) -> bool {
 /// must neither overwrite the DB nor look like a deletion. Because the entry
 /// keeps its `projected_at`, the *next* pass retries it unchanged.
 fn read_entries_dir(dir: &Path, quarantined: &mut usize) -> BTreeMap<String, DiskEntry> {
-    let mut out = BTreeMap::new();
     let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return out;
+        return BTreeMap::new();
     };
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("memory sync: {}: read error: {e}", path.display());
-                *quarantined += 1;
-                continue;
+    let mut paths: Vec<_> = read_dir
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension().and_then(|s| s.to_str()) == Some("md")
+                && path.file_stem().and_then(|s| s.to_str()).is_some()
+        })
+        .collect();
+    // Keep warnings and aggregation independent of filesystem/worker completion order.
+    paths.sort();
+    let results = if paths.len() <= 1 {
+        read_entries_chunk(&paths)
+    } else {
+        // Three scoped workers plus the caller: at most four reads/parse buffers,
+        // no global pool and no SQLite connection shared with a worker. Parsed
+        // entries were already retained by the serial implementation.
+        std::thread::scope(|scope| {
+            let mut chunks = paths.chunks(paths.len().div_ceil(4));
+            let first = chunks.next().expect("nonempty paths");
+            let workers: Vec<_> = chunks
+                .map(|chunk| {
+                    let worker = std::thread::Builder::new()
+                        .name("memory-projection-read".into())
+                        .spawn_scoped(scope, move || read_entries_chunk(chunk));
+                    (chunk, worker)
+                })
+                .collect();
+            let mut results = read_entries_chunk(first);
+            for (chunk, worker) in workers {
+                results.extend(match worker {
+                    Ok(worker) => worker.join().expect("projection reader panicked"),
+                    // Resource exhaustion must not make files disappear from diagnostics.
+                    Err(_) => read_entries_chunk(chunk),
+                });
             }
-        };
-        if has_conflict_markers(&text) {
-            tracing::warn!(
-                "memory sync: {} contains unresolved merge markers — skipped. \
-                 Resolve the merge and re-run.",
-                path.display()
-            );
-            *quarantined += 1;
-            continue;
-        }
-        let file = match crate::store::memory_file::from_markdown(&text) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("memory sync: {}: parse error: {e}", path.display());
-                *quarantined += 1;
-                continue;
+            results
+        })
+    };
+    let mut out = BTreeMap::new();
+    for result in results {
+        match result {
+            Ok(entry) => {
+                out.insert(entry.file.meta.id.clone(), entry);
             }
-        };
-        if file.meta.id != stem {
-            tracing::warn!(
-                "memory sync: {} declares id `{}` — skipped. Rename the file to `{}.md` \
-                 or fix the frontmatter; mdkb will not guess which one is authoritative.",
-                path.display(),
-                file.meta.id,
-                file.meta.id
-            );
-            *quarantined += 1;
-            continue;
+            Err(warning) => {
+                tracing::warn!("{warning}");
+                *quarantined += 1;
+            }
         }
-        out.insert(
-            stem.to_string(),
-            DiskEntry {
-                hash: crate::code::indexing::hasher::content_hash(&text),
-                file,
-            },
-        );
     }
     out
+}
+
+fn read_entries_chunk(paths: &[PathBuf]) -> Vec<std::result::Result<DiskEntry, String>> {
+    paths.iter().map(|path| read_entry_file(path)).collect()
+}
+
+/// Preserve the reconciliation parser and diagnostics for every reader.
+fn read_entry_file(path: &Path) -> std::result::Result<DiskEntry, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("memory sync: {}: read error: {e}", path.display()))?;
+    if has_conflict_markers(&text) {
+        return Err(format!(
+            "memory sync: {} contains unresolved merge markers — skipped. \
+             Resolve the merge and re-run.",
+            path.display()
+        ));
+    }
+    let file = crate::store::memory_file::from_markdown(&text)
+        .map_err(|e| format!("memory sync: {}: parse error: {e}", path.display()))?;
+    if Some(file.meta.id.as_str()) != path.file_stem().and_then(|s| s.to_str()) {
+        return Err(format!(
+            "memory sync: {} declares id `{}` — skipped. Rename the file to `{}.md` \
+             or fix the frontmatter; mdkb will not guess which one is authoritative.",
+            path.display(),
+            file.meta.id,
+            file.meta.id
+        ));
+    }
+    Ok(DiskEntry {
+        hash: crate::code::indexing::hasher::content_hash(&text),
+        file,
+    })
 }
 
 /// What reconciliation decided to do with one entry.
@@ -674,7 +708,8 @@ fn apply_sync_action(
             // reads it back as a local edit.
             project_entry(ctx, &entry, now)?;
             if let Some(embedding) = check.embedding
-                && let Err(e) = memory::store_entry_embedding(&ctx.conn, &entry.id, &embedding)
+                && let Err(e) =
+                    memory::store_entry_embedding_labelled(&ctx.conn, &entry.id, &embedding)
             {
                 tracing::warn!("memory sync: {} embedding deferred: {e}", entry.id);
             }

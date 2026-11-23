@@ -1,0 +1,154 @@
+# mdkb
+
+> Local knowledge base for coding agents. One store per repository (`.mdkb/`) holds four corpora: markdown documents, memory entries, a code index (symbols and call edges), and a typed document graph. Use it through the `mdkb` CLI or the MCP server. This file tells a model which command answers which question, what the output means, and which traps remain. Verified on 2026-11-21 against main after the command-audit fixes (stories 069-078, 080); mdkb 3.14.0 and older still have the defects listed in docs/command-audit-2026-11-21.md.
+
+Read this file before you call mdkb. For flags, run `mdkb <command> --help`. For one command as JSON, run `mdkb schema <command>`. For MCP-to-CLI names, run `mdkb cheatsheet` (section "MCP <-> CLI"). A wrong command prints one line, `error: <what is wrong>. Run: <command that works>`, and exits 2; run that command.
+
+## Pick the command by question
+
+| You want to know | Command | Notes |
+|---|---|---|
+| Where is this exact string in the source now | `mdkb code grep 'TEXT' [--path src/] [--regex] [-i] [-e ALT ...]` | Live lines, like grep but bounded and with coverage. Use for code that changed after the last index. |
+| Where is this UI text / literal / i18n value | `mdkb code grep 'TEXT' --literals [-i] [--path PREFIX]` | Reads the AST literal index, not the files. Prints index age. |
+| Where is symbol X defined | `mdkb code search X [-k function] [--path PREFIX] [--exact]` | Fuzzy by name, exact matches first. `--exact` keeps only exact names. `--path` is a path prefix. |
+| Which code does "a concept" | `mdkb code search 'what it does' --semantic` | Embedding search over symbols. Weak on tiny repos; check similarity. |
+| Who calls X / what X calls | `mdkb code callers X` / `mdkb code calls X` | Call edges carry a resolution tier; tier 4 is a name guess. |
+| What breaks if I change X | `mdkb code impact X [--depth N]` | Transitive callers, default depth 3. |
+| Which docs talk about Y | `mdkb search Y --docs [-c COLLECTION]` | Hybrid BM25 + embeddings. Hides superseded docs unless `--include-superseded`. |
+| What did we decide / learn about Y | `mdkb memory search Y [--entry-type decision]` | Same engine as hook recall. `mdkb search Y --memory` is the same command. |
+| Docs and memory together | `mdkb search Y` | Two groups, each with its own `--limit`. Words need no quotes. JSON: `{"documents": [...], "memory": [...]}`. Code symbols are not in it: for a code name use `code search`. |
+| The full text of a doc | `mdkb get PATH [--lines 10:50]` | Accepts path with or without `.md`, `collection:path`, id, memory slug, glob, comma list. |
+| Who owns / what relates to doc D | `mdkb graph links D`, `mdkb graph backlinks D`, `mdkb graph neighbors D --depth 2` | Edges come from frontmatter keys on the allowlist and `[[wikilinks]]`. D may be a path, an `id:` or an alias. Add `--root NAME` for another repo. |
+| What a memory entry connects to | `mdkb graph links ID --scope memory`; `mdkb graph backlinks PATH_OR_ID --scope memory` | Memory edges from `memory link` and `--relates`. Links and backlinks only. |
+| How doc A connects to doc B | `mdkb graph path A B` | Undirected shortest path. |
+| Which references point at nothing | `mdkb graph dangling` | Full scan. Gardening report. |
+| Which docs are central | `mdkb graph hubs [--relation owner]` | Degree centrality. Full scan. |
+| Which frontmatter keys should become edges | `mdkb graph relations [--apply]` | Measures how many values of each key resolve to a doc. |
+| Which version of a doc is current | `mdkb evolve current PATH`, `mdkb evolve history PATH`, `mdkb evolve superseded-by PATH` | Same reference forms as `get`. `evolve history` prints `#N`, the edge id `evolve unlink` takes. |
+| Is there copy-pasted code | `mdkb code dup`, `mdkb code dup --since HEAD`, `mdkb code dup --file PATH` | Structural pass, no model. `--since` and `--file` narrow the report, not the comparison. `--semantic` adds embeddings (minutes). |
+| Which files change together but do not call each other | `mdkb code coupling [--min-cochanges 5] [--since '12 months ago']` | Git history x call graph. Code files only. |
+| Which docs change with a source file, and which drifted from it | `mdkb graph coupling` | Indexed documents x indexed source. `source_commits_after_doc` > 0 = the source changed after the doc last did. Changelogs, `llms.txt`, todo, stories, plans skipped. |
+| Which memory entries are stale | `mdkb memory audit --dry-run` | Dead code refs (git-known paths), dead symbols (`Type::method`, `fn()` gone from index and source), drifted source, near-duplicates, contradictions, aged entries. Decides nothing. |
+| Is the index healthy and fresh | `mdkb status`; MCP `status` | `mdkb doctor` lists problems with fixes. |
+| Which repos does the daemon know | `mdkb repos list` | `search --root '*'` fans out across them. |
+| Is recall working | `mdkb metrics quality --period 7` | Needs `mdkb setup developer` (local telemetry). |
+
+## Write commands
+
+| You want to | Command |
+|---|---|
+| Record a decision, problem, convention | `mdkb memory add ID --title T --content C --entry-type decision --tags a,b [--source-type official_docs] [--relates relates_to:OTHER_ID]` |
+| Preview a write | add `--dry-run`: runs every check, including duplicates, and exits non-zero when the write would be refused |
+| Raise or lower trust in an entry | `mdkb memory confirm ID --outcome confirmed, refuted or misfired` (`misfired`: a true prior fired out of context) |
+| Connect two entries, or an entry to a doc | `mdkb memory link ID supersedes OTHER_ID`; `mdkb memory link ID derived_from PATH --doc` |
+| Retire an entry for a newer one | `mdkb memory link NEW supersedes OLD` (OLD becomes `superseded`) |
+| Mark a doc as replaced | `mdkb evolve link NEW supersedes OLD --reason R` (relation: `supersedes`, `updates`, `corrects`, `retracts` or `extends`). A cycle is refused. |
+| Undo an evolution edge | `mdkb evolve history DOC` for the `#N` id, then `mdkb evolve unlink N`; the older doc becomes current again unless another edge hides it |
+| Rename a collection | `mdkb collection rename OLD NEW` (documents move with it) |
+| Add a folder to the index | `mdkb collection add NAME PATH -p '**/*.md'` then `mdkb update` |
+| Reindex | `mdkb update` (all) or `mdkb update --files a.md b.rs`. `--force` rebuilds docs only; `mdkb update --code --force` rebuilds code |
+| Keep memory in git | `mdkb memory export`, `mdkb memory sync`, `mdkb memory import PATH` |
+
+`ID` for memory is a positional slug. Never pass `--id`.
+
+## Corpora and freshness
+
+- Documents: markdown files matched by collections. Indexed by `mdkb update`, the file watcher, and the PostToolUse hook.
+- Memory: rows in `.mdkb/index.sqlite`. `.mdkb/memory/entries/*.md` is the git copy and the only copy that survives a lost database.
+- Code index: `.mdkb/code.sqlite`. `code grep` reads live files; `code grep --literals` and `code search` read the index. Check `Index age` before you trust a miss.
+- Session transcripts (`claude_sessions` collection) are excluded from the default `*` fan-out.
+- Embedding model: `[embedding] model` in `.mdkb/config.toml`. `minilm` (default) is English only: a question in another language misses translated memory and docs, and recall can inject both language copies of one entry. A store with any non-English content or questions needs `granite107m`.
+
+## Read the output correctly
+
+- `search` lines start with `[N]`. `N` is the document id, not the rank. Order is rank.
+- Scores are normalised per query. The top hit is always near 1.00; a 0.48 tail is filler, not evidence.
+- Every `path:line` in text output is 1-based and opens in an editor as printed. JSON `range.start_line`/`end_line` and MCP `line_start`/`line_end` stay 0-based tree-sitter rows.
+- `code calls` notes calls on receivers whose type is not indexed; those edges are missing, not absent.
+- `coupling` silently ignores files the code index does not parse (docs, lockfiles, changelogs). "No hidden coupling found" can mean "nothing to compare". `coupling --docs` is the report for documents.
+- `memory list` shows active entries; `--status all` shows every status with a `[superseded]`-style marker. `memory show` prints status, confidence, provenance and edges.
+- `graph relations` column `Detected` is a measurement. The line `Extracted as edges` lists the allowlist keys, which become edges whether detected or not.
+- `update` code-index counts are what this run wrote (`Files reindexed`, `Symbols written`); `mdkb status` prints totals.
+
+## Errors and exit codes
+
+- A refusal (unknown id or document, duplicate title, evolution cycle, invalid field, unknown collection) prints its cause and exits non-zero. Nothing was written; do not retry.
+- `daemon error -32603 ... may still be writing` means the daemon lost contact while it held the request. Check `mdkb status` before you retry.
+- `search -c NAME` with an unknown collection fails and lists the known ones.
+
+## Recipes
+
+Before you edit a function:
+```
+mdkb code search NAME --exact
+mdkb code callers NAME
+mdkb code impact NAME --depth 2
+mdkb memory search NAME               # past decisions or bugs about it
+```
+
+Before you write a memory entry:
+```
+mdkb memory search 'the claim in plain words'   # update an existing entry instead of adding a twin
+mdkb memory add ID --title ... --content ... --entry-type decision --dry-run
+mdkb memory add ID --title ... --content ...
+```
+
+Find duplication worth extracting (rule of three):
+```
+mdkb code dup --since main          # only clusters your branch touched
+mdkb code dup                       # whole repo, structural
+mdkb code dup --semantic            # renamed clones too; minutes
+```
+
+Find a hidden dependency:
+```
+mdkb code coupling --min-cochanges 3
+mdkb code callers SYMBOL_IN_FILE_A    # confirm there is really no edge
+```
+
+Clean up the document graph:
+```
+mdkb graph dangling            # targets with no doc: create the doc or fix the link
+mdkb graph relations           # keys whose values name docs; --apply in semi mode
+mdkb graph hubs --limit 20     # central docs worth keeping current
+```
+
+Retire an outdated document:
+```
+mdkb evolve link NEW supersedes OLD --reason 'why'
+mdkb search topic --docs                              # OLD is gone
+mdkb search topic --docs --include-superseded         # OLD is back
+mdkb evolve history OLD; mdkb evolve unlink N          # undo
+```
+
+Keep memory honest:
+```
+mdkb memory audit --dry-run    # what to re-read
+mdkb memory confirm ID --outcome refuted   # or link a superseding entry
+mdkb memory prune --days 90 --dry-run
+```
+
+Search another repository:
+```
+mdkb repos list
+mdkb search 'Y' --root NAME    # or --root '*' for all repos in scope
+```
+
+## Operations
+
+- The daemon owns every write. The CLI routes mutations to it. `MDKB_NO_DAEMON=1 mdkb CMD` runs in-process for debugging.
+- After a binary upgrade: `mdkb daemon restart`, then `mdkb repos refresh --only outdated`.
+- `mdkb compact` vacuums both databases. `mdkb memory prune` archives expired and aged lifecycle entries.
+- `MDKB_NAMESPACE=NAME mdkb CMD` uses `.mdkb/namespaces/NAME/`; test runners get `test`.
+
+## Docs
+
+- [Use cases with worked examples](docs/use-cases.md): one page per job (search, correlation, deduplication, consolidation, maintenance).
+- [Command audit 2026-11-21](docs/command-audit-2026-11-21.md): verified behaviour, defects, and improvement proposals per command.
+- [README CLI reference](README.md#cli-reference)
+- [Knowledge graph](docs/graph.md): edges, identities, relation modes.
+- [Memory guidelines](docs/memory-guidelines.md): what to store and how.
+- [Hooks](docs/hooks.md): automatic recall and reindex.
+- [External ingest](docs/external-ingest.md): daemon RPC for non-markdown sources.
+- [Daemon RPC](docs/daemon-rpc.md): socket framing, error codes, and the symbol lookups editor integrations use.
+- [Agent search strategy](docs/agent-search-strategy.md)

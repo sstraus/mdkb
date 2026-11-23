@@ -21,14 +21,121 @@ pub fn render(report: &StatsReport, _color: bool) -> String {
     let mut out = String::with_capacity(4096);
     render_quarantine(&mut out, &report.quarantine, report.index.document_count);
     render_header(&mut out, &report.header);
+    render_problems(&mut out, &report.doctor);
+    let stale_fix = |stale: bool| {
+        if stale {
+            "; run: mdkb update --reembed"
+        } else {
+            ""
+        }
+    };
+    let _ = writeln!(
+        out,
+        "Embedding: selected {} | current {:?} | pending {:?} | stale {}{}",
+        report.embedding.selected_model,
+        report.embedding.current_model,
+        report.embedding.pending_model,
+        report.embedding.stale,
+        stale_fix(report.embedding.stale)
+    );
+    let _ = writeln!(
+        out,
+        "Code embedding: current {:?} | stale {}{}",
+        report.code_embedding.current_model,
+        report.code_embedding.stale,
+        stale_fix(report.code_embedding.stale)
+    );
     render_index(&mut out, &report.index);
     render_collections(&mut out, &report.collections);
     render_memory(&mut out, &report.memory);
     render_code(&mut out, &report.code);
     render_sessions(&mut out, &report.sessions);
     render_hooks(&mut out, &report.hooks);
+    render_daemon(&mut out, &report.daemon);
+    render_telemetry(&mut out, &report.telemetry);
     render_recall(&mut out, &report.recall);
     out
+}
+
+/// The daemon frame alone, for `mdkb status` where no store can be opened.
+pub fn render_daemon_only(d: &crate::cli::daemon::DaemonSummary) -> String {
+    let mut out = String::new();
+    render_daemon(&mut out, d);
+    out
+}
+
+/// Findings that are not plain information, one per line, each ending with its fix.
+fn render_problems(out: &mut String, findings: &[crate::domain::doctor::Finding]) {
+    use crate::domain::doctor::Severity;
+    let problems: Vec<_> = findings
+        .iter()
+        .filter(|f| f.severity != Severity::Info)
+        .collect();
+    if problems.is_empty() {
+        return;
+    }
+    let _ = writeln!(out, "Problems:");
+    for f in problems {
+        let _ = writeln!(out, "{}", crate::cli::doctor::render_line(f));
+    }
+    out.push('\n');
+}
+
+fn render_daemon(out: &mut String, d: &crate::cli::daemon::DaemonSummary) {
+    let mut lines = Vec::new();
+    match (d.running, d.pid) {
+        (true, Some(pid)) => {
+            let up = d
+                .uptime_secs
+                .map(|s| {
+                    format!(
+                        ", up {}",
+                        crate::cli::daemon::format_duration(std::time::Duration::from_secs(s))
+                    )
+                })
+                .unwrap_or_default();
+            lines.push(format!("  running (pid {pid}{up})"));
+        }
+        _ if d.stale_pid => {
+            lines.push("  not running (stale pid file); run: mdkb daemon restart".to_string());
+        }
+        _ => lines.push("  not running; run: mdkb daemon restart".to_string()),
+    }
+    lines.push(format!("  base {}", d.base));
+    if d.running && !(d.mcp_socket_present && d.hook_socket_present) {
+        lines.push("  a socket is missing; run: mdkb daemon restart".to_string());
+    }
+    match (&d.repos_known, &d.repos_error) {
+        (Some(n), _) => lines.push(format!("  repos {n} known; `mdkb repos list` lists them")),
+        (None, Some(e)) => lines.push(format!("  repos unavailable: {e}")),
+        (None, None) => {}
+    }
+    out.push_str(&frame("Daemon", &lines.join("\n"), WIDTH));
+    // Outside the frame, which would cut the parser's message at the margin.
+    if let Some(e) = &d.config_error {
+        let _ = writeln!(
+            out,
+            "warning: daemon.toml does not parse, the daemon cannot apply it; fix ~/.mdkb/daemon.toml: {e}"
+        );
+    }
+}
+
+fn render_telemetry(out: &mut String, t: &crate::core::ops::TelemetryStatus) {
+    let state = if t.enabled {
+        "enabled"
+    } else {
+        "disabled; run: mdkb setup developer"
+    };
+    let key = if t.key_present || !t.enabled {
+        ""
+    } else {
+        "\n  private key missing; run: mdkb setup developer"
+    };
+    let body = format!(
+        "  {state}\n  retention {} days, {} stored events{key}",
+        t.retention_days, t.stored_events
+    );
+    out.push_str(&frame("Telemetry", &body, WIDTH));
 }
 
 // ── Sections ─────────────────────────────────────────────────────────────────
@@ -62,6 +169,12 @@ fn render_quarantine(
             "    salvaged {} memory entries, {} edges",
             r.memory_entries_salvaged, r.memory_edges_salvaged
         ));
+        // The sweep keeps a copy whose report cannot prove the salvage
+        // finished (every 3.8/3.9 report). Promising removal for it made the
+        // banner a standing false statement (story 066-bbd4).
+        if !r.salvage_succeeded {
+            lines.push("    kept: report cannot prove the salvage; delete by hand".to_string());
+        }
     }
     // Status and remediation are per-store, not per-file: emit them once.
     lines.push(String::new());
@@ -69,10 +182,12 @@ fn render_quarantine(
     // No manual remedy: `store::heal::sweep_expired_quarantines` deletes the
     // copy on a store open once it is older than the retention, and the banner
     // goes with it. Say when, so the warning does not read as permanent.
-    lines.push(format!(
-        "  copy removed automatically {} days after quarantine",
-        crate::store::heal::QUARANTINE_RETENTION_DAYS
-    ));
+    if reports.iter().any(|r| r.salvage_succeeded) {
+        lines.push(format!(
+            "  copy removed automatically {} days after quarantine",
+            crate::store::heal::QUARANTINE_RETENTION_DAYS
+        ));
+    }
     out.push_str(&frame(
         "⚠ INDEX QUARANTINED (was corrupt)",
         &lines.join("\n"),
@@ -109,7 +224,11 @@ fn render_index(out: &mut String, h: &IndexHealth) {
 
 fn render_collections(out: &mut String, c: &CollectionsSummary) {
     if c.collections.is_empty() {
-        out.push_str(&frame("Collections", "  (none)", WIDTH));
+        out.push_str(&frame(
+            "Collections",
+            "  (none); run: mdkb collection add NAME PATH",
+            WIDTH,
+        ));
         return;
     }
     let mut body = String::new();
@@ -185,7 +304,11 @@ fn render_memory(out: &mut String, m: &MemorySummary) {
 
 fn render_code(out: &mut String, c: &CodeSummary) {
     if c.files == 0 {
-        out.push_str(&frame("Code Index", "  (not indexed)", WIDTH));
+        out.push_str(&frame(
+            "Code Index",
+            "  (not indexed); run: mdkb update --code",
+            WIDTH,
+        ));
         return;
     }
 
@@ -456,6 +579,10 @@ mod tests {
 
     fn fixture_report() -> StatsReport {
         StatsReport {
+            daemon: Default::default(),
+            telemetry: Default::default(),
+            embedding: Default::default(),
+            code_embedding: Default::default(),
             header: HeaderInfo {
                 repo: "my-project".to_string(),
                 version: "2.0.0".to_string(),
@@ -673,7 +800,27 @@ mod tests {
             quarantined_at: ts,
             memory_entries_salvaged: 673,
             memory_edges_salvaged: 12,
+            salvage_succeeded: true,
             ..Default::default()
+        }
+    }
+
+    /// A 3.8/3.9 report has no `salvage_succeeded`; the sweep keeps its copy
+    /// forever, so the banner must not promise automatic removal.
+    #[test]
+    fn render_quarantine_does_not_promise_removal_of_a_kept_copy() {
+        let mut r = fixture_report();
+        let mut legacy = quarantine_fixture(1_700_000_000);
+        legacy.salvage_succeeded = false;
+        r.quarantine = vec![legacy];
+        let out = render(&r, false);
+        assert!(!out.contains("removed automatically"), "{out}");
+        assert!(
+            out.contains("kept: report cannot prove the salvage; delete by hand"),
+            "{out}"
+        );
+        for line in out.lines() {
+            assert!(line.chars().count() <= WIDTH, "line too wide: {line:?}");
         }
     }
 

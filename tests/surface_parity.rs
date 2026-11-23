@@ -97,7 +97,7 @@ impl Repo {
     }
 }
 
-fn params(scope: &str, query: &str, file: Option<&str>) -> SearchParams {
+fn params(scope: &str, query: &str, path: Option<&str>) -> SearchParams {
     SearchParams {
         query: query.to_string(),
         root: None,
@@ -107,11 +107,11 @@ fn params(scope: &str, query: &str, file: Option<&str>) -> SearchParams {
         scope: Some(scope.to_string()),
         kind: None,
         threshold: None,
-        file: file.map(str::to_string),
+        file: None,
         min_confidence: None,
         since: None,
         patterns: None,
-        path: None,
+        path: path.map(str::to_string),
         regex: false,
         ignore_case: false,
         contract: None,
@@ -1056,7 +1056,7 @@ fn search_repo() -> Repo {
          pub fn greet_all(names: &[&str]) -> Vec<String> {\n    names.iter().map(|n| greet(n)).collect()\n}\n",
     )
     .expect("write lib.rs");
-    run(&["code", "index", "src"], &repo.root);
+    run(&["update", "--code"], &repo.root);
     repo
 }
 
@@ -1267,7 +1267,7 @@ fn dup_repo() -> Repo {
         duplicated_body("aggregate", "acc"),
     )
     .expect("write b.rs");
-    run(&["code", "index", "src"], &repo.root);
+    run(&["update", "--code"], &repo.root);
     repo
 }
 
@@ -1293,7 +1293,7 @@ fn git(root: &Path, args: &[&str]) {
 async fn both_surfaces_report_the_same_clusters_for_the_same_repository() {
     let repo = dup_repo();
 
-    let cli = text(&run(&["dup"], &repo.root));
+    let cli = text(&run(&["code", "dup"], &repo.root));
     let (mcp, count) =
         mdkb::mcp::dispatch::search_impl(&repo.handle(), &params("duplicates", "", None))
             .await
@@ -1315,12 +1315,13 @@ async fn both_surfaces_report_the_same_clusters_for_the_same_repository() {
     );
 }
 
+/// `--file` anchors the report on a path; the other copy lives elsewhere and is
+/// still compared (story 073-504b). Both surfaces must agree on that.
 #[tokio::test]
-async fn the_file_option_scopes_both_surfaces_the_same_way() {
+async fn the_file_option_anchors_both_surfaces_the_same_way() {
     let repo = dup_repo();
 
-    // Half the pair is out of scope, so there is nothing left to pair with.
-    let cli = text(&run(&["dup", "--file", "src/a.rs"], &repo.root));
+    let cli = text(&run(&["code", "dup", "--file", "src/a.rs"], &repo.root));
     let (mcp, count) = mdkb::mcp::dispatch::search_impl(
         &repo.handle(),
         &params("duplicates", "", Some("src/a.rs")),
@@ -1328,12 +1329,18 @@ async fn the_file_option_scopes_both_surfaces_the_same_way() {
     .await
     .expect("duplicates scope");
 
-    assert_eq!(count, 0, "one file cannot duplicate itself:\n{mcp}");
+    assert_eq!(count, 1, "the pair touches src/a.rs:\n{mcp}");
     assert!(
-        !cli.contains("aggregate"),
-        "the CLI must have honoured the same narrowing:\n{cli}"
+        cli.contains("total") && cli.contains("aggregate"),
+        "the CLI reports both copies:\n{cli}"
     );
     assert_eq!(mcp, cli, "and both must say so identically");
+
+    let (none, none_count) =
+        mdkb::mcp::dispatch::search_impl(&repo.handle(), &params("duplicates", "", Some("tests/")))
+            .await
+            .expect("duplicates scope");
+    assert_eq!(none_count, 0, "no indexed symbol under tests/:\n{none}");
 }
 
 /// Review mode across both surfaces, on a real git history.
@@ -1350,7 +1357,7 @@ async fn review_mode_scopes_both_surfaces_to_what_the_ref_changed() {
     git(&repo.root, &["commit", "-q", "-m", "b"]);
 
     // `src/a.rs` is now the only path `git diff --name-only HEAD` reports.
-    let cli = text(&run(&["dup", "--since", "HEAD"], &repo.root));
+    let cli = text(&run(&["code", "dup", "--since", "HEAD"], &repo.root));
     let mut p = params("duplicates", "", None);
     p.since = Some("HEAD".to_string());
     let (mcp, count) = mdkb::mcp::dispatch::search_impl(&repo.handle(), &p)
@@ -1377,7 +1384,7 @@ async fn review_mode_reports_nothing_when_the_ref_changed_nothing() {
     git(&repo.root, &["add", "src/a.rs", "src/b.rs"]);
     git(&repo.root, &["commit", "-q", "-m", "both"]);
 
-    let cli = text(&run(&["dup", "--since", "HEAD"], &repo.root));
+    let cli = text(&run(&["code", "dup", "--since", "HEAD"], &repo.root));
     let mut p = params("duplicates", "", None);
     p.since = Some("HEAD".to_string());
     let (mcp, count) = mdkb::mcp::dispatch::search_impl(&repo.handle(), &p)
@@ -1399,7 +1406,7 @@ async fn review_mode_reports_nothing_when_the_ref_changed_nothing() {
 async fn an_unindexed_repository_is_reported_rather_than_refused_on_both_surfaces() {
     let repo = Repo::init("[code.duplication]\nenabled = false\n");
 
-    let out = cli::run(&["dup"], &repo.root);
+    let out = cli::run(&["code", "dup"], &repo.root);
     assert!(
         out.status.success(),
         "an audit with nothing to audit is not a failure: exit={:?}",

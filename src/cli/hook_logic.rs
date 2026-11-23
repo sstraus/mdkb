@@ -203,7 +203,7 @@ pub fn classify_grep_pattern(pattern: &str, path: Option<&str>, bin: &str) -> Op
         .all(|c| c.is_alphanumeric() || c == '_' || c == ':');
     if is_ident {
         return Some(format!(
-            "Use `{} search --scope symbols \"{}\"` or `{} code callers {}` via Bash.",
+            "Use `{} code search \"{}\"` or `{} code callers {}` via Bash.",
             bin, pattern, bin, pattern
         ));
     }
@@ -273,12 +273,8 @@ pub fn definition_symbol(pattern: &str) -> Option<String> {
 }
 
 pub fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
-    definition_symbol(pattern).map(|symbol| {
-        format!(
-            "Use `{} search --scope symbols \"{}\"` via Bash.",
-            bin, symbol
-        )
-    })
+    definition_symbol(pattern)
+        .map(|symbol| format!("Use `{} code search \"{}\"` via Bash.", bin, symbol))
 }
 
 /// Extract the bare definition symbol from a `Bash` `grep`/`rg` command's source
@@ -765,7 +761,7 @@ mod tests {
     fn classify_symbol_name() {
         let r = classify_grep_pattern("handle_post_tool_use", None, "mdkb");
         assert!(r.is_some(), "snake_case identifier must be classified");
-        assert!(r.unwrap().contains("mdkb search"));
+        assert!(r.unwrap().contains("mdkb code search"));
     }
 
     #[test]
@@ -816,7 +812,7 @@ mod tests {
     fn classify_definition_search_detected() {
         let r = classify_definition_search("fn dispatch", "mdkb");
         assert!(r.is_some());
-        assert!(r.unwrap().contains("mdkb search"));
+        assert!(r.unwrap().contains("mdkb code search"));
     }
 
     #[test]
@@ -973,7 +969,7 @@ mod tests {
 
     #[test]
     fn mdkb_invocation_detected() {
-        assert!(is_mdkb_invocation("mdkb search --scope symbols foo"));
+        assert!(is_mdkb_invocation("mdkb code search foo"));
         assert!(is_mdkb_invocation(
             "/Users/x/target/release/mdkb code callers bar"
         ));

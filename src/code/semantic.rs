@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, bail, ensure};
 
 use crate::code::types::SymbolKind;
+use crate::llm::embeddings::Model;
 use crate::llm::{EmbeddingService, cosine_similarity};
+use sha2::{Digest, Sha256};
 
 /// Embedding dimensionality for AllMiniLML6V2.
 ///
@@ -23,10 +25,10 @@ pub const EMBEDDING_DIM: usize = 384;
 const MAGIC: &[u8; 4] = b"MDVS";
 
 /// Current file format version.
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
-/// Header size in bytes: magic(4) + version(4) + dim(4) + count(4) = 16.
-const HEADER_SIZE: usize = 16;
+/// Header size: legacy fields (16 bytes) plus SHA-256 of the encoder contract (32).
+const HEADER_SIZE: usize = 48;
 
 /// Maximum characters of text to embed per symbol.
 const MAX_EMBED_TEXT_LEN: usize = 500;
@@ -39,48 +41,78 @@ const MAX_EMBED_TEXT_LEN: usize = 500;
 ///
 /// File format:
 /// ```text
-/// Header (16 bytes): magic b"MDVS", version: u32, dim: u32, count: u32
+/// Header (48 bytes): magic b"MDVS", version: u32, dim: u32, count: u32, model digest
 /// Entries: [symbol_id: u32, embedding: [f32; dim]] * count
 /// ```
 #[derive(Debug)]
 pub struct VectorStore {
     path: PathBuf,
+    model: Model,
 }
 
 impl VectorStore {
     /// Open or create a vector store at the given path.
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        Self::open_for_model(path, Model::MiniLm)
+    }
+
+    pub fn open_for_model(path: impl AsRef<Path>, model: Model) -> anyhow::Result<Self> {
         let path = path.as_ref().to_path_buf();
-
+        let _archive = crate::store::mutation_lock::acquire(&path, "open code vectors")?;
         if path.exists() {
-            // Validate existing header
-            let mut file = std::fs::File::open(&path)
-                .with_context(|| format!("Failed to open vector store: {}", path.display()))?;
-            let mut header = [0u8; HEADER_SIZE];
-            match file.read_exact(&mut header) {
-                Ok(()) => validate_header(&header)?,
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // File too small — treat as empty/corrupt, recreate
-                    tracing::warn!("Vector store too small, recreating: {}", path.display());
-                    write_empty_file(&path)?;
-                }
-                Err(e) => return Err(e).context("Failed to read vector store header"),
-            }
+            archive_metadata(&path)?;
         } else {
-            write_empty_file(&path)?;
+            write_empty_file_for(&path, model)?;
         }
+        Ok(Self { path, model })
+    }
 
-        Ok(Self { path })
+    fn require_identity(&self, data: &[u8]) -> anyhow::Result<()> {
+        if let Some(dir) = self.path.parent() {
+            let config = crate::config::Config::load_for_repo(dir.join("config.toml"))?;
+            ensure!(
+                config.embedding.model == self.model,
+                "selected code embedding model changed; reopen the store"
+            );
+            let db_path = dir.join("index.sqlite");
+            if db_path.exists() {
+                crate::store::vectors::init_sqlite_vec();
+                let conn = rusqlite::Connection::open_with_flags(
+                    db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )?;
+                crate::store::vectors::require_model(&conn, self.model.identity(), false)?;
+            }
+        }
+        ensure!(
+            archive_model(data)? == self.model,
+            "code embedding identity mismatch; {}",
+            crate::store::vectors::recovery_guidance()
+        );
+        Ok(())
+    }
+
+    /// Full explicit rebuild may replace an archive belonging to another model.
+    pub fn replace_model(&self, entries: &[(u32, Vec<f32>)]) -> anyhow::Result<()> {
+        let _archive =
+            crate::store::mutation_lock::acquire(&self.path, "replace code embedding model")?;
+        self.write_entries(entries)
     }
 
     /// Write all entries to the store (overwrites existing data).
     ///
     /// Uses write-to-temp + rename for atomic writes (crash-safe on Unix).
     pub fn write_all(&self, entries: &[(u32, Vec<f32>)]) -> anyhow::Result<()> {
+        let _archive = crate::store::mutation_lock::acquire(&self.path, "write code vectors")?;
+        self.require_identity(&read_header(&self.path)?)?;
+        self.write_entries(entries)
+    }
+
+    fn write_entries(&self, entries: &[(u32, Vec<f32>)]) -> anyhow::Result<()> {
         let count = entries.len() as u32;
 
         let mut buf = Vec::with_capacity(HEADER_SIZE + entries.len() * entry_size());
-        push_header(&mut buf, count);
+        push_header_for(&mut buf, count, self.model);
 
         for (id, embedding) in entries {
             ensure!(
@@ -103,9 +135,10 @@ impl VectorStore {
         let data = std::fs::read(&self.path)
             .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
 
+        self.require_identity(&data)?;
         let count = entry_count_of(&data)?;
         let mut entries = Vec::with_capacity(count);
-        let mut offset = HEADER_SIZE;
+        let mut offset = archive_header_size(&data)?;
 
         for _ in 0..count {
             let id = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -158,12 +191,15 @@ impl VectorStore {
     /// so a predicate that answered differently the second time would write a
     /// count that disagrees with the body it precedes.
     pub fn retain(&self, keep: impl Fn(u32) -> bool) -> anyhow::Result<usize> {
+        let _archive = crate::store::mutation_lock::acquire(&self.path, "retain code vectors")?;
         let data = std::fs::read(&self.path)
             .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
+        self.require_identity(&data)?;
         let count = entry_count_of(&data)?;
         let entry_sz = entry_size();
+        let header_size = archive_header_size(&data)?;
         let id_at = |i: usize| {
-            let offset = HEADER_SIZE + i * entry_sz;
+            let offset = header_size + i * entry_sz;
             u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
         };
 
@@ -175,9 +211,9 @@ impl VectorStore {
         }
 
         let mut buf = Vec::with_capacity(HEADER_SIZE + kept * entry_sz);
-        push_header(&mut buf, kept as u32);
+        push_header_for(&mut buf, kept as u32, self.model);
         for (i, _) in survives.iter().enumerate().filter(|(_, s)| **s) {
-            let offset = HEADER_SIZE + i * entry_sz;
+            let offset = header_size + i * entry_sz;
             buf.extend_from_slice(&data[offset..offset + entry_sz]);
         }
 
@@ -187,22 +223,15 @@ impl VectorStore {
 
     /// Clear the store (reset to empty header).
     pub fn clear(&self) -> anyhow::Result<()> {
-        write_empty_file(&self.path)
+        let _archive = crate::store::mutation_lock::acquire(&self.path, "clear code vectors")?;
+        self.require_identity(&read_header(&self.path)?)?;
+        write_empty_file_for(&self.path, self.model)
     }
 
     /// Entry count from the header (reads only 16 bytes, not the full file).
     pub fn count(&self) -> anyhow::Result<usize> {
-        let mut file = std::fs::File::open(&self.path)
-            .with_context(|| format!("Failed to open vector store: {}", self.path.display()))?;
-        let mut header = [0u8; HEADER_SIZE];
-        match file.read_exact(&mut header) {
-            Ok(()) => {
-                let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
-                Ok(count)
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
-            Err(e) => Err(e).context("Failed to read vector store header"),
-        }
+        self.require_identity(&read_header(&self.path)?)?;
+        archive_metadata(&self.path).map(|(_, count)| count)
     }
 }
 
@@ -211,13 +240,12 @@ fn entry_size() -> usize {
     4 + EMBEDDING_DIM * 4
 }
 
-/// Write an empty vector store file (header only).
-fn write_empty_file(path: &Path) -> anyhow::Result<()> {
+fn write_empty_file_for(path: &Path, model: Model) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let mut buf = Vec::with_capacity(HEADER_SIZE);
-    push_header(&mut buf, 0);
+    push_header_for(&mut buf, 0, model);
     atomic_write(path, &buf)?;
     Ok(())
 }
@@ -228,14 +256,14 @@ fn write_empty_file(path: &Path) -> anyhow::Result<()> {
 /// overlong file must be refused the same way by both, or the sweep would index
 /// past the end of a file the reader rejects.
 fn entry_count_of(data: &[u8]) -> anyhow::Result<usize> {
-    if data.len() < HEADER_SIZE {
+    if data.len() < 16 {
         bail!("Vector store file too small");
     }
-    validate_header(&data[..HEADER_SIZE])?;
+    validate_header(data)?;
     let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let expected_data_size = count
         .checked_mul(entry_size())
-        .and_then(|s| s.checked_add(HEADER_SIZE))
+        .and_then(|s| s.checked_add(archive_header_size(data).ok()?))
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "Vector store count overflow: {count} entries * {} bytes",
@@ -256,11 +284,17 @@ fn entry_count_of(data: &[u8]) -> anyhow::Result<usize> {
 /// Three writers produce a store — a full write, an empty file, and the sweep —
 /// and all three must agree byte for byte with what [`validate_header`] accepts.
 /// They agree by sharing this.
+#[cfg(test)]
 fn push_header(buf: &mut Vec<u8>, count: u32) {
+    push_header_for(buf, count, Model::MiniLm);
+}
+
+fn push_header_for(buf: &mut Vec<u8>, count: u32, model: Model) {
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
     buf.extend_from_slice(&count.to_le_bytes());
+    buf.extend_from_slice(&Sha256::digest(model.identity().as_bytes()));
 }
 
 // Rewrites of the vector store on this thread, so a test can tell one pass
@@ -300,16 +334,81 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn read_header(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(HEADER_SIZE);
+    std::fs::File::open(path)?
+        .take(HEADER_SIZE as u64)
+        .read_to_end(&mut data)?;
+    Ok(data)
+}
+
+fn archive_metadata(path: &Path) -> anyhow::Result<(Model, usize)> {
+    let header = read_header(path)?;
+    let model = archive_model(&header)?;
+    let size = archive_header_size(&header)?;
+    let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+    let expected = count
+        .checked_mul(entry_size())
+        .and_then(|n| n.checked_add(size))
+        .ok_or_else(|| anyhow::anyhow!("code vector count overflow"))?;
+    ensure!(
+        std::fs::metadata(path)?.len() == expected as u64,
+        "code vector archive length mismatch"
+    );
+    Ok((model, count))
+}
+
+/// Read archive identity without creating or changing any file.
+pub fn identity_status(path: &Path, model: Model) -> crate::store::vectors::IdentityStatus {
+    let (current, ambiguous) = if path.exists() {
+        match archive_metadata(path) {
+            Ok((m, _)) => (Some(m.identity().to_string()), false),
+            Err(_) => (None, true),
+        }
+    } else {
+        (None, false)
+    };
+    let stale = ambiguous || current.as_deref().is_some_and(|m| m != model.identity());
+    crate::store::vectors::IdentityStatus {
+        selected_model: model.identity().into(),
+        current_model: current,
+        pending_model: None,
+        stale,
+        ambiguous,
+    }
+}
+
+fn archive_header_size(data: &[u8]) -> anyhow::Result<usize> {
+    validate_header(data)?;
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let size = if version == 1 { 16 } else { HEADER_SIZE };
+    ensure!(data.len() >= size, "Header too small");
+    Ok(size)
+}
+
+fn archive_model(data: &[u8]) -> anyhow::Result<Model> {
+    if archive_header_size(data)? == 16 {
+        // Version 1 was exclusively written by the shipped MiniLM encoder.
+        return Ok(Model::MiniLm);
+    }
+    [Model::MiniLm, Model::Granite107M]
+        .into_iter()
+        .find(|model| data[16..48] == Sha256::digest(model.identity().as_bytes())[..])
+        .ok_or_else(|| {
+            anyhow::anyhow!("Unknown code embedding identity; run `mdkb update --reembed`")
+        })
+}
+
 /// Validate a 16-byte header.
 fn validate_header(header: &[u8]) -> anyhow::Result<()> {
-    ensure!(header.len() >= HEADER_SIZE, "Header too small");
+    ensure!(header.len() >= 16, "Header too small");
     ensure!(
         &header[0..4] == MAGIC,
         "Invalid magic bytes in vector store"
     );
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     ensure!(
-        version == FORMAT_VERSION,
+        version == 1 || version == FORMAT_VERSION,
         "Unsupported vector store version: {version} (expected {FORMAT_VERSION})"
     );
     let dim = u32::from_le_bytes(header[8..12].try_into().unwrap());
@@ -399,16 +498,36 @@ impl SemanticSearch {
     ///
     /// The embedding service is acquired on-demand, not at construction time.
     pub fn new(store_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let store = VectorStore::open(store_path)?;
+        Self::new_for_model(store_path, Model::MiniLm)
+    }
+
+    pub fn new_for_model(store_path: impl AsRef<Path>, model: Model) -> anyhow::Result<Self> {
+        let store = VectorStore::open_for_model(store_path, model)?;
         Ok(Self {
             store,
             cache: Mutex::new(None),
         })
     }
 
+    /// Replace an archive only after every new vector has been generated.
+    pub fn reembed_at(
+        path: impl AsRef<Path>,
+        model: Model,
+        symbols: &[(u32, String)],
+    ) -> anyhow::Result<()> {
+        let search = Self {
+            store: VectorStore {
+                path: path.as_ref().to_path_buf(),
+                model,
+            },
+            cache: Mutex::new(None),
+        };
+        search.reembed(symbols)
+    }
+
     /// Get the embedding service, initializing it if needed.
-    fn service() -> anyhow::Result<Arc<EmbeddingService>> {
-        crate::llm::get_cached_service()
+    fn service(&self) -> anyhow::Result<Arc<EmbeddingService>> {
+        crate::llm::service_for(self.store.model, false)
             .map_err(|e| anyhow::anyhow!("Failed to get embedding service: {e}"))
     }
 
@@ -417,14 +536,28 @@ impl SemanticSearch {
     /// Processes in batches of [`EMBED_BATCH_SIZE`] to bound memory usage.
     /// Each entry is `(symbol_id, text_to_embed)`.
     pub fn generate_embeddings(&self, symbols: &[(u32, String)]) -> anyhow::Result<()> {
+        self.store
+            .require_identity(&read_header(&self.store.path)?)?;
+        self.generate_impl(symbols, false)
+    }
+
+    pub fn reembed(&self, symbols: &[(u32, String)]) -> anyhow::Result<()> {
+        self.generate_impl(symbols, true)
+    }
+
+    fn generate_impl(&self, symbols: &[(u32, String)], explicit: bool) -> anyhow::Result<()> {
         // Invalidate cache since we're rewriting the store
         self.invalidate_cache();
 
         if symbols.is_empty() {
-            return self.store.clear();
+            return if explicit {
+                self.store.replace_model(&[])
+            } else {
+                self.store.clear()
+            };
         }
 
-        let service = Self::service()?;
+        let service = self.service()?;
         let mut all_entries: Vec<(u32, Vec<f32>)> = Vec::with_capacity(symbols.len());
 
         for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
@@ -444,7 +577,11 @@ impl SemanticSearch {
             );
         }
 
-        self.store.write_all(&all_entries)?;
+        if explicit {
+            self.store.replace_model(&all_entries)?;
+        } else {
+            self.store.write_all(&all_entries)?;
+        }
         tracing::info!("Wrote {} embeddings to store", all_entries.len());
         Ok(())
     }
@@ -487,7 +624,7 @@ impl SemanticSearch {
         let mut all_entries: Vec<(u32, Vec<f32>)> = existing.to_vec();
 
         if !new_symbols.is_empty() {
-            let service = Self::service()?;
+            let service = self.service()?;
             for chunk in new_symbols.chunks(EMBED_BATCH_SIZE) {
                 let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
                 let embeddings = service
@@ -520,8 +657,10 @@ impl SemanticSearch {
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<SemanticMatch>> {
+        self.store
+            .require_identity(&read_header(&self.store.path)?)?;
         // Embed the query
-        let service = Self::service()?;
+        let service = self.service()?;
         let query_embedding = service
             .embed_query(query)
             .map_err(|e| anyhow::anyhow!("Failed to embed query: {e}"))?;
@@ -841,13 +980,11 @@ mod tests {
 
         // Craft a header with a huge count that would overflow when multiplied by entry_size
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // count = 0xFFFFFFFF
-        std::fs::write(&path, &buf).unwrap();
-
+        push_header(&mut buf, u32::MAX); // count = 0xFFFFFFFF
+        // `open` validates archive length, so open a valid empty archive and
+        // corrupt it afterwards: `load` must refuse it on its own.
         let store = VectorStore::open(&path).unwrap();
+        std::fs::write(&path, &buf).unwrap();
         let result = store.load();
         assert!(result.is_err(), "Should fail on overflow count");
         let err = result.unwrap_err().to_string();
@@ -864,19 +1001,17 @@ mod tests {
 
         // Write a valid header + one entry with NaN
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        push_header(&mut buf, 1); // count = 1
         buf.extend_from_slice(&1u32.to_le_bytes()); // symbol_id = 1
         // First float is NaN, rest are 0.0
         buf.extend_from_slice(&f32::NAN.to_le_bytes());
         for _ in 1..EMBEDDING_DIM {
             buf.extend_from_slice(&0.0f32.to_le_bytes());
         }
-        std::fs::write(&path, &buf).unwrap();
-
+        // `open` validates archive length, so open a valid empty archive and
+        // corrupt it afterwards: `load` must refuse it on its own.
         let store = VectorStore::open(&path).unwrap();
+        std::fs::write(&path, &buf).unwrap();
         let result = store.load();
         assert!(result.is_err(), "Should reject NaN values");
         let err = result.unwrap_err().to_string();
@@ -892,18 +1027,16 @@ mod tests {
         let path = dir.path().join("inf.bin");
 
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes());
+        push_header(&mut buf, 1);
         buf.extend_from_slice(&1u32.to_le_bytes());
         buf.extend_from_slice(&f32::INFINITY.to_le_bytes());
         for _ in 1..EMBEDDING_DIM {
             buf.extend_from_slice(&0.0f32.to_le_bytes());
         }
-        std::fs::write(&path, &buf).unwrap();
-
+        // `open` validates archive length, so open a valid empty archive and
+        // corrupt it afterwards: `load` must refuse it on its own.
         let store = VectorStore::open(&path).unwrap();
+        std::fs::write(&path, &buf).unwrap();
         let result = store.load();
         assert!(result.is_err(), "Should reject Inf values");
     }
@@ -936,20 +1069,22 @@ mod tests {
 
         // Write a header claiming 1 entry but only provide partial data
         let mut buf = Vec::new();
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-        buf.extend_from_slice(&1u32.to_le_bytes()); // claims 1 entry
+        push_header(&mut buf, 1); // claims 1 entry
         buf.extend_from_slice(&1u32.to_le_bytes()); // partial: just symbol_id, no embedding
-        std::fs::write(&path, &buf).unwrap();
-
+        // `open` validates archive length, so open a valid empty archive and
+        // corrupt it afterwards: `load` must refuse it on its own.
         let store = VectorStore::open(&path).unwrap();
+        std::fs::write(&path, &buf).unwrap();
         let result = store.load();
         assert!(result.is_err(), "Should fail on size mismatch");
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("mismatch"),
             "Expected size mismatch error, got: {err}"
+        );
+        assert!(
+            VectorStore::open(&path).is_err(),
+            "open must refuse a truncated archive"
         );
     }
 

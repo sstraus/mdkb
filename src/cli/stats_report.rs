@@ -1,4 +1,4 @@
-//! Data aggregator for `mdkb stats`.
+//! Data aggregator for `mdkb status`.
 //!
 //! `collect_report` gathers all data into a `StatsReport` without rendering;
 //! rendering lives in `stats_render`.
@@ -17,6 +17,8 @@ use crate::store::{collections, memory, search, stats};
 
 #[derive(Debug, Serialize)]
 pub struct StatsReport {
+    pub embedding: crate::store::vectors::IdentityStatus,
+    pub code_embedding: crate::store::vectors::IdentityStatus,
     pub header: HeaderInfo,
     pub index: IndexHealth,
     pub collections: CollectionsSummary,
@@ -34,6 +36,10 @@ pub struct StatsReport {
     /// because `stats` always exits 0, and a consumer that discards the
     /// output of a failing command would never see an error finding.
     pub doctor: Vec<crate::domain::doctor::Finding>,
+    /// The daemon process and its sockets (`mdkb status`; was `daemon status`).
+    pub daemon: crate::cli::daemon::DaemonSummary,
+    /// Developer query telemetry (`mdkb status`; was `metrics status`).
+    pub telemetry: crate::core::ops::TelemetryStatus,
 }
 
 /// Labelled candidates needed before a ratio is reported. Below it, one
@@ -304,7 +310,15 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
     let root = mdkb_dir.parent().expect("mdkb_dir has parent");
     let status = search::get_status(&ctx.conn)?;
 
+    let mut embedding = crate::store::vectors::identity_status(&ctx.conn)?;
+    let code_embedding = crate::code::semantic::identity_status(
+        &mdkb_dir.join("vectors.bin"),
+        crate::store::vectors::selected_model(&ctx.conn)?,
+    );
+    embedding.stale |= code_embedding.stale;
     Ok(StatsReport {
+        embedding,
+        code_embedding,
         header: collect_header(ctx, root, &status),
         index: collect_index_health(ctx, &status)?,
         collections: collect_collections(ctx)?,
@@ -319,6 +333,8 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
             Some(ctx),
             false,
         )),
+        daemon: crate::cli::daemon::summary(),
+        telemetry: crate::core::ops::handle_metrics_status(ctx, root)?,
     })
 }
 
@@ -1251,6 +1267,10 @@ mod tests {
 
     fn make_empty_report() -> StatsReport {
         StatsReport {
+            daemon: Default::default(),
+            telemetry: Default::default(),
+            embedding: Default::default(),
+            code_embedding: Default::default(),
             header: HeaderInfo {
                 repo: "t".into(),
                 version: "0.0.0".into(),
@@ -1299,7 +1319,7 @@ mod tests {
         }
     }
 
-    /// `mdkb stats` answers "is mining working?", not just "is it switched on?".
+    /// `mdkb status` answers "is mining working?", not just "is it switched on?".
     ///
     /// `enabled` plus `candidates` cannot tell a distiller that never runs from
     /// one that runs and is rejected every time — for six weeks both looked

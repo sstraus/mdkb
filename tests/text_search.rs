@@ -36,6 +36,15 @@ fn search(root: &Path, query: &str, extra: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+fn grep(root: &Path, query: &str, extra: &[&str]) -> std::process::Output {
+    cli::command()
+        .current_dir(root)
+        .args(["code", "grep", "--literals", query])
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
 fn text(out: std::process::Output) -> String {
     assert!(
         out.status.success(),
@@ -55,22 +64,24 @@ fn literal_scope_finds_jsx_label_and_i18n_json_value() {
     assert!(found.contains("App"), "enclosing component: {found}");
 }
 
-/// Catches: default search hides indexed literals unless the caller knows a scope.
+/// Catches: the literal index not being reachable as structured data. Default
+/// `search` no longer carries literals; `code grep --literals` does.
 #[test]
-fn default_search_includes_indexed_literals_as_structured_data() {
+fn code_grep_literals_returns_the_indexed_literals_as_structured_data() {
     let dir = fixture();
     let found = text(cli::run(
-        &["--format", "json", "search", "Fork from here"],
+        &[
+            "--format",
+            "json",
+            "code",
+            "grep",
+            "--literals",
+            "Fork from here",
+        ],
         dir.path(),
     ));
     let value: serde_json::Value = serde_json::from_str(&found).unwrap();
-    assert_eq!(
-        value["text"]["hits"].as_array().unwrap().len(),
-        2,
-        "{found}"
-    );
-    assert!(value["documents"].is_array());
-    assert!(value["memory"].is_array());
+    assert_eq!(value["hits"].as_array().unwrap().len(), 2, "{found}");
 }
 
 /// Catches: regex metacharacters or implicit case folding admit unrelated strings.
@@ -83,12 +94,12 @@ fn literals_are_fixed_strings_with_opt_in_unicode_case_folding() {
     )
     .unwrap();
     index(dir.path());
-    let found = text(search(dir.path(), "Open [draft].*", &[]));
+    let found = text(grep(dir.path(), "Open [draft].*", &[]));
     assert!(found.contains("extra.ts:1:"), "{found}");
     assert!(!found.contains("extra.ts:2:"), "{found}");
-    assert!(!text(search(dir.path(), "fork from here", &[])).contains("App.tsx:"));
-    assert!(text(search(dir.path(), "fork from here", &["--ignore-case"])).contains("App.tsx:2:"));
-    assert!(text(search(dir.path(), "éclair", &["--ignore-case"])).contains("extra.ts:3:"));
+    assert!(!text(grep(dir.path(), "fork from here", &[])).contains("App.tsx:"));
+    assert!(text(grep(dir.path(), "fork from here", &["-i"])).contains("App.tsx:2:"));
+    assert!(text(grep(dir.path(), "éclair", &["-i"])).contains("extra.ts:3:"));
 }
 
 /// Catches: stale literal rows survive targeted reindex or file deletion.
@@ -199,7 +210,7 @@ fn older_literal_free_index_is_read_only_and_requests_a_refresh() {
     let before = std::fs::read(&path).unwrap();
     let out = search(dir.path(), "Fork from here", &[]);
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("mdkb code index"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("mdkb update --code"));
     let output = text(cli::run(
         &["--format", "json", "search", "Fork from here"],
         dir.path(),
@@ -232,5 +243,39 @@ fn explicit_roots_search_literals_in_each_repository() {
                 .to_str()
                 .unwrap()
         )
+    );
+}
+
+/// Catches: a stale sidecar is reported as active, or active work looks idle.
+#[test]
+fn literal_search_reports_live_background_refresh_and_released_lock() {
+    use fs4::fs_std::FileExt;
+    let dir = fixture();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.path().join(".mdkb/code-refresh.lock"))
+        .unwrap();
+    FileExt::lock_exclusive(&lock).unwrap();
+    let active = text(search(dir.path(), "Fork from here", &[]));
+    assert!(
+        active.contains("Session-start code refresh: in progress."),
+        "{active}"
+    );
+    drop(lock);
+    let idle = text(search(dir.path(), "Fork from here", &[]));
+    assert!(
+        idle.contains("Session-start code refresh: not running."),
+        "{idle}"
+    );
+    assert!(idle.contains("unchanged files retain their age"), "{idle}");
+    let json = text(search(dir.path(), "Fork from here", &["--format", "json"]));
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&json)
+            .unwrap()
+            .get("background_refresh_active")
+            .is_none()
     );
 }

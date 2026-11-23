@@ -172,7 +172,7 @@ impl NearDuplicateCoverage {
 /// one, but two entries written far enough apart — or before the rule existed —
 /// never met each other. The audit is where they do.
 ///
-/// A store with no embeddings (no model pulled, or `mdkb embed` never run)
+/// A store with no embeddings (no model pulled, or `mdkb update` never run)
 /// yields an empty list rather than an error: the other three signals need no
 /// model, and an audit must not require one. The returned `bool` is the fact
 /// an empty `Vec` alone cannot carry: whether the pass had anything to check
@@ -199,47 +199,61 @@ pub fn near_duplicate_pairs<S: std::hash::BuildHasher>(
     min_similarity: f32,
     ids_by_rowid: &HashMap<i64, String, S>,
 ) -> Result<NearDuplicateOutcome> {
-    let embeddings = active_memory_embeddings(conn)?;
-    let coverage = NearDuplicateCoverage {
-        embedded: embeddings.len(),
-        scanned: ids_by_rowid.len(),
-    };
-    if embeddings.is_empty() {
-        return Ok((coverage, Vec::new()));
-    }
-
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for (rowid, embedding) in &embeddings {
-        let neighbours = crate::store::vectors::memory_vector_search(
-            conn,
-            embedding,
-            NEAR_DUPLICATE_NEIGHBOURS,
-            None,
-        )?;
-        for (other_rowid, distance) in neighbours {
-            if other_rowid == *rowid {
-                continue;
-            }
-            let similarity = crate::store::hybrid::cosine_from_distance(distance);
-            if similarity < f64::from(min_similarity) {
-                continue;
-            }
-            // Each unordered pair once, keyed on the rowids rather than on the
-            // slugs: the KNN reports a→b and b→a with the same distance.
-            let key = (*rowid.min(&other_rowid), *rowid.max(&other_rowid));
-            if !seen.insert(key) {
-                continue;
-            }
-            let (Some(a), Some(b)) = (ids_by_rowid.get(rowid), ids_by_rowid.get(&other_rowid))
-            else {
-                continue; // a neighbour that is no longer active
-            };
-            out.push((a.clone(), b.clone(), similarity));
+    crate::store::documents::with_savepoint(conn, "audit_embedding_identity", || {
+        // Granite's semantic duplicate threshold has not been calibrated.
+        if crate::store::vectors::selected_model(conn)?
+            == crate::llm::embeddings::Model::Granite107M
+        {
+            return Ok((
+                NearDuplicateCoverage {
+                    embedded: 0,
+                    scanned: ids_by_rowid.len(),
+                },
+                Vec::new(),
+            ));
         }
-    }
-    out.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    Ok((coverage, out))
+        let embeddings = active_memory_embeddings(conn)?;
+        let coverage = NearDuplicateCoverage {
+            embedded: embeddings.len(),
+            scanned: ids_by_rowid.len(),
+        };
+        if embeddings.is_empty() {
+            return Ok((coverage, Vec::new()));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (rowid, embedding) in &embeddings {
+            let neighbours = crate::store::vectors::memory_vector_search(
+                conn,
+                embedding,
+                NEAR_DUPLICATE_NEIGHBOURS,
+                None,
+            )?;
+            for (other_rowid, distance) in neighbours {
+                if other_rowid == *rowid {
+                    continue;
+                }
+                let similarity = crate::store::hybrid::cosine_from_distance(distance);
+                if similarity < f64::from(min_similarity) {
+                    continue;
+                }
+                // Each unordered pair once, keyed on the rowids rather than on the
+                // slugs: the KNN reports a→b and b→a with the same distance.
+                let key = (*rowid.min(&other_rowid), *rowid.max(&other_rowid));
+                if !seen.insert(key) {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (ids_by_rowid.get(rowid), ids_by_rowid.get(&other_rowid))
+                else {
+                    continue; // a neighbour that is no longer active
+                };
+                out.push((a.clone(), b.clone(), similarity));
+            }
+        }
+        out.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        Ok((coverage, out))
+    })
 }
 
 /// Embeddings of the active entries, read from the plain mirror table rather
@@ -261,6 +275,14 @@ fn active_memory_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     if !has_table {
         return Ok(Vec::new());
     }
+    // DEFERRED (2026-11-15) — an incompatible generation refuses this audit
+    // rather than presenting partial signals as a complete audit; independent
+    // lexical retrieval remains available (058 review T1, accepted risk).
+    crate::store::vectors::require_model(
+        conn,
+        crate::llm::embeddings::Model::MiniLm.identity(),
+        false,
+    )?;
     let mut stmt = conn.prepare(
         "SELECT m.memory_rowid, m.embedding
          FROM memory_embeddings m
@@ -541,8 +563,10 @@ mod tests {
             })
             .unwrap();
         let vector: Vec<f32> = (0..384).map(|i| ((i % 7) as f32) - 3.0).collect();
-        crate::store::vectors::store_memory_embedding(&conn, rowid_a, &vector, "test").unwrap();
-        crate::store::vectors::store_memory_embedding(&conn, rowid_b, &vector, "test").unwrap();
+        crate::store::vectors::store_memory_embedding(&conn, rowid_a, &vector, "AllMiniLML6V2")
+            .unwrap();
+        crate::store::vectors::store_memory_embedding(&conn, rowid_b, &vector, "AllMiniLML6V2")
+            .unwrap();
 
         let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &HashMap::new()).unwrap();
         assert!(

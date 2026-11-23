@@ -296,7 +296,7 @@ fn a_root_less_call_does_not_fall_back_to_an_ignored_open_store() {
 
 // ── mdkb daemon status ──────────────────────────────────────────────────────
 
-/// Catches: `daemon status` aborting on an unparsable `daemon.toml`. The
+/// Catches: `status` aborting on an unparsable `daemon.toml`. The
 /// diagnostic command is the one an operator runs when the daemon is broken; it
 /// is documented to exit 0 (tests/cli_smoke.rs `smoke_daemon_status`) and the
 /// socket lines after the repo listing are what they came for.
@@ -315,7 +315,7 @@ fn daemon_status_still_reports_when_daemon_toml_does_not_parse() {
     let out = cli::command()
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
-        .args(["daemon", "status"])
+        .args(["status"])
         .current_dir(work.path())
         .output()
         .unwrap();
@@ -328,12 +328,12 @@ fn daemon_status_still_reports_when_daemon_toml_does_not_parse() {
         out.status.code()
     );
     assert!(
-        stdout.contains("hook sock:"),
-        "the socket lines were lost: {stdout}"
+        stdout.contains("daemon.toml does not parse") && stdout.contains("not running"),
+        "the daemon section was lost: {stdout}"
     );
 }
 
-/// Catches: `daemon status` going back to reading `repos.json` and walking the
+/// Catches: `status` going back to reading `repos.json` and walking the
 /// disk (story 210-b83b): with no daemon running it must list no repo at all,
 /// not the known roots or the stores nested under them.
 #[cfg(unix)]
@@ -357,7 +357,7 @@ fn daemon_status_without_a_daemon_lists_no_repos_from_disk() {
     let out = cli::command()
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
-        .args(["daemon", "status"])
+        .args(["status"])
         .current_dir(work.path())
         .output()
         .unwrap();
@@ -436,7 +436,7 @@ fn a_root_less_call_keeps_the_open_store_that_is_not_ignored() {
     assert_eq!(resolved.roots, vec![kept]);
 }
 
-/// Catches: `daemon status` swallowing the parse error (`Err(_) => Vec::new()`):
+/// Catches: `status` swallowing the parse error (`Err(_) => Vec::new()`):
 /// the listing then silently includes the stores the operator believes are
 /// ignored, with nothing saying the config was not applied.
 #[cfg(unix)]
@@ -454,7 +454,7 @@ fn daemon_status_says_when_daemon_toml_was_not_applied() {
     let out = cli::command()
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
-        .args(["daemon", "status"])
+        .args(["status"])
         .current_dir(work.path())
         .output()
         .unwrap();

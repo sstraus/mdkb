@@ -93,9 +93,6 @@ fn named_home(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DaemonConfig {
-    /// Unix socket path. Default: ~/.mdkb/daemon.sock
-    pub socket_path: Option<String>,
-
     /// Maximum concurrently active repo handles (LRU eviction beyond this).
     pub max_active_repos: usize,
 
@@ -111,13 +108,14 @@ pub struct DaemonConfig {
     /// See [`DEFAULT_DISCOVERY_CACHE_SECS`]. `0` disables the cache.
     pub discovery_cache_secs: u64,
 
-    /// Days of inactivity before an unpinned healthy repo leaves the map.
-    /// Default: 30. `0` disables expiry. Configured repos and scopes never expire.
+    /// Days since last successful access before an unpinned repo leaves the map.
+    /// Unreadable repos are kept. Default: 30. `0` disables expiry.
+    /// Configured repos and scopes never expire.
     pub repo_expiry_days: u64,
 
-    /// Directories whose stores are never discovered and never part of
-    /// `root="*"`: a path here silences every store at or below it. Hand-owned
-    /// like the rest of this file; `~/` is expanded.
+    /// Directories whose stores are never discovered, never recorded in the
+    /// repo map and never part of `root="*"`: a path here silences every store
+    /// at or below it. Hand-owned like the rest of this file; `~/` is expanded.
     pub ignore: Vec<String>,
 
     /// `[[scopes]]` prefix rules: which scope a path belongs to. `root="*"`
@@ -157,6 +155,18 @@ pub struct DaemonTelemetry {
     /// writing them in every repo costs I/O per tool call and shows up as a file
     /// diff in the agent UI.
     pub hook_events: bool,
+
+    /// Machine-wide default for a repo's `[telemetry] query_events`. Query
+    /// telemetry is a per-developer choice, so it must be possible to turn it on
+    /// without committing a team repo's tracked `.mdkb/config.toml`. A key the
+    /// repo sets explicitly still wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_events: Option<bool>,
+
+    /// Machine-wide default for a repo's `[telemetry] retention_days`; same
+    /// precedence as [`query_events`](Self::query_events).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
 }
 
 /// Environment override for [`DaemonTelemetry::hook_events`], so a test or a
@@ -165,9 +175,9 @@ pub const HOOK_TELEMETRY_ENV: &str = "MDKB_HOOK_TELEMETRY";
 
 /// Whether hooks write their diagnostic logs.
 ///
-/// Reads `daemon.toml` on every call: the daemon reloads that file on change and
-/// a hook client is a short-lived process, so there is no long-lived copy to go
-/// stale. An unreadable file means off. The crate's own unit tests always log,
+/// Reads `daemon.toml` on every call, so a change applies to the next hook
+/// without a daemon restart; unlike the `[priors]` and `[telemetry]` repo
+/// layers, which the daemon reads once at startup. An unreadable file means off. The crate's own unit tests always log,
 /// because they assert on the rows; the gate itself is tested through
 /// [`hook_telemetry_from`].
 pub fn hook_telemetry_enabled() -> bool {
@@ -210,7 +220,6 @@ pub struct ScopeRule {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            socket_path: None,
             max_active_repos: DEFAULT_MAX_ACTIVE_REPOS,
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
@@ -225,6 +234,25 @@ impl Default for DaemonConfig {
     }
 }
 
+/// `socket_path` was a `daemon.toml` key until 3.15. The daemon never bound
+/// it, and the `mdkb mcp` proxy that did read it then dialled a socket nobody
+/// listened on. The key is now ignored; say so once per process, so a hook
+/// that reloads the file does not repeat it on every tool call.
+fn warn_if_socket_path_set(content: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let set = content
+        .parse::<toml::Table>()
+        .is_ok_and(|table| table.contains_key("socket_path"));
+    if set {
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "daemon.toml: socket_path is ignored; the daemon always uses ~/.mdkb/daemon.sock. \
+                 Remove the key, or pass `mdkb mcp --socket` for a one-off override."
+            );
+        });
+    }
+}
+
 impl DaemonConfig {
     /// Load config from a TOML file, or return default if the file doesn't exist.
     ///
@@ -236,6 +264,7 @@ impl DaemonConfig {
         let mut config = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| Error::other(format!("Failed to read daemon config: {e}")))?;
+            warn_if_socket_path_set(&content);
             toml::from_str(&content)
                 .map_err(|e| Error::config(format!("Failed to parse daemon config: {e}")))?
         } else {
@@ -346,12 +375,11 @@ impl DaemonConfig {
         Self::daemon_home().join("daemon.toml")
     }
 
-    /// Resolve the socket path.
-    pub fn socket_path(&self) -> PathBuf {
-        match &self.socket_path {
-            Some(p) => expand_tilde(p),
-            None => Self::daemon_home().join(DEFAULT_SOCKET_NAME),
-        }
+    /// The MCP socket the daemon binds and `mdkb mcp` dials:
+    /// `~/.mdkb/daemon.sock`. Not configurable, because the daemon binds every
+    /// socket next to its PID file; `mdkb mcp --socket` is the one-off override.
+    pub fn mcp_socket_path() -> PathBuf {
+        Self::daemon_home().join(DEFAULT_SOCKET_NAME)
     }
 
     /// Resolve the PID file path.
@@ -530,7 +558,6 @@ mod tests {
     fn test_default_daemon_config() {
         let config = DaemonConfig::default();
         assert_eq!(config.max_active_repos, 5);
-        assert!(config.socket_path.is_none());
         assert_eq!(config.whitelist_dirs, [] as [String; 0]);
         assert!(config.repos.is_empty());
     }
@@ -539,7 +566,6 @@ mod tests {
     fn test_daemon_config_serialization_roundtrip() {
         let config = DaemonConfig {
             telemetry: DaemonTelemetry::default(),
-            socket_path: Some("~/.mdkb/daemon.sock".to_string()),
             max_active_repos: 10,
             whitelist_dirs: vec!["~/Gits".to_string(), "~/Projects".to_string()],
             repos: vec![
@@ -573,7 +599,6 @@ mod tests {
         );
         assert_eq!(parsed.state_dir, None);
         assert_eq!(parsed.max_active_repos, 10);
-        assert_eq!(parsed.socket_path.as_deref(), Some("~/.mdkb/daemon.sock"));
         assert_eq!(parsed.whitelist_dirs.len(), 2);
         assert_eq!(parsed.repos.len(), 2);
         assert_eq!(parsed.repos[0].root, "/Users/me/Gits/projectA");
@@ -595,7 +620,6 @@ whitelist_dirs = ["~/Code"]
         assert_eq!(config.max_active_repos, 3);
         assert_eq!(config.whitelist_dirs, vec!["~/Code"]);
         assert!(config.repos.is_empty());
-        assert!(config.socket_path.is_none());
     }
 
     /// Catches: an `ignore` key that parses nowhere, so the operator's list
@@ -641,7 +665,6 @@ whitelist_dirs = ["~/Code"]
 
         let config = DaemonConfig {
             telemetry: DaemonTelemetry::default(),
-            socket_path: None,
             max_active_repos: 7,
             whitelist_dirs: vec!["~/Gits".to_string()],
             repos: vec![RepoEntry {
@@ -696,19 +719,23 @@ whitelist_dirs = ["~/Code"]
 
     #[test]
     fn test_daemon_socket_path_default() {
-        let config = DaemonConfig::default();
-        let path = config.socket_path();
-        assert!(path.ends_with(".mdkb/daemon.sock"));
+        assert!(DaemonConfig::mcp_socket_path().ends_with(".mdkb/daemon.sock"));
     }
 
+    /// Catches: removing the `socket_path` field together with a stricter
+    /// parse, which would stop the daemon from starting for everyone whose
+    /// `daemon.toml` still carries the old key.
     #[test]
-    fn test_daemon_socket_path_custom() {
-        let config = DaemonConfig {
-            socket_path: Some("~/custom/mdkb.sock".to_string()),
-            ..Default::default()
-        };
-        let path = config.socket_path();
-        assert!(path.ends_with("custom/mdkb.sock"));
+    fn a_daemon_toml_that_still_names_socket_path_loads() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.toml");
+        std::fs::write(
+            &path,
+            "socket_path = \"~/custom/mdkb.sock\"\nmax_active_repos = 3\n",
+        )
+        .unwrap();
+        let config = DaemonConfig::load_or_default(&path).unwrap();
+        assert_eq!(config.max_active_repos, 3);
     }
 
     #[test]

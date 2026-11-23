@@ -17,14 +17,14 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
-use crate::code::storage::NameMatch;
+use crate::code::storage::{FileMatch, NameMatch};
 use crate::error::{Error, Result};
 
-fn open_code_read_only(root: &Path) -> Result<crate::code::indexing::IndexFacade> {
+pub(crate) fn open_code_read_only(root: &Path) -> Result<crate::code::indexing::IndexFacade> {
     let index_path = root.join(".mdkb/code.sqlite");
     if !index_path.exists() {
         return Err(Error::other(format!(
-            "Code index not found at {}; run `mdkb code index` first",
+            "Code index not found at {}; run `mdkb update --code` first",
             index_path.display()
         )));
     }
@@ -42,7 +42,7 @@ pub fn handle_code_init(root: &Path) -> Result<()> {
         .map_err(|e| Error::other(format!("Failed to create code index: {}", e)))?;
     Ok(())
 }
-/// Handle `mdkb code index` - build code index from source files.
+/// Handle `mdkb update --code` - build code index from source files.
 pub fn handle_code_index(
     root: &Path,
     paths: &[String],
@@ -105,7 +105,7 @@ pub fn index_paths(
     }
     Ok(total)
 }
-/// Handle `mdkb code index --force` - full reindex discarding existing data.
+/// Handle `mdkb update --code --force` - full reindex discarding existing data.
 pub fn handle_code_reindex(
     root: &Path,
     paths: &[String],
@@ -170,24 +170,29 @@ pub fn parse_kind_filter(kind_filter: Option<&str>) -> Result<Option<String>> {
 ///
 /// Both surfaces route here so they cannot answer the same query differently.
 /// The name match is fuzzy — substring over name, signature and doc comment.
-/// Exact lookup is [`handle_code_find`].
+/// Exact lookup is [`handle_symbol_lookup`] with `exact`.
 pub fn search_symbols_scoped(
     index: &crate::code::indexing::IndexFacade,
     query: &str,
     kind_filter: Option<&str>,
-    file_filter: Option<&str>,
+    path_prefix: Option<&str>,
     limit: usize,
 ) -> Result<CodeFindResult> {
     let kind = parse_kind_filter(kind_filter)?;
     // An empty or wildcard query means "whatever the other filters allow" —
-    // otherwise `--file src/mcp` alone could not list a file's symbols.
+    // otherwise `--path src/mcp` alone could not list a file's symbols.
     let name = if query.is_empty() || query == "*" {
         NameMatch::Any
     } else {
         NameMatch::Fuzzy(query)
     };
 
-    let (symbols, total) = index.query_symbols(name, kind.as_deref(), file_filter, limit);
+    let (symbols, total) = index.query_symbols(
+        name,
+        kind.as_deref(),
+        path_prefix.map(FileMatch::Prefix),
+        limit,
+    );
     Ok(CodeFindResult { symbols, total })
 }
 /// One repo's share of a cross-repo symbol search: symbols whose name is
@@ -199,15 +204,19 @@ pub fn search_symbols_exact_first(
     index: &crate::code::indexing::IndexFacade,
     query: &str,
     kind_filter: Option<&str>,
-    file_filter: Option<&str>,
+    path_prefix: Option<&str>,
     limit: usize,
 ) -> Result<Vec<(crate::code::symbol::Symbol, bool)>> {
     let kind = parse_kind_filter(kind_filter)?;
     let wildcard = query.is_empty() || query == "*";
     let mut hits: Vec<(crate::code::symbol::Symbol, bool)> = Vec::new();
     if !wildcard {
-        let (exact, _) =
-            index.query_symbols(NameMatch::Exact(query), kind.as_deref(), file_filter, limit);
+        let (exact, _) = index.query_symbols(
+            NameMatch::Exact(query),
+            kind.as_deref(),
+            path_prefix.map(FileMatch::Prefix),
+            limit,
+        );
         hits.extend(exact.into_iter().map(|sym| (sym, true)));
     }
     if hits.len() < limit {
@@ -217,8 +226,12 @@ pub fn search_symbols_exact_first(
             NameMatch::Fuzzy(query)
         };
         // Room for the exact rows the fuzzy match repeats.
-        let (fuzzy, _) =
-            index.query_symbols(name, kind.as_deref(), file_filter, limit + hits.len());
+        let (fuzzy, _) = index.query_symbols(
+            name,
+            kind.as_deref(),
+            path_prefix.map(FileMatch::Prefix),
+            limit + hits.len(),
+        );
         for sym in fuzzy {
             if hits.len() >= limit {
                 break;
@@ -262,7 +275,7 @@ pub fn semantic_search_scoped(
     }
     Ok(results)
 }
-/// Handle `mdkb search --scope code` - semantic code search.
+/// Handle `mdkb code search --semantic` - semantic code search.
 pub fn handle_semantic_code_search(
     root: &Path,
     config_path: &Path,
@@ -274,45 +287,38 @@ pub fn handle_semantic_code_search(
     let facade = open_code_read_only(root)?;
     semantic_search_scoped(&facade, &config, query, kind_filter, limit, None)
 }
-/// Handle `mdkb search --scope symbols` - fuzzy symbol search.
-pub fn handle_symbol_search(
-    root: &Path,
-    query: &str,
-    kind_filter: Option<&str>,
-    file_filter: Option<&str>,
-    limit: usize,
-) -> Result<CodeFindResult> {
-    let facade = open_code_read_only(root)?;
-    search_symbols_scoped(&facade, query, kind_filter, file_filter, limit)
-}
-/// Handle `mdkb code search` - fuzzy symbol search without a file filter.
-pub fn handle_code_search(
-    root: &Path,
-    query: &str,
-    limit: usize,
-    kind_filter: Option<&str>,
-) -> Result<CodeFindResult> {
-    handle_symbol_search(root, query, kind_filter, None, limit)
-}
-/// Handle `mdkb code find` - exact symbol lookup.
+/// Handle `mdkb code search` - symbol lookup by name.
 ///
-/// A common name (`tests`, `new`) matches hundreds of definitions, so the list
-/// is capped at `limit`. `total` keeps the pre-cap count: the caller must
-/// report it, otherwise a capped list reads as the complete set.
-pub fn handle_code_find(
+/// Fuzzy by default, with the symbols named exactly `query` first. With
+/// `exact`, only those. A common name (`tests`, `new`) matches hundreds of
+/// definitions, so the list is capped at `limit`. `total` keeps the pre-cap
+/// count: the caller must report it, otherwise a capped list reads as the
+/// complete set.
+pub fn handle_symbol_lookup(
     root: &Path,
-    name: &str,
+    query: &str,
     kind_filter: Option<&str>,
-    file_filter: Option<&str>,
+    path_prefix: Option<&str>,
     limit: usize,
+    exact: bool,
 ) -> Result<CodeFindResult> {
     let facade = open_code_read_only(root)?;
-    let kind = parse_kind_filter(kind_filter)?;
-
-    let (symbols, total) =
-        facade.query_symbols(NameMatch::Exact(name), kind.as_deref(), file_filter, limit);
-
-    Ok(CodeFindResult { symbols, total })
+    if exact {
+        let kind = parse_kind_filter(kind_filter)?;
+        let (symbols, total) = facade.query_symbols(
+            NameMatch::Exact(query),
+            kind.as_deref(),
+            path_prefix.map(FileMatch::Prefix),
+            limit,
+        );
+        return Ok(CodeFindResult { symbols, total });
+    }
+    let hits = search_symbols_exact_first(&facade, query, kind_filter, path_prefix, limit)?;
+    let total = search_symbols_scoped(&facade, query, kind_filter, path_prefix, limit)?.total;
+    Ok(CodeFindResult {
+        symbols: hits.into_iter().map(|(symbol, _)| symbol).collect(),
+        total,
+    })
 }
 /// The calls a symbol makes that the index could not place on a symbol of its
 /// own.
@@ -473,7 +479,7 @@ pub fn handle_code_impact(
         },
     ))
 }
-/// Handle `mdkb code info` - show index statistics.
+/// Handle `mdkb status` - show index statistics.
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
     let facade = open_code_read_only(root)?;
 
@@ -564,7 +570,7 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
     let symbols = parser.parse(&code, file_id, &mut counter);
     Ok(symbols)
 }
-/// Result of `code find` command: the capped matches plus the match count
+/// Result of the `code search` command: the capped matches plus the match count
 /// before truncation.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CodeFindResult {

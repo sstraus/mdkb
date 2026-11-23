@@ -114,15 +114,18 @@ fn status_without_a_daemon_says_so_and_starts_nothing() {
     let home = prepare_home();
 
     let out = mdkb(&home)
-        .arg("daemon")
-        .arg("status")
+        .args(["--format", "json", "status"])
         .output()
-        .expect("daemon status");
+        .expect("status");
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
 
     assert!(out.status.success(), "status must exit 0: {text}");
-    assert!(text.contains("not running"), "{text}");
-    assert!(text.contains("repos:      unknown"), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("status json");
+    assert_eq!(json["daemon"]["running"], false, "{text}");
+    assert!(
+        json["daemon"]["repos_known"].is_null(),
+        "no daemon, no repo count: {text}"
+    );
     assert!(
         !text.contains("[known]") && !text.contains("[discovered]"),
         "{text}"
@@ -145,7 +148,10 @@ fn status_lists_the_repos_the_running_daemon_holds() {
         hook_socket(home.path()).exists()
     }));
 
-    let out = mdkb(&home).args(["daemon", "status"]).output().unwrap();
+    let out = mdkb(&home)
+        .args(["--format", "json", "status"])
+        .output()
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
 
     let pid = read_pid(home.path()).expect("pid file");
@@ -153,13 +159,13 @@ fn status_lists_the_repos_the_running_daemon_holds() {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     let _ = wait_until(Duration::from_secs(5), || !pid_alive(pid));
 
-    assert!(text.contains("running (pid"), "{text}");
-    assert!(text.contains("repos:      "), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("status json");
+    assert_eq!(json["daemon"]["running"], true, "{text}");
     assert!(
-        !text.contains("unavailable"),
-        "the query must succeed: {text}"
+        json["daemon"]["repos_known"].is_u64(),
+        "the daemon's answer must be reported: {text}"
     );
-    assert!(!text.contains("unknown"), "{text}");
+    assert!(json["daemon"]["repos_error"].is_null(), "{text}");
 }
 
 /// `mdkb daemon status` → `stop` → ensure sockets and pid file are gone.
@@ -181,11 +187,7 @@ fn status_stop_restart_cycle() {
     }));
 
     // status: should print "running"
-    let status = mdkb(&home)
-        .arg("daemon")
-        .arg("status")
-        .output()
-        .expect("daemon status");
+    let status = mdkb(&home).arg("status").output().expect("status");
     let status_text = String::from_utf8_lossy(&status.stdout).into_owned();
     assert!(status.status.success(), "status must exit 0");
     assert!(

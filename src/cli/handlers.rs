@@ -6,9 +6,9 @@
 //! runs CLI -> core rather than the inversion this module used to create.
 
 pub use crate::core::code::{
-    CodeFindResult, CodeInfoResult, handle_code_callers, handle_code_calls, handle_code_find,
-    handle_code_impact, handle_code_index, handle_code_info, handle_code_init, handle_code_parse,
-    handle_code_reindex, handle_code_search, handle_semantic_code_search, handle_symbol_search,
+    CodeFindResult, CodeInfoResult, handle_code_callers, handle_code_calls, handle_code_impact,
+    handle_code_index, handle_code_info, handle_code_init, handle_code_parse, handle_code_reindex,
+    handle_semantic_code_search, handle_symbol_lookup,
 };
 pub use crate::core::graph::{
     CollectionInfo, handle_collection_add, handle_collection_list, handle_collection_remove,
@@ -33,13 +33,12 @@ pub use crate::core::memory_sync::{
     load_memory_index, projection_drift, projection_file_and_row_counts, sync_memory_files,
 };
 pub use crate::core::ops::{
-    EmbedResult, EvalOptions, EvolutionHistoryEntry, ExperimentCreateResult, GetResult,
-    PruneSessionsSummary, TelemetryStatus, handle_current, handle_embed, handle_eval_judge,
-    handle_eval_recall, handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
-    handle_experiment_list, handle_experiment_status, handle_get, handle_history, handle_init,
-    handle_journal_import, handle_journal_import_all, handle_metrics_export,
-    handle_metrics_latency, handle_metrics_purge, handle_metrics_show, handle_metrics_status,
-    handle_prune_sessions, handle_search, handle_vsearch, parse_retention_secs,
+    EmbedResult, EvalOptions, EvolutionHistoryEntry, GetResult, PruneSessionsSummary,
+    TelemetryStatus, handle_current, handle_embed, handle_eval_judge, handle_eval_recall,
+    handle_get, handle_history, handle_init, handle_journal_import, handle_journal_import_all,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_purge, handle_metrics_show,
+    handle_metrics_status, handle_prune_sessions, handle_search, handle_vsearch,
+    parse_retention_secs,
 };
 pub use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
 pub use crate::core::sessions::handle_session_index;
@@ -251,10 +250,10 @@ mod tests {
     #[test]
     fn confirm_increments_and_reports_count() {
         let (_t, ctx) = confirm_test_ctx();
-        let r = handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
+        let r = handle_memory_confirm(&ctx, "c1", "confirmed", None).expect("confirm");
         assert_eq!(r.confirmations, 1);
         assert!(r.message.contains("Confirmed"));
-        let r2 = handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm2");
+        let r2 = handle_memory_confirm(&ctx, "c1", "confirmed", None).expect("confirm2");
         assert_eq!(r2.confirmations, 2, "double confirm accumulates");
     }
 
@@ -264,8 +263,8 @@ mod tests {
     #[test]
     fn confirm_refuted_reports_a_correction_not_a_lost_confirmation() {
         let (_t, ctx) = confirm_test_ctx();
-        handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
-        let r = handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
+        handle_memory_confirm(&ctx, "c1", "confirmed", None).expect("confirm");
+        let r = handle_memory_confirm(&ctx, "c1", "refuted", None).expect("refute");
         assert_eq!(r.confirmations, 1, "the confirmation history stands");
         assert_eq!(r.corrections, 1, "the refutation is what moved");
         assert!(r.message.contains("1 corrections"), "{}", r.message);
@@ -295,7 +294,7 @@ mod tests {
             false,
         )
         .expect("add");
-        handle_memory_confirm(&ctx, "d1", "refuted").expect("refute");
+        handle_memory_confirm(&ctx, "d1", "refuted", None).expect("refute");
 
         let hits = handle_memory_search(&ctx, "retry_backoff_ceiling", 5, None).expect("search");
         assert!(
@@ -322,8 +321,8 @@ mod tests {
         let (_t, ctx) = confirm_test_ctx();
         seed_confirm_prior_cluster(&ctx);
 
-        handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
-        handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
+        handle_memory_confirm(&ctx, "c1", "confirmed", None).expect("confirm");
+        handle_memory_confirm(&ctx, "c1", "refuted", None).expect("refute");
 
         let c = get_cluster(&ctx.conn, "clu-x").unwrap().expect("cluster");
         assert_eq!(c.confirmed_count, 1);
@@ -338,7 +337,8 @@ mod tests {
         seed_confirm_prior_cluster(&ctx);
         record_injection(&ctx.conn, "clu-x", "cli-session", 200).unwrap();
 
-        let result = handle_memory_confirm(&ctx, "clu-x", "misfired").expect("misfire verdict");
+        let result =
+            handle_memory_confirm(&ctx, "clu-x", "misfired", None).expect("misfire verdict");
         assert!(result.message.contains("misfired"));
         let cluster = get_cluster(&ctx.conn, "clu-x").unwrap().unwrap();
         assert_eq!((cluster.misfired_count, cluster.refuted_count), (1, 0));
@@ -347,14 +347,14 @@ mod tests {
     #[test]
     fn confirm_unknown_id_errors_cleanly() {
         let (_t, ctx) = confirm_test_ctx();
-        let err = handle_memory_confirm(&ctx, "ghost", "confirmed").expect_err("unknown id");
+        let err = handle_memory_confirm(&ctx, "ghost", "confirmed", None).expect_err("unknown id");
         assert!(err.to_string().contains("ghost"), "{err}");
     }
 
     #[test]
     fn confirm_invalid_outcome_rejected() {
         let (_t, ctx) = confirm_test_ctx();
-        let err = handle_memory_confirm(&ctx, "c1", "sideways").expect_err("bad outcome");
+        let err = handle_memory_confirm(&ctx, "c1", "sideways", None).expect_err("bad outcome");
         assert!(err.to_string().contains("outcome"), "{err}");
     }
 
@@ -2839,8 +2839,6 @@ mod tests {
         );
     }
 }
-
-// ==================== Experiment Handlers ====================
 
 // ============================================================================
 // Journal Import Handlers

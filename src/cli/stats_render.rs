@@ -1,4 +1,4 @@
-//! ASCII rendering primitives for `mdkb stats`.
+//! ASCII rendering primitives for `mdkb status`.
 //!
 //! All functions return `String` so callers can unit-test without a tty.
 

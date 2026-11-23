@@ -69,7 +69,7 @@ impl CachingParser {
     ///
     /// Every language parser needs the same four steps around its own walk:
     /// parse, give up quietly on source tree-sitter cannot read, allocate the
-    /// output, hand the root over. `mdkb dup` found that shape written out 42
+    /// output, hand the root over. `mdkb code dup` found that shape written out 42
     /// times across 13 parsers, so it lives here once instead.
     ///
     /// Giving up returns an empty `Vec` rather than an error: a file that does

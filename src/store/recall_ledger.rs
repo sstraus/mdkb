@@ -2,7 +2,7 @@
 //!
 //! One `recall_prompts` row per prompt that ran recall, one `recall_candidates`
 //! row per entry the search returned at or above the candidate floor — whether
-//! or not it was injected. Settlement at Stop fills `outcome`; `mdkb stats`
+//! or not it was injected. Settlement at Stop fills `outcome`; `mdkb status`
 //! aggregates it. Story 181-63ba.
 //!
 //! Privacy: no column holds prompt text. A prompt is known only by its

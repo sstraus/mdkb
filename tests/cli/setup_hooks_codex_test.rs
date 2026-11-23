@@ -330,3 +330,155 @@ fn codex_handlers_carry_a_label_and_reinstall_relabels_old_entries() {
         assert_eq!(label, format!("mdkb {cli_event}"), "{event_name}: label");
     }
 }
+
+/// Catches remove-then-append shifting trust-key positions after another tool
+/// adds a group. Exercise all events, first/middle/last positions and both hosts.
+#[test]
+fn setup_preserves_hook_positions_and_bytes_for_both_hosts() {
+    use mdkb::cli::setup::handle_setup_hooks_claude;
+
+    let (_guard, project, home) = isolated_project();
+    let mut failures = Vec::new();
+    for codex in [true, false] {
+        let setup = || {
+            if codex {
+                handle_setup_hooks_codex("", false).unwrap();
+            } else {
+                handle_setup_hooks_claude(project.path(), "local", "", false, None).unwrap();
+            }
+        };
+        let path = if codex {
+            codex_hooks_path(home.path())
+        } else {
+            project.path().join(".claude/settings.local.json")
+        };
+        setup();
+        let canonical = read_json(&path);
+        for position in 0..3 {
+            let mut seeded = canonical.clone();
+            for (event, ..) in HOOK_EVENTS {
+                let mut groups = vec![
+                    serde_json::json!({"hooks": [{"type": "command", "command": "echo first"}]}),
+                    serde_json::json!({"hooks": [{"type": "command", "command": "echo second"}]}),
+                ];
+                groups.insert(position, canonical["hooks"][*event][0].clone());
+                seeded["hooks"][*event] = serde_json::json!(groups);
+            }
+            let before = serde_json::to_vec_pretty(&seeded).unwrap();
+            fs::write(&path, &before).unwrap();
+            setup();
+            let after = read_json(&path);
+            for (event, ..) in HOOK_EVENTS {
+                if after["hooks"][*event] != seeded["hooks"][*event] {
+                    failures.push(format!(
+                        "codex={codex}, {event}, position={position}: moved or changed groups"
+                    ));
+                }
+            }
+            if fs::read(&path).unwrap() != before {
+                failures.push(format!("codex={codex}, position={position}: changed bytes"));
+            }
+            setup();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                serde_json::to_vec_pretty(&after).unwrap()
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Catches a binary-path update moving groups or changing fields other than
+/// command text. Uses the persisted output of each real host setup as the oracle.
+#[test]
+fn setup_binary_path_change_only_updates_commands_for_both_hosts() {
+    use mdkb::cli::setup::handle_setup_hooks_claude;
+
+    let (_guard, project, home) = isolated_project();
+    for codex in [true, false] {
+        let setup = || {
+            if codex {
+                handle_setup_hooks_codex("", false).unwrap();
+            } else {
+                handle_setup_hooks_claude(project.path(), "local", "", false, None).unwrap();
+            }
+        };
+        let path = if codex {
+            codex_hooks_path(home.path())
+        } else {
+            project.path().join(".claude/settings.local.json")
+        };
+        // SAFETY: isolated_project holds the shared environment lock.
+        unsafe { std::env::set_var("MDKB_BINARY_OVERRIDE", "/old/mdkb") };
+        setup();
+        let mut before = read_json(&path);
+        for (event, ..) in HOOK_EVENTS {
+            before["hooks"][*event].as_array_mut().unwrap().push(
+                serde_json::json!({"hooks": [{"type": "command", "command": "echo later tool"}]}),
+            );
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&before).unwrap()).unwrap();
+        unsafe { std::env::set_var("MDKB_BINARY_OVERRIDE", "/new/mdkb") };
+        setup();
+        let after = read_json(&path);
+        for (event, cli_event, _) in HOOK_EVENTS {
+            before["hooks"][*event][0]["hooks"][0]["command"] =
+                serde_json::json!(format!("'/new/mdkb' hook {cli_event}"));
+        }
+        assert_eq!(after, before, "codex={codex}: only command text changes");
+    }
+}
+
+/// Catches appending before existing groups or retaining duplicate legacy
+/// registrations. Missing installs append once; repair keeps the first slot.
+#[test]
+fn setup_appends_missing_and_deduplicates_in_place_for_all_events() {
+    let (_guard, _project, home) = isolated_project();
+    let path = codex_hooks_path(home.path());
+    handle_setup_hooks_codex("", false).unwrap();
+    let canonical = read_json(&path);
+    let foreign = serde_json::json!({"hooks": [{"type": "command", "command": "echo foreign"}]});
+    let mut seeded = canonical.clone();
+    for (event, ..) in HOOK_EVENTS {
+        seeded["hooks"][*event] = serde_json::json!([foreign.clone(), foreign.clone()]);
+    }
+    fs::write(&path, seeded.to_string()).unwrap();
+    handle_setup_hooks_codex("", false).unwrap();
+    let appended = read_json(&path);
+    for (event, ..) in HOOK_EVENTS {
+        assert_eq!(
+            appended["hooks"][*event],
+            serde_json::json!([
+                foreign.clone(),
+                foreign.clone(),
+                canonical["hooks"][*event][0].clone()
+            ]),
+            "{event}: append after unrelated groups"
+        );
+    }
+    let bytes = fs::read(&path).unwrap();
+    handle_setup_hooks_codex("", false).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes, "append only once");
+
+    for (event, cli_event, _) in HOOK_EVENTS {
+        seeded["hooks"][*event] = serde_json::json!([
+            foreign.clone(),
+            {"hooks": [{"type": "command", "command": format!("mdkb hook {cli_event}")}]},
+            foreign.clone(), canonical["hooks"][*event][0].clone()
+        ]);
+    }
+    fs::write(&path, seeded.to_string()).unwrap();
+    handle_setup_hooks_codex("", false).unwrap();
+    let repaired = read_json(&path);
+    for (event, ..) in HOOK_EVENTS {
+        assert_eq!(
+            repaired["hooks"][*event],
+            serde_json::json!([
+                foreign.clone(),
+                canonical["hooks"][*event][0].clone(),
+                foreign.clone()
+            ]),
+            "{event}: replace first legacy registration and remove later duplicate"
+        );
+    }
+}

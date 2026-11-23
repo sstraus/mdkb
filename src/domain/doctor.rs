@@ -37,6 +37,9 @@ pub struct Quarantine {
 /// Everything the checks read. `None` means "not collected".
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
+    pub embedding_problem: Option<String>,
+    /// A non-ambiguous transition that a daemon can recover automatically.
+    pub embedding_auto_recovery: bool,
     pub hooks_missing: Vec<String>,
     pub hooks_duplicated: Vec<String>,
     /// The command that registers the missing events in the scope that already
@@ -46,9 +49,13 @@ pub struct Facts {
     pub hooks_duplicated_fix: Option<String>,
     /// Why `.mdkb/config.toml` does not load.
     pub config_error: Option<String>,
+    /// Dotted keys in `.mdkb/config.toml` that nothing reads any more.
+    pub unknown_config_keys: Vec<String>,
     /// Why the enabled code index cannot serve supported source files.
     pub code_index_problem: Option<String>,
     pub quarantine: Vec<Quarantine>,
+    /// Evolution cycles written before the write path refused them, one chain each.
+    pub evolution_cycles: Vec<String>,
     pub doc_count: i64,
     /// `(entry files, active rows)` of the memory projection.
     pub projection: Option<(usize, usize)>,
@@ -62,6 +69,9 @@ pub struct Facts {
     pub distiller_program: Option<String>,
     /// The live distiller probe's error, when it ran and failed (`--full`).
     pub distiller_failure: Option<String>,
+    /// What the live probe said when it ran (`--full`): not configured, or the
+    /// lesson it distilled. Printed by `mdkb doctor --full`; judges nothing.
+    pub distiller_note: Option<String>,
 }
 
 /// Prompts a week must see before a silent shadow counts as broken.
@@ -113,6 +123,24 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
             ),
         );
     }
+    if let Some(problem) = &facts.embedding_problem {
+        let (severity, message, fix) = if facts.embedding_auto_recovery {
+            (
+                Severity::Warning,
+                format!(
+                    "{problem}; automatic re-embedding runs when the daemon opens this store; use lexical search meanwhile"
+                ),
+                None,
+            )
+        } else {
+            (
+                Severity::Error,
+                problem.clone(),
+                Some("mdkb update --reembed"),
+            )
+        };
+        push("embedding.identity", severity, message, fix);
+    }
     if let Some(error) = &facts.config_error {
         push(
             "config.invalid",
@@ -123,12 +151,29 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
             None,
         );
     }
+    if !facts.unknown_config_keys.is_empty() {
+        let keys = &facts.unknown_config_keys;
+        let list = keys
+            .iter()
+            .map(|k| format!("`{k}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        push(
+            "config.unknown_keys",
+            Severity::Warning,
+            format!(".mdkb/config.toml sets keys nothing reads (obsolete or misspelled): {list}"),
+            Some(&format!(
+                "delete these keys from .mdkb/config.toml: {}",
+                keys.join(", ")
+            )),
+        );
+    }
     if let Some(problem) = &facts.code_index_problem {
         push(
             "code.index",
             Severity::Error,
             problem.clone(),
-            Some("mdkb code index"),
+            Some("mdkb update --code"),
         );
     }
     if let Some(failure) = &facts.distiller_failure {
@@ -136,7 +181,7 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
             "priors.distiller_failed",
             Severity::Error,
             format!("the prior distiller ran and failed: {failure}"),
-            Some("mdkb setup check"),
+            Some("mdkb doctor --full"),
         );
     }
     for q in &facts.quarantine {
@@ -148,6 +193,16 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
                 q.date, q.memory_entries_salvaged, q.file
             ),
             (facts.doc_count == 0).then_some("mdkb update"),
+        );
+    }
+    for chain in &facts.evolution_cycles {
+        push(
+            "evolution.cycle",
+            Severity::Error,
+            format!("evolution cycle hides every member from default search: {chain}"),
+            Some(
+                "mdkb evolve history <doc> lists the edge ids; mdkb evolve unlink <id> breaks the cycle",
+            ),
         );
     }
     if let Some((files, rows)) = facts.projection
@@ -268,6 +323,26 @@ mod tests {
             "{}",
             f.message
         );
+    }
+
+    #[test]
+    fn obsolete_config_keys_are_listed_with_the_exact_keys_to_delete() {
+        // Catches: a removed knob (search.rrf_k) silently ignored forever, with
+        // no place the user can learn which lines to delete.
+        let f = one(
+            &Facts {
+                unknown_config_keys: vec!["search.rrf_k".into(), "memory.enabled".into()],
+                ..Facts::default()
+            },
+            "config.unknown_keys",
+        );
+        assert_eq!(f.severity, Severity::Warning);
+        assert!(f.message.contains("`search.rrf_k`") && f.message.contains("`memory.enabled`"));
+        assert_eq!(
+            f.fix.as_deref(),
+            Some("delete these keys from .mdkb/config.toml: search.rrf_k, memory.enabled")
+        );
+        assert!(!ids(&Facts::default()).contains(&"config.unknown_keys"));
     }
 
     #[test]

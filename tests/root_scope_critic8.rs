@@ -20,6 +20,7 @@ fn plain(path: &Path) -> PathBuf {
 fn live(parent: &Path, name: &str) -> PathBuf {
     let path = parent.join(name);
     std::fs::create_dir_all(path.join(".mdkb")).unwrap();
+    std::fs::write(path.join(".mdkb/index.sqlite"), b"").unwrap();
     plain(&path)
 }
 

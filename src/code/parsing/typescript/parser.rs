@@ -1226,6 +1226,22 @@ impl TypeScriptParser {
             }
         }
 
+        // Only opening nodes count: a paired element also has a closing node.
+        if matches!(
+            node.kind(),
+            "jsx_self_closing_element" | "jsx_opening_element"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                let target = &code[name.byte_range()];
+                // Lowercase bare names are intrinsic elements, not components.
+                if (target.starts_with(char::is_uppercase) || target.contains('.'))
+                    && let Some(ctx) = fn_ctx
+                {
+                    calls.push(Call::bare(ctx, target, node_range(*node)));
+                }
+            }
+        }
+
         for child in node.children(&mut node.walk()) {
             Self::extract_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
         }
@@ -2005,6 +2021,35 @@ function boot() {
             calls.contains(&("boot", "run")),
             "the call inside the arrow must still be there, got {calls:?}"
         );
+    }
+
+    #[test]
+    fn tsx_component_jsx_use_is_a_caller() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = r#"
+function Page() { return <Dropdown />; }
+const Panel = () => <Dropdown><span>child</span></Dropdown>;
+const Menu = () => <UI.Dropdown />;
+const root = <Dropdown />;
+"#;
+        let calls: Vec<_> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|call| (call.caller, call.target))
+            .collect();
+        for expected in [
+            ("Page", "Dropdown"),
+            ("Panel", "Dropdown"),
+            ("Menu", "UI.Dropdown"),
+            ("<module>", "Dropdown"),
+        ] {
+            assert_eq!(
+                calls.iter().filter(|call| **call == expected).count(),
+                1,
+                "missing or duplicate JSX caller {expected:?}: {calls:?}"
+            );
+        }
+        assert!(!calls.iter().any(|(_, target)| *target == "span"));
     }
 
     #[test]

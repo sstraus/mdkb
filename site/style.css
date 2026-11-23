@@ -431,7 +431,7 @@ svg .dot-b {
 /* === Cards === */
 .cards {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 22px;
 }
 .card {
@@ -503,6 +503,9 @@ footer nav {
   .cards,
   .start {
     grid-template-columns: 1fr;
+  }
+  .cards {
+    grid-template-columns: minmax(0, 1fr);
   }
   .steps {
     grid-template-columns: 1fr 1fr;

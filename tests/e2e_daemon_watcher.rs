@@ -904,7 +904,7 @@ async fn stats_reports_a_fresh_code_index_after_an_editing_session() {
         *guard = None;
     }
 
-    let out = cli::run(&["stats"], &root);
+    let out = cli::run(&["status"], &root);
     assert!(
         out.status.success(),
         "mdkb stats failed: {}",

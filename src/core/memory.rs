@@ -60,7 +60,7 @@ pub struct WriteMemoryInput<'a> {
     pub triggers: Option<&'a [crate::store::priors::TriggerMatcher]>,
     pub ttl: Option<u64>,
     pub due_in: Option<u64>,
-    pub embedding: Option<&'a [f32]>,
+    pub embedding: Option<&'a crate::llm::embeddings::Vector>,
     /// Embed the text here when `embedding` is `None` and a model is warm.
     ///
     /// Callers that have already decided not to touch the model — a store with
@@ -80,7 +80,7 @@ pub struct WriteMemoryInput<'a> {
 pub struct ImportCheck {
     /// The vector computed for the candidate, to persist after the insert.
     /// `None` when the store does not embed on write or the model is cold.
-    pub embedding: Option<Vec<f32>>,
+    pub embedding: Option<crate::llm::embeddings::Vector>,
     /// What the candidate repeats, when it repeats something.
     pub duplicate: Option<memory::Duplicate>,
 }
@@ -97,9 +97,10 @@ pub fn check_import(
     embed: bool,
 ) -> Result<ImportCheck> {
     let embedding = embed
-        .then(|| embed_for_write(&entry.title, &entry.content))
+        .then(|| embed_for_write(conn, &entry.title, &entry.content))
         .flatten();
-    let duplicate = memory::find_duplicate(conn, &entry.id, &entry.title, embedding.as_deref())?;
+    let duplicate =
+        memory::find_duplicate_labelled(conn, &entry.id, &entry.title, embedding.as_ref())?;
     Ok(ImportCheck {
         embedding,
         duplicate,
@@ -116,10 +117,16 @@ pub fn auto_embed_memory(ctx: &Context) -> bool {
 
 /// Embed `"{title} {content}"` with the process-wide model, or `None` when it
 /// is cold. The one place the write paths turn text into a vector.
-pub fn embed_for_write(title: &str, content: &str) -> Option<Vec<f32>> {
-    crate::llm::get_cached_service()
+pub fn embed_for_write(
+    conn: &rusqlite::Connection,
+    title: &str,
+    content: &str,
+) -> Option<crate::llm::embeddings::Vector> {
+    let model = crate::store::vectors::selected_model(conn).ok()?;
+    crate::store::vectors::require_model(conn, model.identity(), false).ok()?;
+    crate::llm::service_for(model, false)
         .ok()
-        .and_then(|service| service.embed_query(&format!("{title} {content}")).ok())
+        .and_then(|service| service.query(&format!("{title} {content}")).ok())
 }
 
 /// Create or update one memory row, including revisions, edges, provenance and
@@ -197,13 +204,13 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     // not depend on which door the entry came through. The caller's own
     // embedding wins when it has one: it was built from the same text.
     let self_embedded = (input.embedding.is_none() && input.embed_when_missing && is_new)
-        .then(|| embed_for_write(input.title, input.content))
+        .then(|| embed_for_write(conn, input.title, input.content))
         .flatten();
-    let embedding = input.embedding.or(self_embedded.as_deref());
+    let embedding = input.embedding.or(self_embedded.as_ref());
 
     let mut contradicts_target = None;
     let duplicate = if is_new {
-        memory::find_duplicate(conn, input.id, input.title, embedding)?
+        memory::find_duplicate_labelled(conn, input.id, input.title, embedding)?
     } else {
         None
     };
@@ -213,14 +220,16 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     // one question it was asked with the one answer that is wrong. Nothing
     // above this point writes — `embed_for_write` only computes.
     if input.dry_run {
+        // A preview of a refused write fails the same way the write does, so a
+        // caller that reads only the exit status sees the refusal.
+        if let Some(dup) = &duplicate
+            && input.on_conflict != Some("contradicts")
+        {
+            return Err(ErrorKind::DuplicateEntry(format!("dry-run: {}", dup.message())).into());
+        }
         return Ok(match (&duplicate, existing.is_some()) {
-            (Some(dup), _) if input.on_conflict == Some("contradicts") => format!(
-                "dry-run: would create memory entry '{}' as contradicting '{}'",
-                input.id,
-                dup.existing().id
-            ),
             (Some(dup), _) => format!(
-                "dry-run: would fail: '{}' duplicates '{}'",
+                "dry-run: would create memory entry '{}' as contradicting '{}'",
                 input.id,
                 dup.existing().id
             ),
@@ -328,7 +337,7 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
                 conn,
                 rowid,
                 embedding,
-                crate::llm::embeddings::MODEL_NAME,
+                embedding.model.identity(),
             ) {
                 if error.is_index_corrupt() {
                     return Err(error);
@@ -340,7 +349,11 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
             }
             if is_new {
                 output.push_str(&memory::find_similar_entries(
-                    conn, embedding, rowid, input.id,
+                    conn,
+                    embedding,
+                    embedding.model,
+                    rowid,
+                    input.id,
                 )?);
             }
         }
@@ -457,12 +470,17 @@ pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>
 /// confirm loop is reachable on every transport (this is what the UPS recall
 /// nudge points at). Confirmations live in the DB (source of truth for the
 /// confidence signal); the markdown projection is refreshed on the next write.
-pub fn handle_memory_confirm(ctx: &Context, id: &str, outcome: &str) -> Result<ConfirmResult> {
+pub fn handle_memory_confirm(
+    ctx: &Context,
+    id: &str,
+    outcome: &str,
+    session: Option<&str>,
+) -> Result<ConfirmResult> {
     if let Some(message) = crate::store::priors::record_model_verdict(
         &ctx.conn,
         id,
         outcome,
-        None,
+        session,
         chrono::Utc::now().timestamp(),
     )? {
         let cluster = crate::store::priors::get_cluster(&ctx.conn, id)?
@@ -522,7 +540,7 @@ pub fn handle_memory_link(
     // An existence check is not a read of the entry: `memory link` must not
     // move the access counters that rank memory search.
     if memory::get_entry_without_tracking(&ctx.conn, id)?.is_none() {
-        return Err(ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")).into());
+        return Err(ErrorKind::MemoryNotFound { id: id.to_string() }.into());
     }
 
     let kind = if doc {
@@ -544,12 +562,17 @@ pub fn handle_memory_list(
     limit: usize,
     status: Option<&str>,
 ) -> Result<Vec<MemoryEntry>> {
-    let status_filter = status
-        .map(|s| {
-            s.parse::<EntryStatus>()
-                .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))
-        })
-        .transpose()?;
+    // Default to the live set, as MCP `memory_list` does; `all` lifts the filter.
+    let status_filter = match status {
+        None => Some(EntryStatus::Active),
+        Some("all") => None,
+        Some(s) => Some(s.parse::<EntryStatus>().map_err(|e: String| {
+            Error::from(ErrorKind::InvalidEntryField {
+                field: "status".into(),
+                message: format!("{e}; use active, superseded, archived or all"),
+            })
+        })?),
+    };
 
     memory::list_entries(&ctx.conn, limit, status_filter)
 }
@@ -571,19 +594,21 @@ pub fn handle_memory_search(
     limit: usize,
     entry_type: Option<&str>,
 ) -> Result<Vec<MemoryEntry>> {
-    let query_embedding = match crate::llm::get_cached_service().and_then(|s| s.embed_query(query))
-    {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::debug!("Memory search falling back to BM25-only: {e}");
-            None
-        }
-    };
+    let query_embedding =
+        match crate::llm::service_for(crate::store::vectors::selected_model(&ctx.conn)?, false)
+            .and_then(|s| s.query(query))
+        {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!("Memory search falling back to BM25-only: {e}");
+                None
+            }
+        };
     let cfg = crate::config::Config::load_or_default(&ctx.config_path);
-    let scored = memory::search_entries_recall(
+    let scored = memory::search_entries_recall_labelled(
         &ctx.conn,
         query,
-        query_embedding.as_deref(),
+        query_embedding.as_ref(),
         limit,
         entry_type,
         &cfg.search.memory,
@@ -690,7 +715,7 @@ pub fn handle_memory_export(
 /// two to drift.
 fn insert_imported_batch(
     ctx: &Context,
-    entries: &[(MemoryEntry, Option<Vec<f32>>)],
+    entries: &[(MemoryEntry, Option<crate::llm::embeddings::Vector>)],
     result: &mut ImportResult,
 ) -> Result<()> {
     if entries.is_empty() {
@@ -711,7 +736,7 @@ fn insert_imported_batch(
         // Store the vector the dedup check already paid for. A cold model left
         // it `None`, and `mdkb update`'s backfill picks the entry up later.
         if let Some(embedding) = embedding
-            && let Err(e) = memory::store_entry_embedding(&ctx.conn, &entry.id, embedding)
+            && let Err(e) = memory::store_entry_embedding_labelled(&ctx.conn, &entry.id, embedding)
         {
             tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
         }
@@ -759,7 +784,8 @@ pub fn handle_memory_import_dir(
     // Phase 1: read, parse, validate, and check duplicates — no DB writes.
     // A dry run never touches the model, so it dedups on the title alone.
     let embed = !dry_run && auto_embed_memory(ctx);
-    let mut entries_to_insert: Vec<(MemoryEntry, Option<Vec<f32>>)> = Vec::new();
+    let mut entries_to_insert: Vec<(MemoryEntry, Option<crate::llm::embeddings::Vector>)> =
+        Vec::new();
     for path in &paths {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -912,7 +938,7 @@ pub fn handle_memory_import_file(ctx: &Context, path: &Path) -> Result<()> {
     // Store the vector the check already paid for; a cold model leaves the
     // entry pending and `mdkb update`'s backfill picks it up with no manual step.
     if let Some(embedding) = check.embedding
-        && let Err(e) = memory::store_entry_embedding(&ctx.conn, &id, &embedding)
+        && let Err(e) = memory::store_entry_embedding_labelled(&ctx.conn, &id, &embedding)
     {
         tracing::warn!("imported entry {id}: embedding deferred to `mdkb update`: {e}");
     }
@@ -952,7 +978,8 @@ pub fn handle_memory_import(
     // Phase 1: parse, validate, and check duplicates — no DB writes.
     // A dry run never touches the model, so it dedups on the title alone.
     let embed = !dry_run && auto_embed_memory(ctx);
-    let mut entries_to_insert: Vec<(MemoryEntry, Option<Vec<f32>>)> = Vec::new();
+    let mut entries_to_insert: Vec<(MemoryEntry, Option<crate::llm::embeddings::Vector>)> =
+        Vec::new();
     for raw in &import_file.entries {
         // Parse entry_type
         let entry_type: EntryType = match raw.entry_type.parse() {

@@ -35,8 +35,13 @@ fn unknown_subcommand_lists_the_valid_subcommands() {
         "`memory nosuchthing` must fail:\n{text}"
     );
     assert!(
-        text.contains("unrecognized subcommand 'nosuchthing'"),
+        text.contains("unknown command 'nosuchthing' in 'mdkb memory'"),
         "the error must still name the offending subcommand:\n{text}"
+    );
+    assert_eq!(out.status.code(), Some(2), "a usage error exits 2:\n{text}");
+    assert!(
+        text.trim_end().ends_with("Run: mdkb memory --help"),
+        "no close name, so the error points at the group's help:\n{text}"
     );
     for name in ["add", "show", "list", "search", "rm", "audit"] {
         assert!(
@@ -71,8 +76,7 @@ fn unknown_subcommand_list_is_scoped_to_the_nested_command() {
     );
 }
 
-/// The existing did-you-mean tip for a near-miss typo must still appear
-/// alongside the new list.
+/// A near-miss typo names the closest command and the command line that works.
 #[test]
 fn near_miss_typo_still_gets_the_did_you_mean_tip() {
     let dir = tempfile::tempdir().unwrap();
@@ -81,13 +85,13 @@ fn near_miss_typo_still_gets_the_did_you_mean_tip() {
 
     assert!(!out.status.success(), "`memory lst` must fail:\n{text}");
     assert!(
-        text.contains("tip:") && text.contains("list"),
-        "a near-miss typo must still get a did-you-mean tip:\n{text}"
+        text.contains("use `mdkb memory list`")
+            && text.trim_end().ends_with("Run: mdkb memory list"),
+        "a near-miss typo must name the nearest command:\n{text}"
     );
 }
 
-/// A missing required argument is a different error kind and must be
-/// unaffected by the subcommand-list augmentation.
+/// A missing required argument is named, without a subcommand list.
 #[test]
 fn missing_argument_error_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
@@ -99,11 +103,11 @@ fn missing_argument_error_is_unchanged() {
         "`memory show` with no ID must fail:\n{text}"
     );
     assert!(
-        text.contains("the following required arguments were not provided"),
+        text.contains("missing required argument <ID>"),
         "a missing argument must still be named by hand:\n{text}"
     );
     assert!(
-        !text.contains("valid subcommand"),
+        !text.contains("commands:"),
         "a missing-argument error must not gain a subcommand list:\n{text}"
     );
 }

@@ -41,3 +41,9 @@ rustflags = ["-C", "target-cpu=generic"]
 # ARM64 macOS: native features (required for ring crate on Apple Silicon)
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
+
+# Tests and `cargo run` ignore ~/.mdkb/daemon.toml for the embedding model
+# (src/config.rs IGNORE_DAEMON_TOML_ENV): a developer machine that moved every
+# repository to one model must not change what the suite tests.
+[env]
+MDKB_IGNORE_DAEMON_TOML = "1"

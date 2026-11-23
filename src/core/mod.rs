@@ -107,9 +107,17 @@ pub fn run_mutation<T>(
     )
 }
 
-/// A mutation that keeps the store slot longer than this is named in the log:
-/// every hook read that cannot bypass the slot waits that long (#209-bc4b).
-const SLOT_HOLD_WARN: std::time::Duration = std::time::Duration::from_millis(100);
+/// A slot hold at or above this is logged at WARN; shorter holds go to DEBUG.
+/// Routine warm opens and hook reads hold the slot for 100 ms to a second, and
+/// at the old 100 ms threshold they wrote 27k warnings in 15 days (#064-3c58).
+/// One second is the point where a hook read that cannot bypass the slot waits
+/// long enough to matter (#209-bc4b). Documented in `docs/hooks.md`.
+pub(crate) const SLOT_HOLD_WARN: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Whether a hold of this length is worth a WARN line.
+pub(crate) fn slot_hold_is_warning(held: std::time::Duration) -> bool {
+    held >= SLOT_HOLD_WARN
+}
 
 /// Measures how long a mutation holds the store slot and logs it on drop, so
 /// the holders and their worst hold times come from the live daemon's log
@@ -142,7 +150,7 @@ impl Drop for SlotHold {
     fn drop(&mut self) {
         let held = self.since.elapsed();
         let held_ms = held.as_millis() as u64;
-        if held >= SLOT_HOLD_WARN {
+        if slot_hold_is_warning(held) {
             tracing::warn!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
         } else {
             tracing::debug!(operation = %self.what, repo = %self.repo, held_ms, "slot held");
@@ -157,23 +165,28 @@ pub fn run_mutation_verify_after_release<T>(
     f: impl FnOnce(&mut Context) -> Result<T>,
     verify: impl FnOnce(&Path) -> Result<()>,
 ) -> Option<Result<T>> {
-    let (db_path, generation, mut result) = {
-        let mut guard = slot.blocking_lock();
-        let mut hold = SlotHold::start(what);
+    let (db_path, generation, mut result) = loop {
         let (db_path, generation) = {
+            let guard = slot.blocking_lock();
             let ctx = guard.as_ref()?;
-            hold.in_repo(&ctx.root);
             (ctx.db_path.clone(), ctx.generation)
         };
-        let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+        let writer = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
             Ok(guard) => guard,
             Err(error) => return Some(Err(error)),
         };
-        // A crash during the mutation must not leave a pre-write health marker
-        // capable of suppressing recovery on the next open.
+        let mut guard = slot.blocking_lock();
+        let ctx = guard.as_mut()?;
+        if ctx.db_path != db_path || ctx.generation != generation {
+            drop(guard);
+            drop(writer);
+            continue;
+        }
+        let mut hold = SlotHold::start(what);
+        hold.in_repo(&ctx.root);
         crate::store::heal::invalidate_marker(&db_path);
-        let result = f(guard.as_mut().expect("slot was checked above"));
-        (db_path, generation, result)
+        let result = f(ctx);
+        break (db_path, generation, result);
     };
     if let Err(error) = verify(&db_path) {
         result = Err(error);
@@ -213,25 +226,6 @@ pub(crate) fn close_over_corruption(slot: &mut Option<Context>) {
     }
 }
 
-/// Run a small write under universal writer admission and close a long-lived
-/// context immediately when SQLite reports structural corruption.
-///
-/// Telemetry uses this path: a full-file `quick_check` after every hook would be
-/// disproportionate, but silently swallowing `SQLITE_CORRUPT` keeps the live
-/// lock held forever and prevents autoheal.
-pub fn run_guarded_write<T>(
-    slot: &mut Option<Context>,
-    what: &str,
-    f: impl FnOnce(&Context) -> Result<T>,
-) -> Option<Result<T>> {
-    let db_path = slot.as_ref()?.db_path.clone();
-    let writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
-        Ok(guard) => guard,
-        Err(error) => return Some(Err(error)),
-    };
-    run_admitted_write(slot, what, &writer_guard, f)
-}
-
 /// Run one small write under an existing writer admission for this store.
 ///
 /// Queued telemetry shares admission across a batch, but each row still
@@ -257,6 +251,18 @@ pub(crate) fn run_admitted_write<T>(
         close_over_corruption(slot);
     }
     Some(result)
+}
+
+/// [`run_guarded_read`] inside one read snapshot, so its semantic reads share one
+/// embedding identity probe ([`crate::store::vectors::with_read_snapshot`]).
+pub fn run_guarded_snapshot_read<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    f: impl FnOnce(&Context) -> Result<T>,
+) -> Option<Result<T>> {
+    run_guarded_read(slot, what, |ctx| {
+        crate::store::vectors::with_read_snapshot(&ctx.conn, || f(ctx))
+    })
 }
 
 /// Run a read and release a corrupt long-lived context when SQLite reports the
@@ -335,6 +341,14 @@ impl Context {
 
     fn open_impl(root: &Path, writer_admitted: bool, trust_process_probe: bool) -> Result<Self> {
         let mdkb_dir = namespace::store_dir(root)?;
+        // Admission creates the sidecar directory before a cold open. Keep
+        // that preparation from bypassing the ordinary first-store layout.
+        if writer_admitted
+            && !mdkb_dir.join("index.sqlite").exists()
+            && !mdkb_dir.join("config.toml").exists()
+        {
+            return Self::init_writer_admitted(root);
+        }
 
         if namespace::active()?.is_some() {
             // A namespace is created by its first write: nobody runs `init`
@@ -464,7 +478,6 @@ impl Context {
         // and query_events work on every transport, including the daemon-less
         // in-process CLI hook path (previously only the MCP server created them).
         crate::store::stats::init_stats_schema(&conn)?;
-        crate::store::stats::init_experiments_schema(&conn)?;
 
         // memory_entries/memory_edges live ONLY in this DB — salvage them out of
         // the quarantined file into the fresh schema before it takes over, and
@@ -636,7 +649,14 @@ impl Context {
 
     /// Initialize a new mdkb directory.
     pub fn init(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
+        Self::init_impl(root.as_ref(), false)
+    }
+
+    pub(crate) fn init_writer_admitted(root: &Path) -> Result<Self> {
+        Self::init_impl(root, true)
+    }
+
+    fn init_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
         let mdkb_dir = namespace::store_dir(root)?;
         ensure_store_layout(&mdkb_dir)?;
 
@@ -651,7 +671,14 @@ impl Context {
         })?;
         let config_path = mdkb_dir.join("config.toml");
         let db_path = mdkb_dir.join("index.sqlite");
-        let _writer_guard = crate::store::mutation_lock::acquire_writer(&db_path, "init-schema")?;
+        let _writer_guard = if writer_admitted {
+            None
+        } else {
+            Some(crate::store::mutation_lock::acquire_writer(
+                &db_path,
+                "init-schema",
+            )?)
+        };
         let _init_guard = crate::store::mutation_lock::acquire(&db_path, "init-schema")?;
 
         // Write the defaults commented out, so they stay discoverable without
@@ -668,7 +695,6 @@ impl Context {
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
         crate::store::stats::init_stats_schema(&conn)?;
-        crate::store::stats::init_experiments_schema(&conn)?;
 
         Ok(Self {
             conn,
@@ -743,11 +769,13 @@ pub(crate) fn ensure_store_gitignore(memory_dir: &Path) -> Result<()> {
 pub mod cli_mutation;
 pub mod code;
 pub mod coupling;
+pub mod coupling_docs;
 pub mod dup;
 pub mod graph;
 pub mod indexing;
 pub mod memory;
 pub mod memory_audit;
+mod memory_audit_symbols;
 pub mod memory_sync;
 pub mod ops;
 pub mod refresh;
@@ -792,7 +820,8 @@ mod close_over_corruption_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
-        run_guarded_write(&mut slot, "test write", |ctx| -> Result<()> {
+        let admission = crate::store::mutation_lock::acquire_writer(&db_path, "test").unwrap();
+        run_admitted_write(&mut slot, "test write", &admission, |ctx| -> Result<()> {
             Err(corrupt_error(ctx))
         });
         assert!(slot.is_none() && !heal::has_process_probe(&db_path));
@@ -810,13 +839,16 @@ mod close_over_corruption_tests {
     /// (invalidate_marker forgets), which would leave the daemon's reopen
     /// re-scanning after all; and a FAILED write keeping it.
     #[test]
-    fn a_successful_guarded_write_keeps_the_probe_and_a_failed_one_drops_it() {
+    fn a_successful_admitted_write_keeps_the_probe_and_a_failed_one_drops_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
-        run_guarded_write(&mut slot, "ok write", |_| -> Result<()> { Ok(()) });
+        let admission = crate::store::mutation_lock::acquire_writer(&db_path, "test").unwrap();
+        run_admitted_write(&mut slot, "ok write", &admission, |_| -> Result<()> {
+            Ok(())
+        });
         assert!(heal::has_process_probe(&db_path));
-        run_guarded_write(&mut slot, "failed write", |_| -> Result<()> {
+        run_admitted_write(&mut slot, "failed write", &admission, |_| -> Result<()> {
             Err(Error::other("disk full"))
         });
         assert!(slot.is_some() && !heal::has_process_probe(&db_path));
@@ -827,7 +859,7 @@ mod close_over_corruption_tests {
     /// invalidation for every row after the first of a shared admission, or
     /// keeping the process probe across a corrupt row.
     #[test]
-    fn critic_r6_admitted_rows_each_invalidate_the_marker_under_one_admission() {
+    fn admitted_rows_each_invalidate_the_marker_under_one_admission() {
         let dir = tempfile::tempdir().unwrap();
         let mut slot = Some(probed_slot(dir.path()));
         let db_path = slot.as_ref().unwrap().db_path.clone();
@@ -919,6 +951,128 @@ mod verify_after_release_tests {
         assert!(!crate::store::heal::has_process_probe(&db_path));
     }
 
+    // After admission, a same-path replacement must force retry before mutation.
+    // A corrupt verdict for the replacement actually mutated must close it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn replacement_during_writer_admission_closes_the_generation_actually_mutated() {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = Context::init(dir.path()).unwrap();
+        let db_path = first.db_path.clone();
+        let replacement = Context::open(dir.path()).unwrap();
+        assert_eq!(replacement.db_path, db_path);
+        assert_ne!(replacement.generation, first.generation);
+        let replacement_generation = replacement.generation;
+        let slot = Arc::new(tokio::sync::Mutex::new(Some(first)));
+        let writer = crate::store::mutation_lock::acquire_writer(&db_path, "test blocker").unwrap();
+        let metadata =
+            std::fs::metadata(crate::store::mutation_lock::writer_lock_path(&db_path)).unwrap();
+        let identity = (
+            libc::major(metadata.dev() as libc::dev_t),
+            libc::minor(metadata.dev() as libc::dev_t),
+            metadata.ino(),
+        );
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_slot = Arc::clone(&slot);
+        let worker_db = db_path.clone();
+        let worker = std::thread::spawn(move || {
+            let mut mutated_generation = None;
+            let mut verified = false;
+            let outcome = run_mutation_verify_after_release(
+                &worker_slot,
+                "generation replacement",
+                |ctx| {
+                    mutated_generation = Some(ctx.generation);
+                    ctx.conn.execute_batch(
+                        "CREATE TABLE admission_generation_effect(value INTEGER);
+                         INSERT INTO admission_generation_effect VALUES(1);",
+                    )?;
+                    Ok(())
+                },
+                |path| {
+                    assert_eq!(path, worker_db.as_path());
+                    verified = true;
+                    // Typed probe input, not a claim of physical file corruption.
+                    Err(ErrorKind::IndexCorrupt {
+                        path: path.to_path_buf(),
+                    }
+                    .into())
+                },
+            );
+            let _ = result_tx.send((outcome, mutated_generation, verified));
+        });
+        // Real blocked FLOCK record measured on Linux run20261115T230040Z-65760.
+        // /proc/locks reports process PID, not TID. This fixture's private inode
+        // identifies its only waiter, which already snapshotted the first ctx.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let records = std::fs::read_to_string("/proc/locks").expect("read kernel lock records");
+            let blocked = records.lines().any(|record| {
+                let fields: Vec<_> = record.split_whitespace().collect();
+                let [_, "->", "FLOCK", "ADVISORY", "WRITE", pid, key, ..] = fields.as_slice()
+                else {
+                    return false;
+                };
+                let mut parts = key.split(':');
+                let major = parts
+                    .next()
+                    .and_then(|value| u32::from_str_radix(value, 16).ok());
+                let minor = parts
+                    .next()
+                    .and_then(|value| u32::from_str_radix(value, 16).ok());
+                let inode = parts.next().and_then(|value| value.parse::<u64>().ok());
+                pid.parse::<u32>().ok() == Some(std::process::id())
+                    && major == Some(identity.0)
+                    && minor == Some(identity.1)
+                    && inode == Some(identity.2)
+                    && parts.next().is_none()
+            });
+            if blocked {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mutator never blocked on the fixture's writer-lock inode {identity:?}"
+            );
+            std::thread::yield_now();
+        }
+        let previous = slot
+            .try_lock()
+            .expect("writer admission waiter must release the serving slot before waiting")
+            .replace(replacement)
+            .unwrap();
+        drop(previous);
+        drop(writer);
+        // Inverted revalidation can loop forever: fail here, not at the runner's
+        // whole-process timeout. No join is attempted until a result arrives.
+        let (outcome, mutated_generation, verified) = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("mutation must finish after writer release and generation revalidation");
+        worker.join().unwrap();
+        assert_eq!(mutated_generation, Some(replacement_generation));
+        assert!(verified);
+        assert!(matches!(outcome, Some(Err(ref e)) if e.is_index_corrupt()));
+        let conn =
+            Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let writes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM admission_generation_effect",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(writes, 1);
+        assert!(
+            slot.try_lock().unwrap().is_none(),
+            "corruption verdict left the generation actually mutated in the slot"
+        );
+    }
+
     /// Catches: an empty slot (nothing opened yet) reported as a finished
     /// mutation, or probed.
     #[test]
@@ -937,3 +1091,21 @@ mod verify_after_release_tests {
 pub mod search_contract;
 pub mod source_search;
 pub mod text_search;
+
+#[cfg(test)]
+mod slot_hold_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn routine_slot_holds_stay_below_warn_and_only_long_ones_warn() {
+        // Catches: every warm open and hook read (100 ms and up) logged at WARN,
+        // which filled daemon.log with 27k lines in 15 days (#064-3c58).
+        assert!(!slot_hold_is_warning(Duration::from_millis(223)));
+        assert!(!slot_hold_is_warning(
+            SLOT_HOLD_WARN - Duration::from_millis(1)
+        ));
+        assert!(slot_hold_is_warning(SLOT_HOLD_WARN));
+        assert!(slot_hold_is_warning(Duration::from_secs(9)));
+    }
+}

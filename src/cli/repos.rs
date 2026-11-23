@@ -1,4 +1,4 @@
-//! `mdkb repos` subcommands: `list`, `refresh`.
+//! `mdkb repos` subcommands: `list`, `refresh`, `prune`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use crate::cli::{OutputFormat, RefreshFilter};
 use crate::core::refresh::{RefreshReport, RefreshStatus, refresh_outdated};
 use crate::daemon::config::DaemonConfig;
 use crate::daemon::repo_listing::{list_repos, render_text};
-use crate::daemon::repo_map::{discover_nested_stores, try_read_known_roots};
+use crate::daemon::repo_map::{PruneReport, discover_nested_stores, try_read_known_roots};
 use crate::daemon::scope::ScopePolicy;
 use crate::error::{Error, Result};
 use crate::mcp::tools::{RootSelector, ScopedRoots};
@@ -92,6 +92,93 @@ pub async fn handle_list(format: OutputFormat) -> Result<()> {
         print!("{}", render_text(&rows));
     }
     Ok(())
+}
+
+/// Why nothing was pruned when no daemon answers. Without Unix sockets this
+/// platform has no daemon at all, so restart advice would be impossible.
+#[cfg(unix)]
+const NO_DAEMON_PRUNE: &str = "no mdkb daemon is running, so nothing was changed. The daemon owns the \
+     registry and drops Gone roots itself when it starts; `repos list` without a \
+     daemon already omits them. Start it (`mdkb daemon restart`) and run this again.";
+#[cfg(not(unix))]
+const NO_DAEMON_PRUNE: &str = "`repos prune` needs the mdkb daemon, which this platform does not \
+     provide, so nothing was changed. `repos list` here reads repos.json and already omits Gone roots.";
+
+/// Remove Gone roots from the running daemon's registry. The daemon is the
+/// only writer: with none running, or one that predates the method, nothing is
+/// changed and the error names the next step.
+pub async fn handle_prune(paths: Vec<PathBuf>, dry_run: bool, format: OutputFormat) -> Result<()> {
+    let paths = paths
+        .into_iter()
+        .map(|p| std::path::absolute(&p).map_err(|e| Error::other(format!("{}: {e}", p.display()))))
+        .collect::<Result<Vec<_>>>()?;
+    let report = match crate::cli::daemon::prune_daemon_repos(&paths, dry_run).await {
+        Ok(Some(report)) => report,
+        Ok(None) => {
+            return Err(Error::other(NO_DAEMON_PRUNE));
+        }
+        Err(why) if daemon_lacks_prune(&why) => {
+            return Err(Error::other(
+                "the running daemon predates `repos prune` and refused the request; nothing was \
+                 changed. Install this build, then `mdkb daemon restart` (it drops Gone roots \
+                 on start) and run this again.",
+            ));
+        }
+        Err(why) => {
+            return Err(Error::other(format!(
+                "the outcome of the prune is unconfirmed: {why}. The daemon may or may not have \
+                 removed the roots. Inspect with `mdkb repos list` or `mdkb repos prune --dry-run` \
+                 before retrying."
+            )));
+        }
+    };
+    if let OutputFormat::Json = format {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", render_prune(&report));
+    }
+    if report.refused.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::other(format!(
+            "{} selected path(s) were refused; the lines above say why. Eligible Gone roots in the \
+             same selection were still handled as reported",
+            report.refused.len()
+        )))
+    }
+}
+
+/// A daemon without `daemon.repos_prune` treats it as a repo method and refuses
+/// it for lacking `params.root` (`-32602`, before dispatch, nothing written).
+pub(crate) fn daemon_lacks_prune(why: &str) -> bool {
+    why.contains("-32602") && why.contains("params.root")
+}
+
+fn render_prune(report: &PruneReport) -> String {
+    let verb = if report.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
+    let mut out = String::new();
+    for root in &report.removed {
+        let _ = writeln!(out, "{verb}  {}", root.display());
+    }
+    for r in &report.refused {
+        let _ = writeln!(out, "REFUSED  {}: {}", r.path.display(), r.reason);
+    }
+    let _ = writeln!(
+        out,
+        "{} {} Gone or NoStore root(s) {}; no repository, store or index was deleted",
+        if report.dry_run { "dry run:" } else { "done:" },
+        report.removed.len(),
+        if report.dry_run {
+            "would be removed from the registry"
+        } else {
+            "removed from the registry"
+        },
+    );
+    out
 }
 
 pub fn handle_refresh(only: RefreshFilter) -> Result<()> {

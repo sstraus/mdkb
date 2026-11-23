@@ -181,7 +181,7 @@ fn hook_client_whitelist_rejection_returns_structured_error() {
     assert!(text.contains("-32602"), "code should be -32602: {text}");
 }
 
-/// End-to-end: `mdkb hook status --root <repo>` run as a subprocess exits 0
+/// End-to-end: `mdkb hook search --root <repo>` run as a subprocess exits 0
 /// even on whitelist rejection (host hook must not be blocked).
 #[test]
 fn hook_cli_exits_zero_on_whitelist_rejection() {
@@ -203,14 +203,13 @@ fn hook_cli_exits_zero_on_whitelist_rejection() {
     .unwrap();
 
     let output = Command::new(BIN)
-        .arg("hook")
-        .arg("status")
+        .args(["hook", "search", "anything"])
         .arg("--root")
         .arg(&root)
         .env("HOME", empty_home.path())
         .env("MDKB_NO_DAEMON", "1")
         .output()
-        .expect("run hook status");
+        .expect("run hook search");
 
     assert!(
         output.status.success(),
@@ -267,15 +266,15 @@ fn auto_spawned_daemon_writes_daemon_log() {
     // directive on top of RUST_LOG, and between two bare directives the WARN
     // one wins, while a target-scoped one is more specific and takes effect.
     let output = Command::new(BIN)
-        .args(["hook", "status", "--root"])
+        .args(["hook", "search", "anything", "--root"])
         .arg(&root)
         .env("HOME", daemon.home.path())
         .env("RUST_LOG", "mdkb=info")
         .output()
-        .expect("run hook status");
+        .expect("run hook search");
     assert!(
         output.status.success(),
-        "hook status must exit 0; stderr: {}",
+        "hook search must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 

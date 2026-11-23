@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::Connection;
 
 use super::body::hamming;
-use super::candidates::{DupCandidate, MAX_SUPPRESSING_TIER, candidates, confident_call_pairs};
+use super::candidates::{MAX_SUPPRESSING_TIER, candidates, confident_call_pairs};
 use super::cluster::{Fingerprint, UnionFind, cluster, dense_groups, suppression_for};
 use super::embed::{BodyEmbedder, score_semantic_tail};
 use super::report::{Cluster, Evidence, filter_ignored, rank};
@@ -34,11 +34,14 @@ pub struct DupOptions {
     pub hamming_threshold: u32,
     /// Cosine floor for the semantic pass.
     pub similarity_threshold: f32,
-    /// Only look at paths starting with this. `None` sweeps the repository.
+    /// Report only clusters with a member whose path starts with this.
+    ///
+    /// An anchor, like `changed`, not a candidate filter: the copy of a body
+    /// under this prefix lives by definition somewhere else (story 073-504b).
     pub file: Option<String>,
     /// Review mode: report only clusters that touch one of these paths.
     ///
-    /// Deliberately NOT a candidate filter like `file`. The question review
+    /// Deliberately NOT a candidate filter. The question review
     /// mode asks is "what did *my change* duplicate", and the code it
     /// duplicated is by definition code the change did not touch — narrowing
     /// the candidate set first would remove the very symbols the answer is
@@ -88,11 +91,8 @@ pub fn scan_duplication(
     options: &DupOptions,
     now: i64,
 ) -> Result<DupOutcome> {
-    let mut candidates = candidates(code, options.min_lines)
+    let candidates = candidates(code, options.min_lines)
         .map_err(|e| Error::other(format!("reading duplication candidates failed: {e}")))?;
-    if let Some(prefix) = &options.file {
-        candidates.retain(|c| c.file_path.starts_with(prefix.as_str()));
-    }
 
     let scanned = fingerprint_candidates(&candidates, dup, read_file, options.min_nodes, now)
         .map_err(|e| Error::other(format!("fingerprinting bodies failed: {e}")))?;
@@ -145,6 +145,13 @@ pub fn scan_duplication(
             c.members
                 .iter()
                 .any(|m| changed.contains(m.file_path.as_str()))
+        });
+    }
+    if let Some(prefix) = &options.file {
+        clusters.retain(|c| {
+            c.members
+                .iter()
+                .any(|m| m.file_path.starts_with(prefix.as_str()))
         });
     }
 
@@ -334,11 +341,8 @@ fn group_similarity(group: &[usize], pairs: &HashMap<(usize, usize), f32>) -> f3
 ///
 /// For a caller that wants to say how much work a scan is about to be.
 pub fn candidate_count(code: &Connection, options: &DupOptions) -> Result<usize> {
-    let mut found = candidates(code, options.min_lines)
+    let found = candidates(code, options.min_lines)
         .map_err(|e| Error::other(format!("reading duplication candidates failed: {e}")))?;
-    if let Some(prefix) = &options.file {
-        found.retain(|c: &DupCandidate| c.file_path.starts_with(prefix.as_str()));
-    }
     Ok(found.len())
 }
 
@@ -468,8 +472,12 @@ mod tests {
         assert_eq!(out.considered, 1);
     }
 
+    /// `--file` anchors the report on a path, it does not shrink what is
+    /// compared: a clone of `src/a.rs` lives by definition in another file.
+    /// Story 073-504b: the old candidate filter made `dup --file src/a.rs`
+    /// report nothing for a two-file clone.
     #[test]
-    fn a_file_scope_narrows_what_is_looked_at() {
+    fn a_file_anchor_reports_a_clone_whose_other_copy_is_elsewhere() {
         let (conn, sources) = two_copies();
         let dup = DupDb::in_memory().unwrap();
         let opts = DupOptions {
@@ -481,16 +489,31 @@ mod tests {
         let out =
             scan_duplication(&conn, None, &dup, None, &mut files(&sources), &opts, 1).unwrap();
 
-        assert_eq!(out.considered, 1, "only the scoped file was fingerprinted");
-        assert!(out.clusters.is_empty(), "one symbol resembles nothing");
+        assert_eq!(out.considered, 2, "the whole index is compared");
+        assert_eq!(out.clusters.len(), 1, "the cluster touches src/a.rs");
+        assert_eq!(out.clusters[0].members.len(), 2);
+    }
+
+    #[test]
+    fn a_file_anchor_drops_clusters_with_no_member_under_it() {
+        let (conn, sources) = two_copies();
+        let dup = DupDb::in_memory().unwrap();
+        let opts = DupOptions {
+            min_nodes: 5,
+            file: Some("tests/".to_string()),
+            ..DupOptions::default()
+        };
+
+        let out =
+            scan_duplication(&conn, None, &dup, None, &mut files(&sources), &opts, 1).unwrap();
+
+        assert!(out.clusters.is_empty());
     }
 
     /// The distinction between review mode and `--file`, and the whole reason
     /// they are two options: `src/b.rs` was NOT changed, and the cluster must
     /// still be reported, because what `src/a.rs` duplicated is exactly the
-    /// code that did not change. `--file` narrows the candidates and would
-    /// have found nothing here (proved by the test above); this narrows only
-    /// the report.
+    /// code that did not change. This narrows only the report.
     #[test]
     fn review_mode_keeps_a_cluster_whose_other_member_did_not_change() {
         let (conn, sources) = two_copies();
@@ -834,7 +857,8 @@ mod tests {
                 }
             )
             .unwrap(),
-            1
+            2,
+            "an anchor narrows the report, not the work: every candidate is still compared"
         );
     }
 
