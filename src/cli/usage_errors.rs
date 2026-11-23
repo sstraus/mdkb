@@ -70,6 +70,8 @@ const GUESSES: &[(&str, &[&[&str]])] = &[
 const PREFERRED_OWNERS: &[(&str, &[&str])] = &[
     ("--entry-type", &["memory", "search"]),
     ("--path", &["code", "search"]),
+    // `search -i` moved to `code grep`; `memory condense -i` is `--interactive`.
+    ("-i", &["code", "grep"]),
 ];
 
 /// True when the arguments ask for JSON output.

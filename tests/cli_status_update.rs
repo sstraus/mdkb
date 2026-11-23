@@ -122,7 +122,10 @@ fn smoke_consolidated_removed_names_print_a_command_that_runs() {
         (vec!["code", "init"], "mdkb update --code".into()),
         (
             vec!["session", "index", "--sessions-path", sessions],
-            format!("mdkb update --sessions --sessions-path {sessions}"),
+            format!(
+                "mdkb update --sessions --sessions-path {}",
+                mdkb::cli::usage_errors::shell_quote(sessions)
+            ),
         ),
         (vec!["dup"], "mdkb code dup".into()),
         (vec!["coupling"], "mdkb code coupling".into()),

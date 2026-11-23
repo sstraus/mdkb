@@ -440,7 +440,8 @@ mod tests {
         let registry = state_registry(state.path());
         registry.get_or_open(&stale).unwrap();
         registry.get_or_open(&keep).unwrap();
-        let stale = stale.canonicalize().unwrap();
+        // Plain form: the map keys roots without the Windows `\\?\` prefix.
+        let stale = crate::domain::canonicalize_plain(&stale).unwrap();
         std::fs::remove_dir_all(&stale).unwrap();
 
         let dry = call(
@@ -456,7 +457,10 @@ mod tests {
         let done = call(&registry, PRUNE_METHOD, json!({"paths": [stale]})).await;
         assert_eq!(done["result"]["removed"], json!([stale]));
         let listed = registry.listed_roots();
-        assert!(!listed.contains(&stale) && listed.contains(&keep.canonicalize().unwrap()));
+        assert!(
+            !listed.contains(&stale)
+                && listed.contains(&crate::domain::canonicalize_plain(&keep).unwrap())
+        );
         let persisted = std::fs::read_to_string(state.path().join("repos.json")).unwrap();
         assert!(
             !persisted.contains(stale.to_string_lossy().as_ref()),
@@ -475,7 +479,8 @@ mod tests {
         std::fs::create_dir_all(stale.join(".mdkb")).unwrap();
         let registry = state_registry(state.path());
         registry.get_or_open(&stale).unwrap();
-        let stale = stale.canonicalize().unwrap();
+        // Plain form: the map keys roots without the Windows `\\?\` prefix.
+        let stale = crate::domain::canonicalize_plain(&stale).unwrap();
         std::fs::remove_dir_all(&stale).unwrap();
         let file = state.path().join("repos.json");
         let before = std::fs::read(&file).unwrap();

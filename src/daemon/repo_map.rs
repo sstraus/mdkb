@@ -390,7 +390,14 @@ pub fn read_scope_overrides(path: &Path) -> BTreeMap<PathBuf, String> {
 pub fn try_read_scope_overrides(path: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        // Windows reports a parent that is a file as NotFound, where Unix says
+        // ENOTDIR; either way the map exists in some form and cannot be read.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !path.parent().is_some_and(|p| p.exists() && !p.is_dir()) =>
+        {
+            return Ok(BTreeMap::new());
+        }
         Err(e) => return Err(e.to_string()),
     };
     let file = serde_json::from_str::<RepoMapFile>(&content).map_err(|e| e.to_string())?;
