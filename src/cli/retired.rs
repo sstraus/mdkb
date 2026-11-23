@@ -85,3 +85,48 @@ pub fn consolidated_replacement(old: &str, args: &[String]) -> String {
         other => format!("mdkb {other} --help"),
     }
 }
+
+/// The argv of a hidden legacy alias rewritten to the command that replaces it,
+/// or `None` when `command` is not one. `stats`, `embed` and `code index` keep
+/// working, unlisted in help, docs and the changelog, so scripts that call them
+/// (the TUICommander dashboard before 1.5.0) survive the rename.
+///
+/// DEFERRED (2026-11-23) — remove in February 2027 (Boss): drop this function,
+/// its call in `Cli::parse_args`, and `legacy_aliases_still_run_and_stay_out_of_help`.
+pub fn legacy_alias_argv(command: &super::Command, argv: &[String]) -> Option<Vec<String>> {
+    use super::{CodeCommand, Command};
+    let (word, args, replacement): (&str, &[String], Vec<String>) = match command {
+        Command::Stats(a) => ("stats", &a.args, vec!["status".into()]),
+        Command::Embed(a) => ("embed", &a.args, vec!["update".into()]),
+        Command::Code(CodeCommand::Index(a)) => {
+            ("index", &a.args, vec!["update".into(), "--code".into()])
+        }
+        _ => return None,
+    };
+    // The retired variants take every trailing argument, so the subcommand word
+    // sits right before them.
+    let at = argv.len().checked_sub(args.len() + 1)?;
+    if argv[at] != word {
+        return None;
+    }
+    let mut head: Vec<String> = argv[..at].to_vec();
+    let mut tail: Vec<String> = args.to_vec();
+    if word == "index" {
+        let code = head.iter().rposition(|a| a == "code")?;
+        head.remove(code);
+        // `code index` took paths; `update --code` indexes the whole repo.
+        let mut kept = Vec::new();
+        for a in tail {
+            let value_of_global = kept
+                .last()
+                .is_some_and(|p: &String| p == "--format" || p == "--root");
+            if a.starts_with('-') || value_of_global {
+                kept.push(a);
+            }
+        }
+        tail = kept;
+    }
+    head.extend(replacement);
+    head.extend(tail);
+    Some(head)
+}

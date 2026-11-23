@@ -234,7 +234,8 @@ pub enum Command {
         project_root: Option<String>,
     },
 
-    /// Removed: use `mdkb update` (add `--reembed` to rebuild every embedding).
+    /// Hidden legacy alias of `mdkb update` (see `retired::legacy_alias_argv`).
+    /// DEFERRED (2026-11-23) — remove in February 2027 (Boss).
     #[command(hide = true, disable_help_flag = true)]
     Embed(RetiredArgs),
 
@@ -317,7 +318,8 @@ pub enum Command {
         no_color: bool,
     },
 
-    /// Removed: use `mdkb status`.
+    /// Hidden legacy alias of `mdkb status` (see `retired::legacy_alias_argv`).
+    /// DEFERRED (2026-11-23) — remove in February 2027 (Boss).
     #[command(hide = true, disable_help_flag = true)]
     Stats(RetiredArgs),
 
@@ -1328,7 +1330,8 @@ pub enum CodeCommand {
     #[command(hide = true, disable_help_flag = true)]
     Init(RetiredArgs),
 
-    /// Removed: use `mdkb update --code`.
+    /// Hidden legacy alias of `mdkb update --code` (see `retired::legacy_alias_argv`).
+    /// DEFERRED (2026-11-23) — remove in February 2027 (Boss).
     #[command(hide = true, disable_help_flag = true)]
     Index(RetiredArgs),
 
@@ -1507,6 +1510,13 @@ impl Cli {
     /// that works and exits 2 (see [`usage_errors`]).
     pub fn parse_args() -> Self {
         let argv: Vec<String> = std::env::args().collect();
-        Self::try_parse_from(&argv).unwrap_or_else(|err| usage_errors::exit_with(err, &argv))
+        let cli =
+            Self::try_parse_from(&argv).unwrap_or_else(|err| usage_errors::exit_with(err, &argv));
+        // DEFERRED (2026-11-23) — remove in February 2027 (Boss): hidden legacy aliases.
+        match retired::legacy_alias_argv(&cli.command, &argv) {
+            Some(rewritten) => Self::try_parse_from(&rewritten)
+                .unwrap_or_else(|err| usage_errors::exit_with(err, &rewritten)),
+            None => cli,
+        }
     }
 }

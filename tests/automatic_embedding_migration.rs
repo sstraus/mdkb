@@ -1,4 +1,8 @@
 //! Writable encounters regenerate model-incompatible stores; discovery stays read-only.
+//!
+//! Unix only: the recording worker is a `/bin/sh` script, and the lowered-child
+//! check reads the priority with `getpriority`.
+#![cfg(unix)]
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},

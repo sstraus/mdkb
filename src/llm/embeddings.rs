@@ -524,6 +524,30 @@ mod tests {
         // assert the lever itself: once capped, fastembed's `par_chunks` batch
         // loop can no longer fan out to one worker per core on top of ORT's own
         // per-core pool.
+        //
+        // The global pool is per process, and any other test in this binary
+        // that touches rayon first initialises it at one worker per core (CI
+        // saw 4). So the assertion runs in a child that executes only this test.
+        const CHILD: &str = "MDKB_RAYON_CAP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "llm::embeddings::tests::cap_rayon_global_pool_limits_the_batch_loop_to_one_worker",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && text.contains("1 passed"),
+                "child run failed:\n{text}\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         cap_rayon_global_pool();
         assert_eq!(rayon::current_num_threads(), 1);
         // Idempotent: the second call hits the already-initialised pool and must

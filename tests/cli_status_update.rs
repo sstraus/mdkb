@@ -115,17 +115,10 @@ fn smoke_consolidated_removed_names_print_a_command_that_runs() {
     assert_ok(&run(&["setup", "hooks", "claude"], &repo.root), "hooks");
 
     let cases: Vec<(Vec<&str>, String)> = vec![
-        (vec!["stats", "--no-color"], "mdkb status --no-color".into()),
         (vec!["code", "info"], "mdkb status".into()),
         (vec!["daemon", "status"], "mdkb status".into()),
         (vec!["metrics", "status"], "mdkb status".into()),
         (vec!["setup", "check"], "mdkb doctor --full".into()),
-        (vec!["embed"], "mdkb update".into()),
-        (vec!["code", "index", "src"], "mdkb update --code".into()),
-        (
-            vec!["code", "index", "--force"],
-            "mdkb update --code --force".into(),
-        ),
         (vec!["code", "init"], "mdkb update --code".into()),
         (
             vec!["session", "index", "--sessions-path", sessions],
@@ -177,6 +170,54 @@ fn smoke_consolidated_removed_names_print_a_command_that_runs() {
         let ran = run(&words, &repo.root);
         assert_ok(&ran, &format!("suggested `{expected}`"));
     }
+}
+
+/// Catches: the legacy aliases `stats`, `embed` and `code index` failing with the
+/// removed-name error, which breaks every script still calling them, or showing
+/// up in `--help` and so becoming official again.
+///
+/// DEFERRED (2026-11-23) — remove in February 2027 (Boss), with `retired::legacy_alias_argv`.
+#[test]
+fn legacy_aliases_still_run_and_stay_out_of_help() {
+    let repo = Repo::new();
+    let status = run(&["--format", "json", "stats"], &repo.root);
+    assert_ok(&status, "stats");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&status)).expect("stats JSON");
+    assert!(
+        json.get("daemon").is_some(),
+        "stats prints the status object: {json}"
+    );
+    assert_ok(
+        &run(&["stats", "--no-color"], &repo.root),
+        "stats --no-color",
+    );
+    assert_ok(
+        &run(
+            &["--format", "json", "code", "index", "--force"],
+            &repo.root,
+        ),
+        "code index --force",
+    );
+    assert_ok(
+        &run(&["code", "index", "src"], &repo.root),
+        "code index src",
+    );
+    assert_ok(&run(&["embed"], &repo.root), "embed");
+
+    let top = stdout(&run(&["--help"], &repo.root));
+    let code = stdout(&run(&["code", "--help"], &repo.root));
+    for (help, word) in [(&top, "stats"), (&top, "embed"), (&code, "index")] {
+        assert!(
+            !help
+                .lines()
+                .any(|l| l.trim_start().starts_with(&format!("{word} "))),
+            "`{word}` must stay out of help:\n{help}"
+        );
+    }
+    assert!(
+        top.lines().any(|l| l.trim_start().starts_with("status ")),
+        "{top}"
+    );
 }
 
 /// Split a printed command the way a POSIX shell would, for single quotes only.
